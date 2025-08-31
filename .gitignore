@@ -25,6 +25,8 @@ gurobi.log
 /cutouts
 /tmp
 doc/_build
+/config
+*config/storyline.default.yaml
 
 /scripts/old
 /scripts/create_scenarios.py
