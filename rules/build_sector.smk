@@ -605,6 +605,8 @@ rule build_heat_totals:
     input:
         hdd="data/bundle/era5-HDD-per-country.csv",
         energy_totals=resources("energy_totals.csv"),
+        country_shapes=resources("country_shapes.geojson"),
+        cutout=lambda w: input_cutout(w),
     output:
         heat_totals=resources("heat_totals.csv"),
     threads: 1

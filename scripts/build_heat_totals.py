@@ -15,13 +15,78 @@ import logging
 from itertools import product
 
 import pandas as pd
+import geopandas as gpd ##add geopandas
 from numpy.polynomial import Polynomial
 
-from scripts._helpers import configure_logging
+from scripts._helpers import configure_logging, load_cutout ##add loadcutout
 
 logger = logging.getLogger(__name__)
 
 idx = pd.IndexSlice
+
+##New function
+def merge_hdd(df1: pd.DataFrame, df2: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge two DataFrames with a DatetimeIndex where df2 is a subset of df1's columns.
+    
+    The function performs the following:
+    - Keeps only the columns that are present in df2.
+    - Combines the indices (timestamps) of both DataFrames.
+    - If a timestamp exists in both DataFrames:
+        * Prints an info message whenever a value is overwritten 
+          (including when the value is the same).
+        * If values differ, an additional message highlights the difference.
+        * Overwrites values in df1 with values from df2.
+    - If a timestamp exists only in df2, the corresponding rows are added.
+    - Returns a new DataFrame sorted by time index.
+    
+    Parameters
+    ----------
+    df1 : pd.DataFrame
+        Base DataFrame containing all possible columns and timestamps.
+    df2 : pd.DataFrame
+        DataFrame with a subset of columns from df1, whose values should overwrite df1.
+    
+    Returns
+    -------
+    pd.DataFrame
+        A new DataFrame containing only the columns of df2, with values from df2 
+        overwriting df1 where applicable, and additional timestamps from df2 included.
+    """
+    # Ensure we only use the subset of columns from df2
+    common_cols = df2.columns
+
+    # Prepare new DataFrame
+    df_new = df1[common_cols].copy()
+
+    # Iterate over all timestamps in df2
+    for ts in df2.index:
+        if ts in df_new.index: #if timestamp already exists
+            # Compare and overwrite values
+            for col in common_cols:
+                val1 = df_new.at[ts, col]
+                val2 = df2.at[ts, col]
+
+                if pd.notna(val1) and pd.notna(val2):
+                    rel_diff=abs(val1-val2)/val1
+                    tol=0.03
+                    if rel_diff>tol:
+                        print(f"Difference of {rel_diff}>{tol} at {ts} in column '{col}': df1={val1}, df2={val2}")
+                        print(f"Overwriting value at {ts} in column '{col}' with {val2}")
+                    else:
+                        print(f'Values at {ts} exist in df1 and df2 and are identical')
+                else:
+                    print(f"Overwriting values at {ts} in column '{col}' with {val2}")
+                
+                df_new.at[ts, col] = val2
+        else: #default
+            # Add new rows for timestamps not present in df1
+            df_new.loc[ts, common_cols] = df2.loc[ts, common_cols]
+
+    # Sort by index (time)
+    df_new = df_new.sort_index()
+
+    return df_new
 
 
 def approximate_heat_demand(
@@ -108,7 +173,20 @@ if __name__ == "__main__":
 
     configure_logging(snakemake)
 
-    hdd = pd.read_csv(snakemake.input.hdd, index_col=0, parse_dates=True)
+    hdd_full = pd.read_csv(snakemake.input.hdd, index_col=0, parse_dates=True) #all counties in pypsa
+    
+    ####Changes####
+    #snippets from https://gist.github.com/fneum/d99e24e19da423038fd55fe3a4ddf875
+    country_shapes_file=snakemake.input.country_shapes
+    cutout_input=snakemake.input.cutout
+    country_shapes = gpd.read_file(country_shapes_file).set_index('name')['geometry'] #file from resources with only the countries considered in this run
+    cutout = load_cutout(cutout_input)
+    da = cutout.heat_demand(shapes=country_shapes) #atlite function
+    s = da.to_pandas()
+
+    hdd=merge_hdd(hdd_full, s)
+    ########
+    
     hdd = hdd.groupby(hdd.index.year).sum().div(1e3)
 
     energy_totals = pd.read_csv(snakemake.input.energy_totals, index_col=[0, 1])
