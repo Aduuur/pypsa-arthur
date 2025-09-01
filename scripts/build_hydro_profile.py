@@ -110,10 +110,31 @@ def correct_eia_stats_by_capacity(
 
 
 def approximate_missing_eia_stats(
-    eia_stats: pd.DataFrame, runoff_fn: str, countries: list[str]
+    eia_stats: pd.DataFrame, runoff_fn: str, countries: list[str], country_shapes: gpd.GeoSeries, cutout, full_years_available: bool
 ) -> pd.DataFrame:
     runoff = pd.read_csv(runoff_fn, index_col=0, parse_dates=True)[countries]
     runoff = runoff.groupby(runoff.index.year).sum() #removed .index
+
+    ##### Changes #####
+    cutout_time = cutout.data['time'] # Time dimension from atlite cutout
+    cutout_years = cutout_time.to_index().year.unique() # Unique years in the cutout
+
+    # Check if the years are already in the ERA5 runoff data
+    year_in_era5 = all(item in runoff.index.unique() for item in cutout_years)
+
+    if full_years_available and not year_in_era5: # If the cutout covers a full year and the data is not in ERA5 yet
+        print(f'Calculate runoff for year {list(cutout_years)}')
+        add_runoff_raw = cutout.runoff(shapes=country_shapes)       # Atlite Runoff DataArray
+        add_runoff = add_runoff_raw.to_pandas()                     # Convert to DataFrame
+        add_runoff = add_runoff.groupby(add_runoff.index.year).sum() # Aggregate annually
+        runoff = pd.concat([runoff, add_runoff])                   # Append to existing runoff data
+
+    elif year_in_era5:# If the year is already in ERA5, use the default workflow
+        print("Use default runoff data from ERA5 to calculate hydro")
+
+    else: # Cutout does not cover a full year and the year is not in ERA5
+        raise ValueError("Provide a whole year for runoff. Fallback to ERA5 is not possible. Provide runoff data for a full year.")
+    ##########
 
     # fix outliers; exceptional floods in 1977-1979 in ES & PT
     if "ES" in runoff:
@@ -191,13 +212,19 @@ if __name__ == "__main__":
 
     if config_hydro.get("eia_approximate_missing"):
         fn = snakemake.input.era5_runoff
-        eia_stats = approximate_missing_eia_stats(eia_stats, fn, countries)
+        eia_stats = approximate_missing_eia_stats(eia_stats, fn, countries, country_shapes, cutout, full_years_available)
 
     norm_year = config_hydro.get("eia_norm_year")
     missing_years = years_in_time.difference(eia_stats.index)
     if norm_year:
+        print('####################################################')
+        print('WARNING: Used norm year for runoff for hydropower Calculation')
+        print('####################################################')
         eia_stats.loc[years_in_time] = eia_stats.loc[norm_year]
     elif missing_years.any():
+        print('####################################################')
+        print('WARNING: Used median of era5 runoff years for hydropower Calculation')
+        print('####################################################')
         eia_stats.loc[missing_years] = eia_stats.median()
 
     inflow = cutout.runoff(
