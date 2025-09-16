@@ -2,32 +2,34 @@
 #
 # SPDX-License-Identifier: MIT
 
-
-rule build_electricity_demand:
-    params:
-        snapshots=config_provider("snapshots"),
-        drop_leap_day=config_provider("enable", "drop_leap_day"),
-        countries=config_provider("countries"),
-        load=config_provider("load"),
-    input:
-        reported=ancient("data/electricity_demand_raw.csv"),
-        synthetic=lambda w: (
-            ancient("data/load_synthetic_raw.csv")
-            if config_provider("load", "supplement_synthetic")(w)
-            else []
-        ),
-    output:
-        resources("electricity_demand.csv"),
-    log:
-        logs("build_electricity_demand.log"),
-    benchmark:
-        benchmarks("build_electricity_demand")
-    resources:
-        mem_mb=5000,
-    conda:
-        "../envs/environment.yaml"
-    script:
-        "../scripts/build_electricity_demand.py"
+if cutout_historic(input_cutout(wildcards={})): #check if cutout is from historic (real) data
+    rule build_electricity_demand:
+        params:
+            snapshots=config_provider("snapshots"),
+            drop_leap_day=config_provider("enable", "drop_leap_day"),
+            countries=config_provider("countries"),
+            load=config_provider("load"),
+        input:
+            reported=ancient("data/electricity_demand_raw.csv"),
+            synthetic=lambda w: (
+                ancient("data/load_synthetic_raw.csv")
+                if config_provider("load", "supplement_synthetic")(w)
+                else []
+            ),
+        output:
+            resources("electricity_demand.csv"),
+        log:
+            logs("build_electricity_demand.log"),
+        benchmark:
+            benchmarks("build_electricity_demand")
+        resources:
+            mem_mb=5000,
+        conda:
+            "../envs/environment.yaml"
+        script:
+            "../scripts/build_electricity_demand.py"
+else:
+    print('Non historic')
 
 
 rule build_powerplants:

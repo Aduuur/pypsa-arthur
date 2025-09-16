@@ -1079,3 +1079,35 @@ def load_cutout(
         cutout.data = cutout.data.sel(time=time)
 
     return cutout
+
+def cutout_historic(cutout_files: Union[str, list[str]]) -> bool:
+    """
+    Check if the given cutout file contain only historic modules(data sources).
+
+    Parameters
+    ----------
+    cutout_files : str or list of str
+        Path to a single cutout file or a list of paths to multiple cutout files.
+        If a list is provided, the cutouts will be concatenated along the time dimension.
+
+    Returns
+    -------
+    bool
+        True if all modules in the cutout are historic, False otherwise.
+
+    Raises
+    ------
+    ValueError
+        If a list of cutout files is provided (not supported).
+    """
+    hist_modules = ['era5', 'sarah']  # historic modules
+
+    if isinstance(cutout_files, str):
+        modules = xr.open_dataset(cutout_files).attrs['module']  # modules in cutout attributes
+        print(f'Cutout contains the modules {modules}')
+    elif isinstance(cutout_files, list):
+        raise ValueError('Cannot handle list of cutouts for non-historic data')  # Could be implemented but currently is not
+    else:
+        raise TypeError('cutout_files must be a string or a list of strings')
+
+    return all(elem in hist_modules for elem in modules)
