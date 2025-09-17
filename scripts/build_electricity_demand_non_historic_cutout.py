@@ -1,85 +1,19 @@
 """
-Compute daily heating and cooling demand using atlite, generate hourly profiles,
-and calculate thermal electricity demand per country and sector.
+Generate hourly profiles and calculate thermal electricity demand per country and sector.
 """
 
-import os
+
 import logging
 from tempfile import NamedTemporaryFile
 from itertools import product
-from typing import Callable, Union
 
 import pandas as pd
-import numpy as np
+
 import xarray as xr
-import geopandas as gpd
-import pytz
-import atlite
-from dask.distributed import Client, LocalCluster
-
-from scripts._helpers import configure_logging, get_snapshots, set_scenario_config, load_cutout, generate_periodic_profiles
-
-# --- Helper functions --- #
-
-# def get_snapshots(
-#     snapshots: dict, drop_leap_day: bool = False, freq: str = "h", **kwargs
-# ) -> pd.DatetimeIndex:
-#     """
-#     Return a DateTimeIndex of snapshots for multiple time ranges.
-#     """
-#     start = snapshots["start"] if isinstance(snapshots["start"], list) else [snapshots["start"]]
-#     end = snapshots["end"] if isinstance(snapshots["end"], list) else [snapshots["end"]]
-
-#     assert len(start) == len(end), "Start and end lists must have the same length"
-
-#     time_periods = [pd.date_range(start=s, end=e, freq=freq, inclusive=snapshots["inclusive"], **kwargs)
-#                     for s, e in zip(start, end)]
-
-#     time = pd.DatetimeIndex([])
-#     for period in time_periods:
-#         time = time.append(period)
-
-#     if drop_leap_day and time.is_leap_year.any():
-#         time = time[~((time.month == 2) & (time.day == 29))]
-
-#     return time
 
 
-# def load_cutout(
-#     cutout_files: Union[str, list[str]], time: Union[None, pd.DatetimeIndex] = None
-# ) -> atlite.Cutout:
-#     """
-#     Load one or multiple atlite cutouts and optionally select specific times.
-#     """
-#     if isinstance(cutout_files, str):
-#         cutout = atlite.Cutout(cutout_files)
-#     elif isinstance(cutout_files, list):
-#         cutout_da = [atlite.Cutout(c).data for c in cutout_files]
-#         combined_data = xr.concat(cutout_da, dim="time", data_vars="minimal")
-#         cutout = atlite.Cutout(NamedTemporaryFile().name, data=combined_data)
 
-#     if time is not None:
-#         cutout.data = cutout.data.sel(time=time)
-
-#     return cutout
-
-
-# def generate_periodic_profiles(dt_index, nodes, weekly_profile, localize=None):
-#     """
-#     Expand daily weekly profiles to hourly profiles for each node, considering timezones.
-#     """
-#     weekly_profile = pd.Series(weekly_profile, range(24 * 7))
-#     week_df = pd.DataFrame(index=dt_index, columns=nodes)
-
-#     for node in nodes:
-#         ct = node[:2] if node[:2] != "XK" else "RS"
-#         timezone = pytz.timezone(pytz.country_timezones[ct][0])
-#         tz_dt_index = dt_index.tz_convert(timezone)
-#         week_df[node] = [24 * dt.weekday() + dt.hour for dt in tz_dt_index]
-#         week_df[node] = week_df[node].map(weekly_profile)
-
-#     week_df = week_df.tz_localize(localize)
-#     return week_df
+from scripts._helpers import configure_logging, set_scenario_config, generate_periodic_profiles
 
 
 def calc_hourly_space_demand(daily_space_demand, intraday_profiles, uses, sectors):
@@ -111,10 +45,16 @@ def calc_hourly_space_demand(daily_space_demand, intraday_profiles, uses, sector
     return ds
 
 
-def load_and_reindex_demand(hdd):
+def load_and_reindex_demand(thermal_demand_path):
     """
-    Reindex daily demand to hourly and forward fill missing values.
+    Read daily heating and ccoling demand shape. Reindex daily demand to hourly and forward fill missing values.
     """
+    hdd = pd.read_csv(
+        thermal_demand_path,
+        index_col=0,
+        parse_dates=True
+    )
+
     hdd.index.name = "time"
     leap_days = hdd.index[(hdd.index.month == 2) & (hdd.index.day == 29)]
 
@@ -168,16 +108,13 @@ if __name__ == "__main__":
 
     if "snakemake" not in globals():
         from scripts._helpers import mock_snakemake
-        snakemake = mock_snakemake("build_electricity_demand")
+        snakemake = mock_snakemake("build_electricity_demand_non_historic_cutouts")
 
     configure_logging(snakemake)
     set_scenario_config(snakemake)
 
 
     # Input files
-    cutout_name = snakemake.input.cutout
-    regions_onshore = snakemake.input.country_shapes
-    pop_layout = snakemake.input.pop_layout_total
     intraday_profiles = snakemake.input.heat_profile
     cooling_demand_path = snakemake.input.energy_totals_cool
     heating_demand_path = snakemake.input.energy_totals
@@ -187,66 +124,14 @@ if __name__ == "__main__":
 
     time_start = pd.to_datetime(snakemake.params.snapshots["start"])
     time_end = pd.to_datetime(snakemake.params.snapshots["end"])
-
-    overlapping_year = (
-        (time_end - time_start) > (time_start + pd.DateOffset(years=1) - time_start)
-    )
-
-    if overlapping_year:
-        raise ValueError("Provide snapshots for one year only; overlapping time series are not supported.")
-    else:
-        snapshot_year=time_start.year #equals time_end.year
-        #use whole year for calculation
-        snapshots={'start': f'{snapshot_year}-01-01', 'end': f'{snapshot_year+1}-01-01', 'inclusive': 'left'}
-
-    # Generate time indices
-    time = get_snapshots(snapshots, drop_leap_day)
-    daily = get_snapshots(
-            snapshots,
-            snakemake.params.drop_leap_day,
-            freq="D",
-        )
-    
-
-    # Load cutout and regions
-    cutout = load_cutout(cutout_name, time=time)
-    clustered_regions = gpd.read_file(regions_onshore).set_index("name").buffer(0)
-    I = cutout.indicatormatrix(clustered_regions)
-    pop_layout = xr.open_dataarray(pop_layout)
-    stacked_pop = pop_layout.stack(spatial=("y", "x"))
-    M = I.T.dot(np.diag(I.dot(stacked_pop)))
-
-    # Compute daily heat/cooling demand
-    heat_demand = cutout.heat_demand(
-        threshold=15.0,
-        a=1.0,
-        constant=0.0,
-        hour_shift=0.0,
-        matrix=M.T,
-        index=clustered_regions.index,
-        show_progress=False,
-    ).sel(time=daily)
-
-    df_heat = pd.DataFrame(heat_demand.values, index=heat_demand["time"].values, columns=heat_demand["name"].values)
-
-    cool_demand = cutout.cooling_demand(
-        threshold=18.0,
-        a=1.0,
-        constant=0.0,
-        hour_shift=0.0,
-        matrix=M.T,
-        index=clustered_regions.index,
-        show_progress=False,
-    ).sel(time=daily)
-
-    df_cool = pd.DataFrame(cool_demand.values, index=cool_demand["time"].values, columns=cool_demand["name"].values)
+    snapshot_year=time_start.year #equals time_end.year
 
     # Hourly demand
-    daily_space_heating_demand = load_and_reindex_demand(df_heat)
+    daily_space_heating_demand = load_and_reindex_demand(snakemake.input.hdd)
     ds_heat = calc_hourly_space_demand(daily_space_heating_demand, intraday_profiles,
                                        uses=["water", "space"], sectors=["residential", "services"])
 
-    daily_space_cooling_demand = load_and_reindex_demand(df_cool)
+    daily_space_cooling_demand = load_and_reindex_demand(snakemake.input.cdd)
     ds_cool = calc_hourly_space_demand(daily_space_cooling_demand, intraday_profiles,
                                        uses=["space"], sectors=["residential", "services"])
 
@@ -259,16 +144,12 @@ if __name__ == "__main__":
     #equals config_provider('energy','energy_totals_year')
     year_demand = electric_demand_no_thermal.index.year.unique()[0]
 
-    if len(time) >= 8760:
-        ratio_heat = df_heat.sum(axis=0) / hist_demand_day_calc['sum_hdd'].xs(year_demand, level='year')
-        ratio_cool = df_cool.sum(axis=0) / hist_demand_day_calc['sum_cdd'].xs(year_demand, level='year')
-        logger.info("Historical energy totals scaled by yearly sum of demand days.")
-        logger.info(f"Heat ratio: {ratio_heat.to_dict()}")
-        logger.info(f"Cooling ratio: {ratio_cool.to_dict()}")
-    else:
-        logger.info("Energy ratios not scaled. Provide a full-year snapshot for scaling.")
-        ratio_heat = 1
-        ratio_cool = 1
+
+    ratio_heat = daily_space_heating_demand.sum(axis=0) / hist_demand_day_calc['sum_hdd'].xs(year_demand, level='year')
+    ratio_cool = daily_space_cooling_demand.sum(axis=0) / hist_demand_day_calc['sum_cdd'].xs(year_demand, level='year')
+    logger.info("Historical energy totals scaled by yearly sum of demand days.")
+    logger.info(f"Heat ratio: {ratio_heat.to_dict()}")
+    logger.info(f"Cooling ratio: {ratio_cool.to_dict()}")
 
     # Compute thermal electricity demand
     elec_cooling = thermal_elec_demand(ds_cool, energy_totals_cool, ratio_cool, year_demand,

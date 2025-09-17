@@ -31,15 +31,29 @@ if config_provider("atlite","cutouts","historic_data")(wildcards={}):
 
 elif config_provider("atlite","cutouts","historic_data")(wildcards={})==False:
     print('Build electricity demand for custom temperature data')
+
+    rule build_daily_thermal_demand:
+        params:
+            thermal_type=lambda wildcards: wildcards.thermal_type,
+            snapshots=config_provider("snapshots"),
+            drop_leap_day=config_provider("enable", "drop_leap_day"),
+        input:
+            cutout=lambda w: input_cutout(w),
+            country_shapes=resources("country_shapes.geojson"),
+            pop_layout_total=resources("pop_layout_total.nc"),
+        output:
+            resources("cutout_daily_{thermal_type}_demand.csv")
+        script:
+            "../scripts/build_daily_thermal_demand.py"
+
     rule build_electricity_demand:
         params:
             snapshots=config_provider("snapshots"),
             drop_leap_day=config_provider("enable", "drop_leap_day"),
             energy_totals_year=config_provider('energy','energy_totals_year'),
         input:
-            cutout=lambda w: input_cutout(w),
-            country_shapes=resources("country_shapes.geojson"),
-            pop_layout_total=resources("pop_layout_total.nc"),
+            hdd=resources("cutout_daily_heating_demand.csv"),
+            cdd=resources("cutout_daily_cooling_demand.csv"),
             energy_totals=resources("energy_totals.csv"),
             energy_totals_cool="data/EE_GitHub/electricity/cooling_demand_idees_approx.csv",
             heat_profile="data/heat_load_profile_BDEW.csv",
@@ -47,8 +61,8 @@ elif config_provider("atlite","cutouts","historic_data")(wildcards={})==False:
             hist_demand_day_calc="data/EE_GitHub/electricity/hist_demand_day_calc.csv",
         output:
             elec_demand=resources("electricity_demand.csv")
-        script:
-            "../scripts/build_electricity_demand_non_historic_cutout.py"
+        notebook:
+            "../scripts/build_electricity_demand_non_historic_cutout.py.ipynb"
 
 
 rule build_powerplants:
