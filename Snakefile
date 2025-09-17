@@ -15,7 +15,6 @@ from scripts._helpers import (
     get_scenarios,
     get_rdir,
     get_shadow,
-    cutout_historic,
 )
 
 
