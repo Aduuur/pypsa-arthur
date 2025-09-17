@@ -162,6 +162,7 @@ atlite:
   nprocesses: 16
   show_progress: false
   cutouts:
+    historic_data: true
     # use 'base' to determine geographical bounds and time span from config
     # base:
       # module: era5
