@@ -2,6 +2,14 @@
 #
 # SPDX-License-Identifier: CC0-1.0
 
+#additional config
+ee:
+  historic_data: true
+  elec_thermal:
+    scaling_method: singleYear #singleYear, regression, none
+    max_scale: 2
+
+
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#top-level-configuration
 version: v2025.07.0
 tutorial: false
@@ -161,8 +169,7 @@ atlite:
   default_cutout: europe-2013-sarah3-era5
   nprocesses: 16
   show_progress: false
-  cutouts:
-    historic_data: true
+  cutouts:    
     # use 'base' to determine geographical bounds and time span from config
     # base:
       # module: era5

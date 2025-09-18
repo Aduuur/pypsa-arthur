@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Contributors to PyPSA-Eur <https://github.com/pypsa/pypsa-eur>
 #
 # SPDX-License-Identifier: MIT
-if config_provider("atlite","cutouts","historic_data")(wildcards={}):
+if config_provider("ee","historic_data")(wildcards={}):
     print('Build electricity demand for historic cutout')
     rule build_electricity_demand:
             params:
@@ -29,7 +29,7 @@ if config_provider("atlite","cutouts","historic_data")(wildcards={}):
             script:
                 "../scripts/build_electricity_demand.py"
 
-elif config_provider("atlite","cutouts","historic_data")(wildcards={})==False:
+elif config_provider("ee","historic_data")(wildcards={})==False:
     print('Build electricity demand for custom temperature data')
 
     rule build_daily_thermal_demand:
@@ -43,10 +43,42 @@ elif config_provider("atlite","cutouts","historic_data")(wildcards={})==False:
             pop_layout_total=resources("pop_layout_total.nc"),
         output:
             resources("cutout_daily_{thermal_type}_demand.csv")
+        log:
+            logs("cutout_daily_{thermal_type}_demand.log"),
+        benchmark:
+            benchmarks("cutout_daily_{thermal_type}_demand")
+        resources:
+            mem_mb=5000,
+        conda:
+            "../envs/environment.yaml"
         script:
             "../scripts/build_daily_thermal_demand.py"
+    
+    rule build_electric_thermal_demand_regression:
+        params:
+            max_scale=config_provider("ee","elec_thermal","max_scale"),
+            scaling_method= config_provider("ee","elec_thermal","scaling_method"),
+            energy_totals_year=config_provider('energy','energy_totals_year'),
+        input:
+            hdd=resources("cutout_daily_heating_demand.csv"),
+            cdd=resources("cutout_daily_cooling_demand.csv"),
+            hist_demand_day_calc="data/EE_GitHub/electricity/hist_demand_day_calc.csv",
+        output:
+            et_scale=resources("energy_totals_scaling.csv"),
+            elec_heat_reg_plot=directory(resources("plots/elec_heat_reg"))
+        log:
+            logs("energy_totals_scaling.log"),
+        benchmark:
+            benchmarks("energy_totals_scaling")
+        resources:
+            mem_mb=5000,
+        conda:
+            "../envs/environment.yaml"
+        script:
+            "../scripts/build_electric_thermal_demand_regression.py"
 
-    rule build_electricity_demand:
+
+    rule build_electricity_demand_non_historic_cutout:
         params:
             snapshots=config_provider("snapshots"),
             drop_leap_day=config_provider("enable", "drop_leap_day"),
@@ -57,12 +89,21 @@ elif config_provider("atlite","cutouts","historic_data")(wildcards={})==False:
             energy_totals=resources("energy_totals.csv"),
             energy_totals_cool="data/EE_GitHub/electricity/cooling_demand_idees_approx.csv",
             heat_profile="data/heat_load_profile_BDEW.csv",
-            demand_no_thermal=f"data/EE_GitHub/electricity/elec_no_termal/elec_demand_no_thermal_{config_provider('energy','energy_totals_year')(wildcards={})}.csv", #year must be in idees report and proper demand available. Currently for: [2007, 2008, 2009, 2011, 2012, 2013, 2014, 2015, 2017, 2018, 2019]
-            hist_demand_day_calc="data/EE_GitHub/electricity/hist_demand_day_calc.csv",
+            demand_no_thermal=f"data/EE_GitHub/electricity/elec_no_termal/elec_demand_no_thermal_{config_provider('energy','energy_totals_year')(wildcards={})}.csv", # In theory, it does not have to match energy_totals_year, but the year must be in the IDEES report and proper electricity demand must be available. Currently, electricity demand is available for: [2007, 2008, 2009, 2011, 2012, 2013, 2014, 2015, 2017, 2018, 2019]
+            et_scale=resources("energy_totals_scaling.csv"),
         output:
-            elec_demand=resources("electricity_demand.csv")
-        notebook:
-            "../scripts/build_electricity_demand_non_historic_cutout.py.ipynb"
+            elec_demand=resources("electricity_demand.csv"),
+            elec_thermal_demand=resources("electricity_thermal_demand.nc")
+        log:
+            logs("electricity_demand.log"),
+        benchmark:
+            benchmarks("electricity_demand")
+        resources:
+            mem_mb=5000,
+        conda:
+            "../envs/environment.yaml"
+        script:
+            "../scripts/build_electricity_demand_non_historic_cutout.py"
 
 
 rule build_powerplants:

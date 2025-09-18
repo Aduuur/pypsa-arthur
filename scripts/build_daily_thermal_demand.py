@@ -19,7 +19,7 @@ if __name__ == "__main__":
 
     if "snakemake" not in globals():
         from scripts._helpers import mock_snakemake
-        snakemake = mock_snakemake("build_yearly_demand_days")
+        snakemake = mock_snakemake("build_daily_thermal_demand")
 
     configure_logging(snakemake)
     set_scenario_config(snakemake)
