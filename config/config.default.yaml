@@ -4,7 +4,7 @@
 
 #additional config
 ee:
-  historic_data: true
+  historic_cutout: true
   elec_thermal:
     scaling_method: singleYear #singleYear, regression, none
     max_scale: 2

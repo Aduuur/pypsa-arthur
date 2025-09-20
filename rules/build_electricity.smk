@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Contributors to PyPSA-Eur <https://github.com/pypsa/pypsa-eur>
 #
 # SPDX-License-Identifier: MIT
-if config_provider("ee","historic_data")(wildcards={}):
+if config_provider("ee","historic_cutout")(wildcards={}):
     print('Build electricity demand for historic cutout')
     rule build_electricity_demand:
             params:
@@ -29,7 +29,7 @@ if config_provider("ee","historic_data")(wildcards={}):
             script:
                 "../scripts/build_electricity_demand.py"
 
-elif config_provider("ee","historic_data")(wildcards={})==False:
+elif config_provider("ee","historic_cutout")(wildcards={})==False:
     print('Build electricity demand for custom temperature data')
 
     rule build_daily_thermal_demand:
