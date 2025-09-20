@@ -601,7 +601,31 @@ rule build_energy_totals:
         "../scripts/build_energy_totals.py"
 
 
+rule build_cooling_totals:
+    params:
+        historic_cutout=config_provider("ee","historic_cutout")
+    input:
+        cdd="data/EE_GitHub/electricity/era5_CDD_per_country.csv", #generated using pypsa4cordex_clean_elec_demand
+        energy_totals_cooling="data/EE_GitHub/electricity/cooling_demand_idees_approx.csv", #generated using pypsa4cordex_clean_elec_demand
+        country_shapes=resources("country_shapes.geojson"),
+        cutout=lambda w: input_cutout(w),
+    output:
+        cooling_totals=resources("cooling_totals.csv"),
+    threads: 1
+    resources:
+        mem_mb=2000,
+    log:
+        logs("build_cooling_totals.log"),
+    benchmark:
+        benchmarks("build_cooling_totals")
+    conda:
+        "../envs/environment.yaml"
+    script:
+        "../scripts/build_cooling_totals.py"
+
 rule build_heat_totals:
+    params:
+        historic_cutout=config_provider("ee","historic_cutout")
     input:
         hdd="data/bundle/era5-HDD-per-country.csv",
         energy_totals=resources("energy_totals.csv"),
