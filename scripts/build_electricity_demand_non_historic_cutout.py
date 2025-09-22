@@ -16,7 +16,7 @@ import xarray as xr
 from scripts._helpers import configure_logging, set_scenario_config, generate_periodic_profiles
 
 
-def calc_hourly_space_demand(daily_space_demand, intraday_profiles, uses, sectors):
+def calc_hourly_space_demand(daily_space_demand, intraday_profiles,drop_leap_day, uses, sectors):
     """
     Calculate hourly space heating/cooling demand from daily values using intraday profiles.
     """
@@ -42,6 +42,8 @@ def calc_hourly_space_demand(daily_space_demand, intraday_profiles, uses, sector
     heat_demand = pd.concat(heat_demand, axis=1, names=["sector use", "node"])
     heat_demand.index.name = "snapshots"
     ds = heat_demand.stack(future_stack=True).to_xarray()
+    if drop_leap_day:
+        ds = ds.sel(snapshots=~((ds.snapshots.dt.month == 2) & (ds.snapshots.dt.day == 29)))
     return ds
 
 
@@ -74,7 +76,7 @@ def load_and_reindex_demand(thermal_demand_path):
     return hdd, hdd_hourly
 
 
-def thermal_elec_demand(hourly_thermal_demand: xr.Dataset, energy_totals: pd.DataFrame, et_ratio, year: int,
+def thermal_elec_demand(hourly_thermal_demand: xr.Dataset, energy_totals: pd.DataFrame, year: int,
                         uses=["water", "space"], sectors=["residential", "services"]):
     """
     Compute hourly electricity demand per country per sector for heating/cooling.
@@ -88,13 +90,8 @@ def thermal_elec_demand(hourly_thermal_demand: xr.Dataset, energy_totals: pd.Dat
     electric_thermal_supply = {}
     for sector, use in product(sectors, uses):
         name = f"{sector} {use}"
-        if 'space' in name:
-            elec_sector_use = year_totals[f"electricity {sector} {use}"] * et_ratio
- 
-        else:
-            elec_sector_use = year_totals[f"electricity {sector} {use}"]
 
-        electric_thermal_supply[name] = (thermal_demand_shape[name] / thermal_demand_shape[name].sum()).multiply(elec_sector_use) * 1e6
+        electric_thermal_supply[name] = (thermal_demand_shape[name] / thermal_demand_shape[name].sum()).multiply(year_totals[f'electricity {name}']) * 1e6
 
     electric_thermal_supply = pd.concat(electric_thermal_supply, axis=1)
     electric_thermal_supply_agg = electric_thermal_supply.T.groupby(level=1).sum().T
@@ -118,39 +115,47 @@ if __name__ == "__main__":
     # Input files
     intraday_profiles = snakemake.input.heat_profile
     cooling_demand_path = snakemake.input.energy_totals_cool
-    heating_demand_path = snakemake.input.energy_totals
+    heating_demand_path = snakemake.input.energy_totals_heat
     electric_demand_no_thermal_path = snakemake.input.demand_no_thermal
-    drop_leap_day = snakemake.params.drop_leap_day
-    et_scale_path=snakemake.input.et_scale
-    energy_totals_year=snakemake.params.energy_totals_year
-
-    #equals config_provider('energy','energy_totals_year')
-    #year_demand = electric_demand_no_thermal.index.year.unique()[0]
-    year_demand=int(energy_totals_year)
+    drop_leap_day = bool(snakemake.params.drop_leap_day)
+    energy_totals_year=int(snakemake.params.energy_totals_year)
+    et_regression = str(snakemake.params.et_regression)
 
     time_start = pd.to_datetime(snakemake.params.snapshots["start"])
     time_end = pd.to_datetime(snakemake.params.snapshots["end"])
-    snapshot_year=time_start.year #equals time_end.year
+    snapshot_year = int(time_start.year)
+    
+    # Note: whole script only applies if config['ee']['historic_cutout']['enable'] == true (if statement in snakefile)
+    if et_regression == 'True':
+        year_demand = snapshot_year  # equals time_end.year
+        logger.info(f'Using demand year {year_demand} derived by regression')
+    elif et_regression == 'False':
+        year_demand = energy_totals_year
+        logger.info(f'Using reported demand year {year_demand}')
+    else:
+        raise ValueError('config[ee][non_historic_cutout][et_regression] must be false or true')
+
+
+
 
     # Hourly demand
     hdd, daily_space_heating_demand = load_and_reindex_demand(snakemake.input.hdd)
-    ds_heat = calc_hourly_space_demand(daily_space_heating_demand, intraday_profiles,
+    ds_heat = calc_hourly_space_demand(daily_space_heating_demand, intraday_profiles,drop_leap_day,
                                        uses=["water", "space"], sectors=["residential", "services"])
 
     cdd, daily_space_cooling_demand = load_and_reindex_demand(snakemake.input.cdd)
-    ds_cool = calc_hourly_space_demand(daily_space_cooling_demand, intraday_profiles,
+    ds_cool = calc_hourly_space_demand(daily_space_cooling_demand, intraday_profiles,drop_leap_day,
                                        uses=["space"], sectors=["residential", "services"])
 
     # Load total energy data
     electric_demand_no_thermal = pd.read_csv(electric_demand_no_thermal_path, index_col="Date", parse_dates=["Date"])
-    df_scaling=pd.read_csv(et_scale_path, index_col='country')
-    energy_totals_heat = pd.read_csv(heating_demand_path, index_col="country")
     energy_totals_cool = pd.read_csv(cooling_demand_path, index_col="country")
-
+    energy_totals_heat = pd.read_csv(heating_demand_path, index_col=["country"])
+    
     # Compute thermal electricity demand
-    elec_cooling = thermal_elec_demand(ds_cool, energy_totals_cool, df_scaling['scaling_ratio_cool'], year_demand,
+    elec_cooling = thermal_elec_demand(ds_cool, energy_totals_cool, year_demand,
                                        uses=["space"], sectors=["residential", "services"])
-    elec_heating = thermal_elec_demand(ds_heat, energy_totals_heat, df_scaling['scaling_ratio_heat'], year_demand,
+    elec_heating = thermal_elec_demand(ds_heat, energy_totals_heat, year_demand,
                                        uses=["space", "water"], sectors=["residential", "services"])
 
     # Combine with non-thermal demand
