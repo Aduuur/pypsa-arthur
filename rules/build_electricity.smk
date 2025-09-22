@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Contributors to PyPSA-Eur <https://github.com/pypsa/pypsa-eur>
 #
 # SPDX-License-Identifier: MIT
-if config_provider("ee","historic_cutout")(wildcards={}):
+if config_provider("ee","historic_cutout","enable")(wildcards={}):
     print('Build electricity demand for historic cutout')
     rule build_electricity_demand:
             params:
@@ -29,7 +29,7 @@ if config_provider("ee","historic_cutout")(wildcards={}):
             script:
                 "../scripts/build_electricity_demand.py"
 
-elif config_provider("ee","historic_cutout")(wildcards={})==False:
+elif config_provider("ee","historic_cutout","enable")(wildcards={})==False:
     print('Build electricity demand for custom temperature data')
 
     rule build_daily_thermal_demand:
@@ -87,10 +87,10 @@ elif config_provider("ee","historic_cutout")(wildcards={})==False:
             hdd=resources("cutout_daily_heating_demand.csv"),
             cdd=resources("cutout_daily_cooling_demand.csv"),
             energy_totals=resources("energy_totals.csv"),
+            energy_totals_heat=resources("heat_totals.csv"),
             energy_totals_cool="data/EE_GitHub/electricity/cooling_demand_idees_approx.csv",
             heat_profile="data/heat_load_profile_BDEW.csv",
             demand_no_thermal=f"data/EE_GitHub/electricity/elec_no_termal/elec_demand_no_thermal_{config_provider('energy','energy_totals_year')(wildcards={})}.csv", # In theory, it does not have to match energy_totals_year, but the year must be in the IDEES report and proper electricity demand must be available. Currently, electricity demand is available for: [2007, 2008, 2009, 2011, 2012, 2013, 2014, 2015, 2017, 2018, 2019]
-            et_scale=resources("energy_totals_scaling.csv"),
         output:
             elec_demand=resources("electricity_demand.csv"),
             elec_thermal_demand=resources("electricity_thermal_demand.nc")

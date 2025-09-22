@@ -4,10 +4,10 @@
 
 #additional config
 ee:
-  historic_cutout: true
-  elec_thermal:
-    scaling_method: singleYear #singleYear, regression, none
-    max_scale: 2
+  historic_cutout:
+    enable: true
+    et_regression: true
+    hydro_regression: true
 
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#top-level-configuration

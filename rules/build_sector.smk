@@ -603,7 +603,8 @@ rule build_energy_totals:
 
 rule build_cooling_totals:
     params:
-        historic_cutout=config_provider("ee","historic_cutout")
+        historic_cutout = config_provider("ee","historic_cutout","enable"),
+        et_regression = config_provider("ee","historic_cutout","et_regeresison"),
     input:
         cdd="data/EE_GitHub/electricity/era5_CDD_per_country.csv", #generated using pypsa4cordex_clean_elec_demand
         energy_totals_cooling="data/EE_GitHub/electricity/cooling_demand_idees_approx.csv", #generated using pypsa4cordex_clean_elec_demand
@@ -625,7 +626,8 @@ rule build_cooling_totals:
 
 rule build_heat_totals:
     params:
-        historic_cutout=config_provider("ee","historic_cutout")
+        historic_cutout = config_provider("ee","historic_cutout","enable"),
+        et_regression = config_provider("ee","historic_cutout","et_regression"),
     input:
         hdd="data/bundle/era5-HDD-per-country.csv",
         energy_totals=resources("energy_totals.csv"),
