@@ -499,8 +499,8 @@ rule build_hydro_profile:
         mem_mb=5000,
     conda:
         "../envs/environment.yaml"
-    notebook:
-        "../scripts/build_hydro_profile.py.ipynb"
+    script:
+        "../scripts/build_hydro_profile.py"
 
 
 rule build_line_rating:
