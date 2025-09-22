@@ -480,6 +480,7 @@ rule build_hydro_profile:
         countries=config_provider("countries"),
         snapshots=config_provider("snapshots"),
         drop_leap_day=config_provider("enable", "drop_leap_day"),
+        non_historic_cutout = config_provider("ee","non_historic_cutout","enable"),
     input:
         country_shapes=resources("country_shapes.geojson"),
         eia_hydro_generation="data/eia_hydro_annual_generation.csv",
@@ -498,8 +499,8 @@ rule build_hydro_profile:
         mem_mb=5000,
     conda:
         "../envs/environment.yaml"
-    script:
-        "../scripts/build_hydro_profile.py"
+    notebook:
+        "../scripts/build_hydro_profile.py.ipynb"
 
 
 rule build_line_rating:
