@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Contributors to PyPSA-Eur <https://github.com/pypsa/pypsa-eur>
 #
 # SPDX-License-Identifier: MIT
-if config_provider("ee","non_historic_cutout","enable")(wildcards={}):
+if str(config_provider("ee","non_historic_cutout","enable")(wildcards={})) == 'True':
     print('Build electricity demand for custom temperature data')
 
     rule build_daily_thermal_demand:
@@ -55,12 +55,12 @@ if config_provider("ee","non_historic_cutout","enable")(wildcards={}):
             snapshots=config_provider("snapshots"),
             drop_leap_day=config_provider("enable", "drop_leap_day"),
             energy_totals_year=config_provider('energy','energy_totals_year'),
-            et_regression = config_provider("ee","non_historic_cutout","et_regeresison"),
+            et_regression = config_provider("ee","non_historic_cutout","et_regression"),
         input:
             hdd=resources("cutout_daily_heating_demand.csv"),
             cdd=resources("cutout_daily_cooling_demand.csv"),
             energy_totals_heat=resources("heat_totals.csv"),
-            energy_totals_cool="data/EE_GitHub/electricity/cooling_demand_idees_approx.csv",
+            energy_totals_cool=resources("cooling_totals.csv"),
             heat_profile="data/heat_load_profile_BDEW.csv",
             demand_no_thermal=f"data/EE_GitHub/electricity/elec_no_termal/elec_demand_no_thermal_{config_provider('energy','energy_totals_year')(wildcards={})}.csv", # In theory, it does not have to match energy_totals_year, but the year must be in the IDEES report and proper electricity demand must be available. Currently, electricity demand is available for: [2007, 2008, 2009, 2011, 2012, 2013, 2014, 2015, 2017, 2018, 2019]
         output:
@@ -78,7 +78,7 @@ if config_provider("ee","non_historic_cutout","enable")(wildcards={}):
             "../scripts/build_electricity_demand_non_historic_cutout.py"
 
 
-else:
+elif str(config_provider("ee","non_historic_cutout","enable")(wildcards={})) == 'False':
     print('Build electricity demand for historic cutout')
     rule build_electricity_demand:
             params:
@@ -105,6 +105,8 @@ else:
                 "../envs/environment.yaml"
             script:
                 "../scripts/build_electricity_demand.py"
+else:
+    raise ValueError('config[ee][non_historic_cutout][enable] must be false or true')
 
 
 rule build_powerplants:
