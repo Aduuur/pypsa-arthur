@@ -15,6 +15,7 @@ import logging
 from itertools import product
 
 import pandas as pd
+import numpy as np
 import geopandas as gpd 
 from numpy.polynomial import Polynomial
 
@@ -48,7 +49,7 @@ def merge_hdd(df1: pd.DataFrame, df2: pd.DataFrame) -> pd.DataFrame:
 
 
 def approximate_heat_demand(
-    energy_totals: pd.DataFrame, hdd: pd.DataFrame
+    energy_totals: pd.DataFrame, hdd: pd.DataFrame,cols
 ) -> pd.DataFrame:
     """
     Approximate heat demand for a set of countries based on energy totals and
@@ -78,12 +79,19 @@ def approximate_heat_demand(
 
     demands = {}
 
-    for kind, sector in product(["total", "electricity"], ["services", "residential"]):
+    for kind, sector, com in cols:
         # Use reduced number of years (2007-2021) for regression because it implicitly
         # assumes a constant building stock
         row = idx[:, 2007:2021]
-        col = f"{kind} {sector} space"
+        col = f"{kind} {sector} {com}"
         demand = energy_totals.loc[row, col].unstack(0)
+    
+        #Forward fill works only with Nan, not with 0.0 Values
+        for c in list(demand.columns):
+            for i in list(demand.index):
+                if demand[c].loc[i] == 0.0:
+                     demand.loc[i, c] = np.nan
+                     logger.info(f'For country {c} in year {i} changed {col} for heat from 0.0 to NaN.')
 
         # Forward-fill for GB in 2020 and backward-fill for CH 2007-2009
         # compromise to have more years available for the fit
@@ -113,7 +121,7 @@ def approximate_heat_demand(
 
         demand_approx = pd.DataFrame(demand_approx)
         demand_approx = pd.concat([demand, demand_approx]).sort_index()
-        demands[f"{kind} {sector} space"] = demand_approx.groupby(
+        demands[f"{kind} {sector} {com}"] = demand_approx.groupby(
             demand_approx.index
         ).sum()
 
@@ -131,12 +139,14 @@ if __name__ == "__main__":
 
     configure_logging(snakemake)
     
-    historic_cutout = bool(snakemake.params.historic_cutout)
+    non_historic_cutout = str(snakemake.params.non_historic_cutout)
+    heat_regression = str(snakemake.params.et_regression)
+    drop_leap_day = bool(snakemake.params.drop_leap_day)
     
     hdd = pd.read_csv(snakemake.input.hdd, index_col=0, parse_dates=True)  # all countries in PyPSA
     energy_totals = pd.read_csv(snakemake.input.energy_totals, index_col=[0, 1])
-
-    if not historic_cutout:
+    
+    if non_historic_cutout == 'True':
         # snippets from https://gist.github.com/fneum/d99e24e19da423038fd55fe3a4ddf875
         country_shapes_file = snakemake.input.country_shapes
         cutout_input = snakemake.input.cutout
@@ -144,23 +154,38 @@ if __name__ == "__main__":
         cutout = load_cutout(cutout_input)
         da = cutout.heat_demand(shapes=country_shapes)  # atlite function
         s = da.to_pandas()
+        if drop_leap_day == True:
+            s = s.drop(s.index[(s.index.month == 2) & (s.index.day == 29)])
 
         s = s.apply(lambda x: x.astype(int))  # convert all entries to integer
-        
-        # Remove historical heat demand from data if the cutout is not historical
-        remove_years = list(s.index.year.unique())
-        logger.info(
-            f'If year(s) {remove_years} exist in historic heat data (between 1990 and 2022), they are removed -> regression for missing values triggered'
-        )
-        indices_to_drop = energy_totals.index.get_level_values('year').isin(remove_years)
-        energy_totals = energy_totals.drop(index=energy_totals.index[indices_to_drop])
 
         # Replace existing and fill all missing timestamps
         hdd = merge_hdd(hdd, s)
+        
+        if heat_regression == 'True':
+            # Remove historical heat demand from data and so triggers regression 
+            remove_years = list(s.index.year.unique())
+            logger.info(
+                f'If year(s) {remove_years} exist in historic heat data (between 1990 and 2022), they are removed -> regression for missing values triggered'
+            )
+            indices_to_drop = energy_totals.index.get_level_values('year').isin(remove_years)
+            energy_totals = energy_totals.drop(index=energy_totals.index[indices_to_drop])
+        elif heat_regression == 'False':
+            pass
+        else:
+            raise ValueError('config[ee][non_historic_cutout][et_regression] must be false or true')
+
+        #Allow regression for water too
+        cols=product(["total", "electricity"], ["services", "residential"],['space', 'water'])
+    elif non_historic_cutout == 'False':
+        #Preserve default functionality. Updated for water by energy totals in prepare_sector_network
+        cols=product(["total", "electricity"], ["services", "residential"],['space'])
+    else:
+        raise ValueError('config[ee][non_historic_cutout][enable] must be false or true')
 
     hdd = hdd.groupby(hdd.index.year).sum().div(1e3)
 
     # Automatically replace all missing values/years present in HDD but missing in energy_totals using regression
-    heat_demand = approximate_heat_demand(energy_totals, hdd)
+    heat_demand = approximate_heat_demand(energy_totals, hdd, cols)
 
     heat_demand.to_csv(snakemake.output.heat_totals)

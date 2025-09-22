@@ -2,18 +2,18 @@
 #
 # SPDX-License-Identifier: MIT
 """
-Approximate cooling demand for all weather years. Derived from script build_heating_totals.py
-
+Approximate cooling demand for all weather years. Derived from script build_heat_totals.py
 """
 
 import logging
 from itertools import product
 
 import pandas as pd
-import geopandas as gpd  # added geopandas
+import numpy as np
+import geopandas as gpd
 from numpy.polynomial import Polynomial
 
-from scripts._helpers import configure_logging, load_cutout  # added load_cutout
+from scripts._helpers import configure_logging, load_cutout
 
 logger = logging.getLogger(__name__)
 
@@ -43,18 +43,18 @@ def merge_cdd(df1: pd.DataFrame, df2: pd.DataFrame) -> pd.DataFrame:
 
 
 def approximate_cooling_demand(
-    energy_totals_cool: pd.DataFrame, cdd: pd.DataFrame
+    energy_totals_cool: pd.DataFrame, cdd: pd.DataFrame, cols
 ) -> pd.DataFrame:
     """
-    Approximate cooling demand for a set of countries based on cooling totals and
+    Approximate cooling demand for a set of countries based on energy totals and
     cooling degree days (CDD). A polynomial regression of cooling demand on CDDs
     is performed using data from 2007 to 2021. Then, for 2022 and 2023 (and other missing years),
     the cooling demand is estimated from known CDDs based on the regression.
 
     Parameters
     ----------
-    cooling_totals : pd.DataFrame
-        DataFrame with energy consumption by sector (columns), country, and year. Generated using pypsa4cordex/clean_elec_demand
+    energy_totals_cool : pd.DataFrame
+        DataFrame with energy consumption by sector (columns), country, and year.
     cdd : pd.DataFrame
         DataFrame with number of cooling degree days by year (columns) and country (index).
 
@@ -65,7 +65,7 @@ def approximate_cooling_demand(
 
     Notes
     -----
-    - Missing data is forward-filled for GB in 2021 and 2021.
+    - Missing data is forward-filled for GB in 2020 and 2021.
     - If only one year of cooling data is available for a country, a point (0, 0) is added to allow the polynomial fit to work.
     """
 
@@ -73,15 +73,21 @@ def approximate_cooling_demand(
 
     demands = {}
 
-    for kind, sector in product(["total", "electricity"], ["services", "residential"]):
+    for kind, sector, com in cols:
         # Use reduced number of years (2007-2021) for regression because it implicitly
         # assumes a constant building stock
         row = idx[:, 2007:2021]
-        col = f"{kind} {sector} space"
+        col = f"{kind} {sector} {com}"
         demand = energy_totals_cool.loc[row, col].unstack(0)
 
+        # Forward fill works only with NaN, not with 0.0 values
+        for c in list(demand.columns):
+            for i in list(demand.index):
+                if demand[c].loc[i] == 0.0:
+                    demand.loc[i, c] = np.nan
+                    logger.info(f'For country {c} in year {i} changed {col} for cooling from 0.0 to NaN.')
+
         # Forward-fill for GB in 2020 and 2021
-        # compromise to have more years available for the fit
         demand = demand.ffill(axis=0).bfill(axis=0)
 
         demand_approx = {}
@@ -90,10 +96,6 @@ def approximate_cooling_demand(
             Y = demand[c].dropna()
             X = cdd.loc[Y.index, c]
 
-            # It could happen that we only have
-            # _one_ year of data to base the prediction on. In
-            # this case we add a point at 0, 0 to make the polynomial
-            # fit work.
             if len(X) == len(Y) == 1:
                 X.loc[-1] = 0
                 Y.loc[-1] = 0
@@ -108,7 +110,7 @@ def approximate_cooling_demand(
 
         demand_approx = pd.DataFrame(demand_approx)
         demand_approx = pd.concat([demand, demand_approx]).sort_index()
-        demands[f"{kind} {sector} space"] = demand_approx.groupby(
+        demands[f"{kind} {sector} {com}"] = demand_approx.groupby(
             demand_approx.index
         ).sum()
 
@@ -125,38 +127,50 @@ if __name__ == "__main__":
         snakemake = mock_snakemake("build_cooling_totals")
 
     configure_logging(snakemake)
-    
-    historic_cutout = bool(snakemake.params.historic_cutout)
+
+    non_historic_cutout = str(snakemake.params.non_historic_cutout)
+    cool_regression = str(snakemake.params.et_regression)
+    drop_leap_day = bool(snakemake.params.drop_leap_day)
 
     cdd = pd.read_csv(snakemake.input.cdd, index_col=0, parse_dates=True)  # all countries in PyPSA
-
     energy_totals_cool = pd.read_csv(snakemake.input.energy_totals_cooling, index_col=[0, 1])
 
-    if not historic_cutout:
-        # snippets from https://gist.github.com/fneum/d99e24e19da423038fd55fe3a4ddf875
+    if non_historic_cutout == 'True':
         country_shapes_file = snakemake.input.country_shapes
         cutout_input = snakemake.input.cutout
-        country_shapes = gpd.read_file(country_shapes_file).set_index('name')['geometry']  # only countries considered in this run
+        country_shapes = gpd.read_file(country_shapes_file).set_index('name')['geometry']
         cutout = load_cutout(cutout_input)
-        da = cutout.cooling_demand(shapes=country_shapes)  # atlite function
+        da = cutout.cooling_demand(shapes=country_shapes)
         s = da.to_pandas()
-
-        s = s.apply(lambda x: x.astype(int))  # convert all entries to integer
-        
-        # Remove historical cooling demand from data if the cutout is not historical
-        remove_years = list(s.index.year.unique())
-        logger.info(
-            f'If year(s) {remove_years} exist in historic cooling data (between 2020 and 2021), they are removed -> regression for missing values triggered'
-        )
-        indices_to_drop = energy_totals_cool.index.get_level_values('year').isin(remove_years)
-        energy_totals = energy_totals_cool.drop(index=energy_totals_cool.index[indices_to_drop])
+        if drop_leap_day == True:
+            s = s.drop(s.index[(s.index.month == 2) & (s.index.day == 29)])
+        s = s.apply(lambda x: x.astype(int))
 
         # Replace existing and fill all missing timestamps
         cdd = merge_cdd(cdd, s)
 
+        if cool_regression == 'True':
+            # Remove historical cooling demand from data and trigger regression
+            remove_years = list(s.index.year.unique())
+            logger.info(
+                f'If year(s) {remove_years} exist in historic cooling data (between 1990 and 2022), they are removed -> regression for missing values triggered'
+            )
+            indices_to_drop = energy_totals_cool.index.get_level_values('year').isin(remove_years)
+            energy_totals_cool = energy_totals_cool.drop(index=energy_totals_cool.index[indices_to_drop])
+        elif cool_regression == 'False':
+            pass
+        else:
+            raise ValueError('config[ee][non_historic_cutout][et_regression] must be false or true')
+    
+        # no water in cooling demand
+        cols = product(["total", "electricity"], ["services", "residential"], ["space"])
+    elif non_historic_cutout == 'False':
+        cols = product(["total", "electricity"], ["services", "residential"], ["space"])
+    else:
+        raise ValueError('config[ee][non_historic_cutout][enable] must be false or true')
+
     cdd = cdd.groupby(cdd.index.year).sum().div(1e3)
 
-    # Automatically replace all missing values/years present in CDD but missing in energy_totals_cool using regression
-    cooling_demand = approximate_cooling_demand(energy_totals_cool, cdd)
+    cooling_demand = approximate_cooling_demand(energy_totals_cool, cdd, cols)
 
     cooling_demand.to_csv(snakemake.output.cooling_totals)
