@@ -1,35 +1,7 @@
 # SPDX-FileCopyrightText: Contributors to PyPSA-Eur <https://github.com/pypsa/pypsa-eur>
 #
 # SPDX-License-Identifier: MIT
-if config_provider("ee","historic_cutout","enable")(wildcards={}):
-    print('Build electricity demand for historic cutout')
-    rule build_electricity_demand:
-            params:
-                snapshots=config_provider("snapshots"),
-                drop_leap_day=config_provider("enable", "drop_leap_day"),
-                countries=config_provider("countries"),
-                load=config_provider("load"),
-            input:
-                reported=ancient("data/electricity_demand_raw.csv"),
-                synthetic=lambda w: (
-                    ancient("data/load_synthetic_raw.csv")
-                    if config_provider("load", "supplement_synthetic")(w)
-                    else []
-                ),
-            output:
-                resources("electricity_demand.csv"),
-            log:
-                logs("build_electricity_demand.log"),
-            benchmark:
-                benchmarks("build_electricity_demand")
-            resources:
-                mem_mb=5000,
-            conda:
-                "../envs/environment.yaml"
-            script:
-                "../scripts/build_electricity_demand.py"
-
-elif config_provider("ee","historic_cutout","enable")(wildcards={})==False:
+if config_provider("ee","non_historic_cutout","enable")(wildcards={}):
     print('Build electricity demand for custom temperature data')
 
     rule build_daily_thermal_demand:
@@ -83,10 +55,10 @@ elif config_provider("ee","historic_cutout","enable")(wildcards={})==False:
             snapshots=config_provider("snapshots"),
             drop_leap_day=config_provider("enable", "drop_leap_day"),
             energy_totals_year=config_provider('energy','energy_totals_year'),
+            et_regression = config_provider("ee","non_historic_cutout","et_regeresison"),
         input:
             hdd=resources("cutout_daily_heating_demand.csv"),
             cdd=resources("cutout_daily_cooling_demand.csv"),
-            energy_totals=resources("energy_totals.csv"),
             energy_totals_heat=resources("heat_totals.csv"),
             energy_totals_cool="data/EE_GitHub/electricity/cooling_demand_idees_approx.csv",
             heat_profile="data/heat_load_profile_BDEW.csv",
@@ -104,6 +76,35 @@ elif config_provider("ee","historic_cutout","enable")(wildcards={})==False:
             "../envs/environment.yaml"
         script:
             "../scripts/build_electricity_demand_non_historic_cutout.py"
+
+
+else:
+    print('Build electricity demand for historic cutout')
+    rule build_electricity_demand:
+            params:
+                snapshots=config_provider("snapshots"),
+                drop_leap_day=config_provider("enable", "drop_leap_day"),
+                countries=config_provider("countries"),
+                load=config_provider("load"),
+            input:
+                reported=ancient("data/electricity_demand_raw.csv"),
+                synthetic=lambda w: (
+                    ancient("data/load_synthetic_raw.csv")
+                    if config_provider("load", "supplement_synthetic")(w)
+                    else []
+                ),
+            output:
+                resources("electricity_demand.csv"),
+            log:
+                logs("build_electricity_demand.log"),
+            benchmark:
+                benchmarks("build_electricity_demand")
+            resources:
+                mem_mb=5000,
+            conda:
+                "../envs/environment.yaml"
+            script:
+                "../scripts/build_electricity_demand.py"
 
 
 rule build_powerplants:
