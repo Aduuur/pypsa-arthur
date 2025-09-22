@@ -4,11 +4,15 @@
 
 #additional config
 ee:
-  historic_cutout:
-    enable: true
-    et_regression: true
-    hydro_regression: true
-
+  non_historic_cutout:
+    enable: true #false if historic cutout is used (pypsa_default)
+  #Following only applies if non_historic_cutout is enabled
+    # Regression behavior:
+    # - If the cutout year is outside 2007–2021 → regression is always applied.
+    # - If the cutout year is within 2007–2021 → that year is removed from historical data
+    #   and replaced by regression (missing years affect the regression parameters).
+    # - If et_regression = False → demand is taken directly from energy_totals_year (without regression), if available.
+    et_regression: false 
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#top-level-configuration
 version: v2025.07.0
