@@ -123,8 +123,6 @@ def approximate_missing_eia_stats(
         logger.info(f'Drop year {list(cutout_years)} if existing in datasets')
         eia_stats = eia_stats.drop(cutout_years) 
         runoff = runoff.drop(cutout_years)
-    else: #default behaviour
-        logger.info(f'Use historic year {list(cutout_years)} for hydropower calculation')
 
         if full_years_available: # If the cutout covers a full year and the data is not in ERA5 yet
             logger.info(f'Calculate runoff for year {list(cutout_years)}')
@@ -135,6 +133,8 @@ def approximate_missing_eia_stats(
 
         else: # Cutout does not cover a full year and the year is not in ERA5
             raise ValueError("Provide a whole year for runoff. Fallback to ERA5 is not possible. Provide runoff data for a full year.")
+    else: #default behaviour
+        logger.info(f'Use historic year {list(cutout_years)} for hydropower calculation')
     ##########
 
     # fix outliers; exceptional floods in 1977-1979 in ES & PT
