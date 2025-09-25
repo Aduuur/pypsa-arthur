@@ -25,30 +25,6 @@ if str(config_provider("ee","non_historic_cutout","enable")(wildcards={})) == 'T
             "../envs/environment.yaml"
         script:
             "../scripts/build_daily_thermal_demand.py"
-    
-    rule build_electric_thermal_demand_regression:
-        params:
-            max_scale=config_provider("ee","elec_thermal","max_scale"),
-            scaling_method= config_provider("ee","elec_thermal","scaling_method"),
-            energy_totals_year=config_provider('energy','energy_totals_year'),
-        input:
-            hdd=resources("cutout_daily_heating_demand.csv"),
-            cdd=resources("cutout_daily_cooling_demand.csv"),
-            hist_demand_day_calc="data/EE_GitHub/electricity/hist_demand_day_calc.csv",
-        output:
-            et_scale=resources("energy_totals_scaling.csv"),
-            elec_heat_reg_plot=directory(resources("plots/elec_heat_reg"))
-        log:
-            logs("energy_totals_scaling.log"),
-        benchmark:
-            benchmarks("energy_totals_scaling")
-        resources:
-            mem_mb=5000,
-        conda:
-            "../envs/environment.yaml"
-        script:
-            "../scripts/build_electric_thermal_demand_regression.py"
-
 
     rule build_electricity_demand_non_historic_cutout:
         params:
