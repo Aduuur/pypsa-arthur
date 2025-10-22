@@ -110,6 +110,8 @@ rule build_powerplants:
 
 
 rule build_powerplants_cooling_type_share:
+    params:
+        pps_type=config_provider('ee','pp_add_cooling_types')
     input:
         jrc_list = 'data/EE_GitHub/JRC-PPDB-OPEN.ver1.0/JRC_OPEN_UNITS.csv',
         regions_onshore=resources("regions_onshore_base_s_{clusters}.geojson")
