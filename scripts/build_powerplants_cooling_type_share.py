@@ -34,17 +34,27 @@ if __name__ == "__main__":
     jrc = gpd.sjoin(jrc_gdf, regions[['name', 'geometry']], predicate="within", how="left")
     jrc = jrc.rename(columns={'name': 'bus'})
 
+    # Mapping: original tech -> standardized tech
+    tech_mapping = {
+        'Nuclear':'nuclear',
+        'Coal':'coal',
+        'Fossil Gas':'CCGT',
+        'Fossil Brown coal/Lignite':'lignite',
+        'Fossil Hard coal':'coal',
+        'Biomass':'biomass',
+    }
+
     all_shares = pd.DataFrame()
-    tech_list=['Nuclear', 'Coal', 'CCGT', 'Biomass']
-    for tech in tech_list:
-        # Filter by tech and sum capacity
+    for original_tech, std_tech in tech_mapping.items():
+        # Filter and sum capacity per bus + cooling_type
+        
         shares = (
-            jrc.loc[jrc['type_g'] == tech]
+            jrc.loc[jrc['type_g'] == original_tech]
             .groupby(['bus', 'cooling_type'])
             .sum(numeric_only=True)['capacity_g']
         )
 
-        # Normalize cooling type names
+        # Normalize cooling types
         shares = shares.rename_axis(index=['bus', 'cooling_type']).rename({
             'Mechanical Draught Tower': 'closed-loop',
             'Natural Draught Tower': 'closed-loop',
@@ -54,35 +64,34 @@ if __name__ == "__main__":
         })
 
         # Convert to DataFrame
-        shares = shares.reset_index().rename(columns={'capacity_g': f'capacity_g_{tech}'})
+        shares = shares.reset_index().rename(columns={'capacity_g': 'capacity'})
 
         # Compute total capacity per bus
         total_cap = (
-            shares.groupby('bus')[f'capacity_g_{tech}']
+            shares.groupby('bus')['capacity']
             .sum()
-            .rename(f'total_cap_{tech}')
+            .rename('total_capacity')
             .reset_index()
         )
 
         # Merge totals
         shares = shares.merge(total_cap, on='bus', how='left')
 
-        # Compute shares
-        shares[f'share_{tech}'] = shares[f'capacity_g_{tech}'] / shares[f'total_cap_{tech}']
+        # Compute share
+        shares['share'] = shares['capacity'] / shares['total_capacity']
 
-        # Combine all techs
-        if all_shares.empty:
-            all_shares = shares
-        else:
-            all_shares = pd.merge(
-                all_shares, shares,
-                on=['bus', 'cooling_type'],
-                how='outer'
-            )
+        # Add standardized tech column
+        shares['carrier'] = std_tech
 
-    # Fill missing values
-    all_shares = all_shares.fillna(0)
+        # Keep only needed columns
+        shares = shares[['bus', 'carrier', 'cooling_type', 'capacity', 'total_capacity', 'share']]
+        # Combine with all_shares
+        all_shares = pd.concat([all_shares, shares], ignore_index=True)
 
-    logger.info(f'Created cooling type share per bus for {tech_list}')
-    all_shares.to_csv(snakemake.output.pp_ct_share, index=False)
+    # # Create combined index: bus + tech
+    all_shares['bus_tech'] = all_shares['bus'] + ' ' + all_shares['carrier']
+    all_shares = all_shares.set_index('bus_tech')
+
+    logger.info(f'Created cooling type share per bus')
+    all_shares.to_csv(snakemake.output.pp_ct_share)
 
