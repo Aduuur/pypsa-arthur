@@ -109,6 +109,25 @@ rule build_powerplants:
         "../scripts/build_powerplants.py"
 
 
+rule build_powerplants_cooling_type_share:
+    input:
+        jrc_list = 'data/EE_GitHub/JRC-PPDB-OPEN.ver1.0/JRC_OPEN_UNITS.csv',
+        regions_onshore=resources("regions_onshore_base_s_{clusters}.geojson")
+    output:
+        pp_ct_share = resources('powerplants_s_{clusters}_cooling_share.csv')
+    log:
+        logs('build_powerplants_s_{clusters}_cooling_type_share.log')
+    benchmark:
+        benchmarks('build_powerplants_s_{clusters}_cooling_type_share')
+    threads: 1
+    resources:
+        mem_mb=1000,
+    conda:
+        "../envs/environment.yaml"
+    script:
+        "../scripts/build_powerplants_cooling_type_share.py"
+
+
 def input_base_network(w):
     base_network = config_provider("electricity", "base_network")(w)
     osm_prebuilt_version = config_provider("electricity", "osm-prebuilt-version")(w)
@@ -790,6 +809,7 @@ rule add_electricity:
         unpack(input_profile_tech),
         unpack(input_class_regions),
         unpack(input_conventional),
+        pp_ct_share = resources('powerplants_s_{clusters}_cooling_share.csv'),
         base_network=resources("networks/base_s_{clusters}.nc"),
         tech_costs=lambda w: resources(
             f"costs_{config_provider('costs', 'year')(w)}.csv"
@@ -816,8 +836,8 @@ rule add_electricity:
         mem_mb=10000,
     conda:
         "../envs/environment.yaml"
-    script:
-        "../scripts/add_electricity.py"
+    notebook:
+        "../scripts/add_electricity.py.ipynb"
 
 
 rule prepare_network:
