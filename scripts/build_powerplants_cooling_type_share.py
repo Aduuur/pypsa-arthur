@@ -37,7 +37,6 @@ if __name__ == "__main__":
     # Mapping: original tech -> standardized tech
     tech_mapping = {
         'Nuclear':'nuclear',
-        'Coal':'coal',
         'Fossil Gas':'CCGT',
         'Fossil Brown coal/Lignite':'lignite',
         'Fossil Hard coal':'coal',
