@@ -45,6 +45,7 @@ if __name__ == "__main__":
         'lignite':'Fossil Brown coal/Lignite',
         'coal':'Fossil Hard coal',
         'biomass':'Biomass',
+        'H2':'H2' #is empty 
     }
 
     all_shares = pd.DataFrame()
