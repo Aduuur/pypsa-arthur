@@ -6,6 +6,7 @@ import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point
 import logging
+import itertools
 
 from scripts._helpers import configure_logging, set_scenario_config
 
@@ -25,6 +26,7 @@ if __name__ == "__main__":
 
     jrc_list = pd.read_csv(snakemake.input.jrc_list)
     regions = gpd.read_file(snakemake.input.regions_onshore)
+    all_buses=regions.name.unique()
 
     # Location of each powerplant in jrc
     geometry = [Point(xy) for xy in zip(jrc_list["lon"], jrc_list["lat"])]
@@ -91,59 +93,41 @@ if __name__ == "__main__":
         capacities["carrier"] = tech
 
         shares = capacities[["bus", "carrier", "cooling_type", "capacity", "total_capacity", "share"]]
-
+        shares_safe=shares.copy()
         ####
-        # Ensuring all expected cooling types exist for each bus and carrier
-        all_rows = []
-        for (bus, carrier), group in shares.groupby(["bus", "carrier"], sort=False):
-            existing_ct = set(group["cooling_type"])
+        # Ensuring all expected cooling types exist for each bus for carrier/tech
+        
+        for bus in all_buses:
+            bus_tech_rows=shares.loc[(shares['bus'] == bus) & (shares['carrier'] == tech)].copy()
+   
+            existing_ct=bus_tech_rows.cooling_type.unique()
             missing_ct = [ct for ct in ct_exp_index if ct not in existing_ct]
 
-            if not missing_ct:
-                # Case 0: all expected types present
-                group = group.copy()
-                group["status"] = "original"
-
-            elif len(existing_ct) == 0:
-                # Case 2: no cooling type at all
-                new_rows = pd.DataFrame({
-                    "bus": bus,
-                    "carrier": carrier,
-                    "cooling_type": ct_exp_index,
-                    "capacity": 0,
-                    "total_capacity": 0,
-                    "share": share_ct.values,
-                    "status": "all_missing"
+            bus_tech_rows['val_origin']='jrc'
+            all_shares=pd.concat([all_shares,bus_tech_rows], axis=0)
+            
+            
+            new_row=bus_tech_rows.copy()
+            
+            for ct in missing_ct:
+                if len(missing_ct) < len(ct_exp_index):
+                    new_row.cooling_type = ct
+                    new_row.capacity=0
+                    new_row.share=0
+                    new_row.val_origin='bus_zero'
+                    all_shares=pd.concat([all_shares,new_row], axis=0)
+                else:
+                    new_row = pd.DataFrame({
+                    "bus": [bus],
+                    "carrier": [tech],
+                    "cooling_type": [ct],
+                    "capacity": [0],
+                    "total_capacity": [0],
+                    "share": [share_ct[ct]],
+                    "val_origin": ["all_missing"]
                 })
-                group = new_rows
-
-            else:
-                # Case 1: some cooling types missing
-                total_capacity = group["total_capacity"].iloc[0]
-                new_rows = pd.DataFrame({
-                    "bus": bus,
-                    "carrier": carrier,
-                    "cooling_type": missing_ct,
-                    "capacity": 0,
-                    "total_capacity": total_capacity,
-                    "share": 0,
-                    "status": "partial_replace"
-                })
-                group = pd.concat([group.assign(status="original"), new_rows], ignore_index=True)
-
-            all_rows.append(group)
-
-        shares_full = pd.concat(all_rows, ignore_index=True)
-        shares_full["cooling_type"] = pd.Categorical(
-            shares_full["cooling_type"],
-            categories=ct_exp_index,
-            ordered=True
-        )
-        shares_full = shares_full.sort_values(
-            ["bus", "carrier", "cooling_type"]
-        ).reset_index(drop=True)
-
-        all_shares = pd.concat([all_shares, shares_full], ignore_index=True)
+                    all_shares=pd.concat([all_shares,new_row], axis=0)
+                    
 
     if not all_shares.empty:
         all_shares["bus_tech"] = all_shares["bus"] + " " + all_shares["carrier"]
