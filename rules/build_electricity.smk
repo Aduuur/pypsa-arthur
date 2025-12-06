@@ -129,6 +129,26 @@ rule build_powerplants_cooling_type_share:
     script:
         "../scripts/build_powerplants_cooling_type_share.py"
 
+rule build_powerplants_p_max_pu:
+    params:
+        climatedata_generators_t_p_max_pu_path = config_provider('ee','climatedata_generators_t_p_max_pu_path'),
+        CF_profile_tpp = "tpp{CT}_p{PP}_{clim}_notAgg_pypsa.nc"
+    input:
+        regions_onshore=resources("regions_onshore_base_s_{clusters}.geojson"),
+    output:
+        CF_profile_tpp_agg = resources("tpp{CT}_p{PP}_m{clim}_s{clusters}.csv")
+    log:
+        logs('build_powerplants_tpp{CT}_p{PP}_{clim}_s_{clusters}_p_max_pu.log')
+    benchmark:
+        benchmarks('build_powerplants_tpp{CT}_p{PP}_{clim}_s_{clusters}_p_max_pu')
+    threads: 4
+    resources:
+        mem_mb=2000,
+    conda:
+        "../envs/environment.yaml"
+    script:
+        "../scripts/build_powerplants_p_max_pu.py"
+
 
 def input_base_network(w):
     base_network = config_provider("electricity", "base_network")(w)
@@ -774,6 +794,17 @@ def input_profile_tech(w):
         for tech in config_provider("electricity", "renewable_carriers")(w)
     }
 
+def input_profile_tpp_cooling(w):
+    clim_list = [config_provider("ee", "climatedata_generators_t_p_max_pu")(w)]
+    pp_list = config_provider("ee", "pp_add_cooling_types")(w)
+
+    if clim_list[0]:
+        return {
+            f"CF_profile_tpp{CT}_p{PP}":
+                resources(f"tpp{CT}_p{PP}_m{clim}_s{w.clusters}.csv")
+            for PP, CT, clim in product(pp_list, ['OT', 'CL'], clim_list)
+        }
+    return {}
 
 def input_conventional(w):
     carriers = [
@@ -812,6 +843,7 @@ rule add_electricity:
         unpack(input_profile_tech),
         unpack(input_class_regions),
         unpack(input_conventional),
+        unpack(input_profile_tpp_cooling),
         pp_ct_cost_change="data/EE_GitHub/powerplant_cost_eff.csv",
         pp_ct_share = resources('powerplants_s_{clusters}_cooling_share.csv'),
         base_network=resources("networks/base_s_{clusters}.nc"),

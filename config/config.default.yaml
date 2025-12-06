@@ -15,6 +15,11 @@ ee:
     et_regression: false
   #split [nuclear, lignite, coal, CCGT, biomass, H2] into closed-loop, dry-cooling and once-through
   pp_add_cooling_types: [nuclear, lignite, coal, CCGT, biomass, H2]
+  #add climate data in form MPI-M-MPI-ESM-LR_rcp85_2041 which is then used for time dependent CF for thermal PP (generators_t.p_max.pu)
+  #False to skipp
+  climatedata_generators_t_p_max_pu: False
+  #path to folder where CF from tpp are stored
+  climatedata_generators_t_p_max_pu_path: '/home/paul/src/cd2es/results/europe/MPI-M-MPI-ESM-LR/techfiles'
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#top-level-configuration
 version: v2025.07.0

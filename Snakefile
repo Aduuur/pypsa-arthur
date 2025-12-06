@@ -7,6 +7,7 @@ import yaml
 from os.path import normpath, exists, join
 from shutil import copyfile, move, rmtree
 from snakemake.utils import min_version
+from itertools import product
 
 min_version("8.11")
 
