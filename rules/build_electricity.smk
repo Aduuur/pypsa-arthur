@@ -791,6 +791,7 @@ def input_conventional(w):
 
 rule add_electricity:
     params:
+        pps_type=config_provider('ee','pp_add_cooling_types'),
         line_length_factor=config_provider("lines", "length_factor"),
         link_length_factor=config_provider("links", "length_factor"),
         scaling_factor=config_provider("load", "scaling_factor"),
@@ -811,6 +812,7 @@ rule add_electricity:
         unpack(input_profile_tech),
         unpack(input_class_regions),
         unpack(input_conventional),
+        pp_ct_cost_change="data/EE_GitHub/powerplant_cost_eff.csv",
         pp_ct_share = resources('powerplants_s_{clusters}_cooling_share.csv'),
         base_network=resources("networks/base_s_{clusters}.nc"),
         tech_costs=lambda w: resources(
