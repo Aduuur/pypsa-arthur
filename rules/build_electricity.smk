@@ -132,7 +132,9 @@ rule build_powerplants_cooling_type_share:
 rule build_powerplants_p_max_pu:
     params:
         climatedata_generators_t_p_max_pu_path = config_provider('ee','climatedata_generators_t_p_max_pu_path'),
-        CF_profile_tpp = "tpp{CT}_p{PP}_{clim}_notAgg_pypsa.nc"
+        clim = lambda wildcards: wildcards.clim,
+        cool_type = lambda wildcards: wildcards.CT,
+        pp_type = lambda wildcards: wildcards.PP,
     input:
         regions_onshore=resources("regions_onshore_base_s_{clusters}.geojson"),
     output:
@@ -796,13 +798,14 @@ def input_profile_tech(w):
 
 def input_profile_tpp_cooling(w):
     clim_list = [config_provider("ee", "climatedata_generators_t_p_max_pu")(w)]
-    pp_list = config_provider("ee", "pp_add_cooling_types")(w)
-
+    cd2es_mapping=config_provider("ee", "cd2es_mapping")(w)
+    pp_list_pypsa = config_provider("ee", "pp_add_cooling_types")(w)
+    pp_list_cd2es = list(dict.fromkeys(cd2es_mapping[x] for x in pp_list_pypsa))
     if clim_list[0]:
         return {
             f"CF_profile_tpp{CT}_p{PP}":
                 resources(f"tpp{CT}_p{PP}_m{clim}_s{w.clusters}.csv")
-            for PP, CT, clim in product(pp_list, ['OT', 'CL'], clim_list)
+            for PP, CT, clim in product(pp_list_cd2es, ['OT', 'CL'], clim_list)
         }
     return {}
 
