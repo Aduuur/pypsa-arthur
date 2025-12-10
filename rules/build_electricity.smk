@@ -111,7 +111,7 @@ rule build_powerplants:
 
 rule build_powerplants_cooling_type_share:
     params:
-        pps_type=config_provider('ee','pp_add_cooling_types')
+        pps_type=config_provider('ee','pp_cooling','add_cooling_types')
     input:
         jrc_list = 'data/EE_GitHub/JRC-PPDB-OPEN.ver1.0/JRC_OPEN_UNITS.csv',
         regions_onshore=resources("regions_onshore_base_s_{clusters}.geojson")
@@ -131,11 +131,11 @@ rule build_powerplants_cooling_type_share:
 
 rule build_powerplants_p_max_pu:
     params:
-        climatedata_generators_t_p_max_pu_path = config_provider('ee','climatedata_generators_t_p_max_pu_path'),
+        climatedata_generators_t_p_max_pu_path = config_provider('ee','pp_cooling','climatedata_generators_t_p_max_pu_path'),
         clim = lambda wildcards: wildcards.clim,
         cool_type = lambda wildcards: wildcards.CT,
         pp_type = lambda wildcards: wildcards.PP,
-        cd2es_mapping = config_provider("ee", "cd2es_mapping")
+        cd2es_mapping = config_provider("ee", "pp_cooling","cd2es_mapping")
     input:
         regions_onshore=resources("regions_onshore_base_s_{clusters}.geojson"),
     output:
@@ -798,13 +798,13 @@ def input_profile_tech(w):
     }
 
 def input_profile_tpp_cooling(w):
-    clim_list = [config_provider("ee", "climatedata_generators_t_p_max_pu")(w)]
-    pp_list_pypsa = config_provider("ee", "pp_add_cooling_types")(w)
+    climatedata_generators_t_p_max_pu = [config_provider("ee", "pp_cooling","climatedata_generators_t_p_max_pu")(w)]
+    pp_list_pypsa = config_provider("ee", "pp_cooling","add_cooling_types")(w)
     if clim_list[0]:
         return {
             f"CF_profile_tpp{CT}_{PP}":
                 resources(f"tpp{CT}_{PP}_m{clim}_s{w.clusters}.csv")
-            for PP, CT, clim in product(pp_list_pypsa, ['OT', 'CL'], clim_list)
+            for PP, CT, clim in product(pp_list_pypsa, ['OT', 'CL'], climatedata_generators_t_p_max_pu)
         }
     return {}
 
@@ -820,11 +820,15 @@ def input_conventional(w):
         for attr, fn in d.items()
         if str(fn).startswith("data/")
     }
+def input_cooling_type():
+    if not pps_type=config_provider('ee',"pp_cooling",'add_cooling_types')(w): #if not empty
+        return {pp_ct_share:resources('powerplants_s_{clusters}_cooling_share.csv'}
+    return {}
 
 
 rule add_electricity:
     params:
-        pps_type=config_provider('ee','pp_add_cooling_types'),
+        pps_type=config_provider('ee','pp_cooling','add_cooling_types'),
         line_length_factor=config_provider("lines", "length_factor"),
         link_length_factor=config_provider("links", "length_factor"),
         scaling_factor=config_provider("load", "scaling_factor"),
@@ -846,8 +850,8 @@ rule add_electricity:
         unpack(input_class_regions),
         unpack(input_conventional),
         unpack(input_profile_tpp_cooling),
+        unpack(input_cooling_type),
         pp_ct_cost_change="data/EE_GitHub/powerplant_cost_eff.csv",
-        pp_ct_share = resources('powerplants_s_{clusters}_cooling_share.csv'),
         base_network=resources("networks/base_s_{clusters}.nc"),
         tech_costs=lambda w: resources(
             f"costs_{config_provider('costs', 'year')(w)}.csv"
