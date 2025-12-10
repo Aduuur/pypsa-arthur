@@ -367,6 +367,7 @@ def load_and_aggregate_powerplants(
         "efficiency",
         "capital_cost",
         "marginal_cost",
+        "investment", ## for dividing powerplants by cooling type
         "fuel",
         "lifetime",
     ]
@@ -385,6 +386,13 @@ def load_and_aggregate_powerplants(
         **aggregation_strategies.get("generators", {}),
     }
     strategies = {k: v for k, v in strategies.items() if k in ppl.columns}
+
+    ## for dividing powerplants by cooling type
+    if "investment" in ppl.columns:
+        strategies["investment"] = "capacity_weighted_average"
+    if "fuel" in ppl.columns:
+        strategies["fuel"] = "capacity_weighted_average"
+    ##
 
     to_aggregate = ~ppl.carrier.isin(exclude_carriers)
     df = ppl[to_aggregate].copy()
@@ -423,6 +431,63 @@ def load_and_aggregate_powerplants(
     )
 
     return pd.concat([aggregated, disaggregated])
+
+
+def div_generator_by_cooling(ppl: pd.DataFrame,
+                             pps_type: list,
+                             pp_ct_cost_change: str,
+                             pp_ct_share:str):
+    '''
+    Expands thermal technologies by cooling type variants.
+    - e.g. biomass -> biomass dry-cooling, biomass closed-loop, biomass onve through
+    - for pps_type "nuclear", "CCGT", "lignite", "coal", "biomass" in config('ee','pp_add_cooling_types')
+
+    1) Expand by thermal technologies
+    2) Scale:
+        a) p_nom by share of cooling type at each node using pp_ct_share determinded from jrc report. Also contains dummys (consistency).
+        b) adjust costs
+            i) efficiency and investment by values from pp_ct_cost_change="data/EE_GitHub/powerplant_cost_eff.csv". Approach taken from cd2es-tool
+            ii) capitalCost_{new} = annuityFactor * investment_{new} * Nyears AND capitalCost_{old} = annuityFactor * investment_{old} * Nyears
+                with annuityFactor = const AND Nyears = const
+                -> capitalCost_{new} = capitalCost_{old} * (investment_{new}/investment_{old})
+            iii) marginals_{new} = VOM + fuel/eff_{new} AND marginals_{old} = VOM + fuel/eff_{old}
+                with fuel= const AND VOM = const
+                ->  marginals_new=marginals_old + fuel*(1/eff_{new} - 1/eff_{old})
+    '''
+
+    share=pd.read_csv(pp_ct_share, index_col='bus_tech') #share of different powerplants and cooling types at each node
+    cooling_factors = pd.read_csv(pp_ct_cost_change,comment="#",).set_index("cooling_type") # factors to scale efficiency and costs for cooling type
+
+    df_new=pd.DataFrame()
+    for index, row in ppl.iterrows():
+        if row.carrier in pps_type:
+            for idx_ct, row_ct in share.loc[row.name].iterrows():
+                # copy row and rename
+                new_row=row.copy()
+                new_row=new_row.rename(f'{new_row.name} {row_ct.cooling_type}')
+
+                #adjust p_nom by share of cooling type
+                new_row.p_nom=new_row.p_nom*row_ct.share
+
+                ##### adjust costs
+                vals = cooling_factors.loc[row_ct.cooling_type]
+                
+                # --- adjust efficiency and investment ---
+                new_row["efficiency"] = row["efficiency"] * vals["efficiency_factor"]
+                new_row["investment"] = row["investment"] + vals["inv_add_on"]
+
+                # recalc annualized capital cost ---
+                new_row["capital_cost"] = row["capital_cost"] * ( new_row["investment"] / row["investment"])
+
+                # recalc marginal cost with updated efficiency
+                new_row["marginal_cost"] = row["marginal_cost"] + row["fuel"] * (1/new_row["efficiency"] - 1/row["efficiency"] )
+
+
+                df_new=pd.concat([df_new,new_row], axis=1)
+        else:
+            df_new=pd.concat([df_new, row], axis=1)
+
+    return df_new.T.apply(pd.to_numeric, errors="ignore") #convert convertable columns to numeric
 
 
 def attach_load(
@@ -724,6 +789,27 @@ def attach_conventional_generators(
             else:
                 # Single value affecting all generators of technology k indiscriminantely of country
                 n.generators.loc[idx, attr] = values
+
+
+def time_dependent_p_max_pu(n, pp_CF_path, smk_input_name):
+    """
+    Add time-dependent capacity factors (from cd2es) for thermal power plants:
+    nuclear, lignite, coal, CCGT, biomass and H2.
+    """
+    try:
+        df = pd.read_csv(pp_CF_path, index_col=0)
+    except Exception:
+        raise ValueError(f"Could not open {pp_CF_path}")
+
+    valid_cols = df.columns.intersection(n.generators.index)
+    n.generators_t.p_max_pu[valid_cols] = df[valid_cols].values
+
+    name_pp_tech = smk_input_name.rsplit('_', 1)[-1]
+    logger.info(f"Using time-dependent values for p_max_pu for {name_pp_tech} (generators_t.p_max_pu)")
+
+    if n.generators.p_max_pu[valid_cols].mean() != 1:
+        n.generators.loc[:, 'p_max_pu'] = 1
+        logger.info(f"Values for generators.p_max_pu (likely from config(conventional,{name_pp_tech},p_max_pu)) have been overwritten by 1.0 because time-dependent values are now applied (generators_t.p_max_pu)")
 
 
 def attach_hydro(
@@ -1190,6 +1276,14 @@ if __name__ == "__main__":
         params.exclude_carriers,
     )
 
+    ##For calculation of cooling types for thermal powerplants
+    pps_type=snakemake.params.pps_type
+    if pps_type: # if empty -> skip (default functionality of script)
+        pp_ct_cost_change = snakemake.input.pp_ct_cost_change
+        pp_ct_share = snakemake.input.pp_ct_share
+        ppl = div_generator_by_cooling(ppl,pps_type,pp_ct_cost_change,pp_ct_share)
+        logger.info(f'Divided all powerplants with carrier {pps_type} into cooling type dry-cooling, once-through and closed loop.')
+
     attach_load(
         n,
         snakemake.input.load,
@@ -1235,6 +1329,11 @@ if __name__ == "__main__":
         unit_commitment=unit_commitment,
         fuel_price=fuel_price,
     )
+
+    ## Add time-dependent capacity factors for thermal power plants
+    for smk_input_name, pp_CF_path in snakemake.input.items():
+        if 'CF_profile_tpp' in smk_input_name:
+            time_dependent_p_max_pu(n, pp_CF_path, smk_input_name)
 
     attach_wind_and_solar(
         n,
