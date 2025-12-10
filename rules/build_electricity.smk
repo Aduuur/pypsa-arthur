@@ -800,7 +800,7 @@ def input_profile_tech(w):
 def input_profile_tpp_cooling(w):
     climatedata_generators_t_p_max_pu = [config_provider("ee", "pp_cooling","climatedata_generators_t_p_max_pu")(w)]
     pp_list_pypsa = config_provider("ee", "pp_cooling","add_cooling_types")(w)
-    if clim_list[0]:
+    if  climatedata_generators_t_p_max_pu[0]:
         return {
             f"CF_profile_tpp{CT}_{PP}":
                 resources(f"tpp{CT}_{PP}_m{clim}_s{w.clusters}.csv")
@@ -820,9 +820,9 @@ def input_conventional(w):
         for attr, fn in d.items()
         if str(fn).startswith("data/")
     }
-def input_cooling_type():
-    if not pps_type=config_provider('ee',"pp_cooling",'add_cooling_types')(w): #if not empty
-        return {pp_ct_share:resources('powerplants_s_{clusters}_cooling_share.csv'}
+def input_cooling_type(w):
+    if not config_provider('ee',"pp_cooling",'add_cooling_types')(w): #if not empty
+        return {pp_ct_share:resources('powerplants_s_{clusters}_cooling_share.csv')}
     return {}
 
 
