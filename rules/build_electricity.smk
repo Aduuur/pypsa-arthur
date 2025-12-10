@@ -135,14 +135,15 @@ rule build_powerplants_p_max_pu:
         clim = lambda wildcards: wildcards.clim,
         cool_type = lambda wildcards: wildcards.CT,
         pp_type = lambda wildcards: wildcards.PP,
+        cd2es_mapping = config_provider("ee", "cd2es_mapping")
     input:
         regions_onshore=resources("regions_onshore_base_s_{clusters}.geojson"),
     output:
-        CF_profile_tpp_agg = resources("tpp{CT}_p{PP}_m{clim}_s{clusters}.csv")
+        CF_profile_tpp_agg = resources("tpp{CT}_{PP}_m{clim}_s{clusters}.csv")
     log:
-        logs('build_powerplants_tpp{CT}_p{PP}_{clim}_s_{clusters}_p_max_pu.log')
+        logs('build_powerplants_tpp{CT}_{PP}_{clim}_s_{clusters}_p_max_pu.log')
     benchmark:
-        benchmarks('build_powerplants_tpp{CT}_p{PP}_{clim}_s_{clusters}_p_max_pu')
+        benchmarks('build_powerplants_tpp{CT}_{PP}_{clim}_s_{clusters}_p_max_pu')
     threads: 4
     resources:
         mem_mb=2000,
@@ -798,14 +799,12 @@ def input_profile_tech(w):
 
 def input_profile_tpp_cooling(w):
     clim_list = [config_provider("ee", "climatedata_generators_t_p_max_pu")(w)]
-    cd2es_mapping=config_provider("ee", "cd2es_mapping")(w)
     pp_list_pypsa = config_provider("ee", "pp_add_cooling_types")(w)
-    pp_list_cd2es = list(dict.fromkeys(cd2es_mapping[x] for x in pp_list_pypsa))
     if clim_list[0]:
         return {
-            f"CF_profile_tpp{CT}_p{PP}":
-                resources(f"tpp{CT}_p{PP}_m{clim}_s{w.clusters}.csv")
-            for PP, CT, clim in product(pp_list_cd2es, ['OT', 'CL'], clim_list)
+            f"CF_profile_tpp{CT}_{PP}":
+                resources(f"tpp{CT}_{PP}_m{clim}_s{w.clusters}.csv")
+            for PP, CT, clim in product(pp_list_pypsa, ['OT', 'CL'], clim_list)
         }
     return {}
 

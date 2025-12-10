@@ -27,11 +27,13 @@ if __name__ == "__main__":
     clim = snakemake.params.clim
     climatedata_generators_t_p_max_pu_path = snakemake.params.climatedata_generators_t_p_max_pu_path
 
+    cd2es_mapping = snakemake.params.cd2es_mapping
     cooling_mapping={'CL':'closed-loop','OT':'once-through'}
 
     regions = gpd.read_file(snakemake.input.regions_onshore)
 
-    climdat_path=os.path.join(climatedata_generators_t_p_max_pu_path,f"tpp{cool_type}_p{pp_type}_m{clim}_notAgg_pypsa.nc")
+    climdat_path=os.path.join(climatedata_generators_t_p_max_pu_path,f"tpp{cool_type}_p{cd2es_mapping[pp_type]}_m{clim}_notAgg_pypsa.nc")
+    logger.info(f"Build cooling type file {snakemake.output.CF_profile_tpp_agg} from cd2es file {climdat_path}")
     climate_data=xr.open_dataset(climdat_path)
 
     # Convert DataFrame to GeoDataFrame
