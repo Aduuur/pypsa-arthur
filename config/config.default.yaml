@@ -14,7 +14,7 @@ ee:
     # - If et_regression = False → demand is taken directly from energy_totals_year (without regression), if available.
     et_regression: false
   pp_cooling: #split [nuclear, lignite, coal, CCGT, biomass, H2] into closed-loop, dry-cooling and once-through
-    pp_add_cooling_types: [nuclear, lignite, coal, CCGT, biomass, H2] #[nuclear, lignite, coal, CCGT, biomass, H2]
+    pp_add_cooling_types: [nuclear, lignite, coal, CCGT, biomass, H2] #[nuclear, lignite, coal, CCGT, biomass, H2] and skipp pp_cooling completely for []
     #Add time dependent CF for thermal powerplants (generators_t.p_max.pu)
     climatedata_generators_t_p_max_pu: False #Name of climate data file (e.g. MPI-M-MPI-ESM-LR_rcp85_2041) or False to skipp
     climatedata_generators_t_p_max_pu_path: '/home/paul/src/cd2es/results/europe/MPI-M-MPI-ESM-LR/techfiles' #path to folder where CF from tpp are stored

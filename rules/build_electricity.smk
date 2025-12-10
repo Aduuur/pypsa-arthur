@@ -821,8 +821,8 @@ def input_conventional(w):
         if str(fn).startswith("data/")
     }
 def input_cooling_type(w):
-    if not config_provider('ee',"pp_cooling",'add_cooling_types')(w): #if not empty
-        return {pp_ct_share:resources('powerplants_s_{clusters}_cooling_share.csv')}
+    if config_provider('ee',"pp_cooling",'add_cooling_types')(w): #if not empty
+        return {'pp_ct_share':resources('powerplants_s_{clusters}_cooling_share.csv')}
     return {}
 
 
