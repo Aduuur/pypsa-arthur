@@ -1,33 +1,88 @@
 # SPDX-FileCopyrightText: Contributors to PyPSA-Eur <https://github.com/pypsa/pypsa-eur>
 #
 # SPDX-License-Identifier: MIT
+if str(config_provider("ee","non_historic_cutout","enable")(wildcards={})) == 'True':
+    print('Build electricity demand for custom temperature data')
+
+    rule build_daily_thermal_demand:
+        params:
+            thermal_type=lambda wildcards: wildcards.thermal_type,
+            snapshots=config_provider("snapshots"),
+            drop_leap_day=config_provider("enable", "drop_leap_day"),
+        input:
+            cutout=lambda w: input_cutout(w),
+            country_shapes=resources("country_shapes.geojson"),
+            pop_layout_total=resources("pop_layout_total.nc"),
+        output:
+            resources("cutout_daily_{thermal_type}_demand.csv")
+        log:
+            logs("cutout_daily_{thermal_type}_demand.log"),
+        benchmark:
+            benchmarks("cutout_daily_{thermal_type}_demand")
+        resources:
+            mem_mb=5000,
+        conda:
+            "../envs/environment.yaml"
+        script:
+            "../scripts/build_daily_thermal_demand.py"
+
+    rule build_electricity_demand_non_historic_cutout:
+        params:
+            snapshots=config_provider("snapshots"),
+            drop_leap_day=config_provider("enable", "drop_leap_day"),
+            energy_totals_year=config_provider('energy','energy_totals_year'),
+            et_regression = config_provider("ee","non_historic_cutout","et_regression"),
+        input:
+            hdd=resources("cutout_daily_heating_demand.csv"),
+            cdd=resources("cutout_daily_cooling_demand.csv"),
+            energy_totals_heat=resources("heat_totals.csv"),
+            energy_totals_cool=resources("cooling_totals.csv"),
+            heat_profile="data/heat_load_profile_BDEW.csv",
+            demand_no_thermal=f"data/EE_GitHub/electricity/elec_no_termal/elec_demand_no_thermal_{config_provider('energy','energy_totals_year')(wildcards={})}.csv", # In theory, it does not have to match energy_totals_year, but the year must be in the IDEES report and proper electricity demand must be available. Currently, electricity demand is available for: [2007, 2008, 2009, 2011, 2012, 2013, 2014, 2015, 2017, 2018, 2019]
+        output:
+            elec_demand=resources("electricity_demand.csv"),
+            elec_thermal_demand=resources("electricity_thermal_demand.nc")
+        log:
+            logs("electricity_demand.log"),
+        benchmark:
+            benchmarks("electricity_demand")
+        resources:
+            mem_mb=5000,
+        conda:
+            "../envs/environment.yaml"
+        script:
+            "../scripts/build_electricity_demand_non_historic_cutout.py"
 
 
-rule build_electricity_demand:
-    params:
-        snapshots=config_provider("snapshots"),
-        drop_leap_day=config_provider("enable", "drop_leap_day"),
-        countries=config_provider("countries"),
-        load=config_provider("load"),
-    input:
-        reported=ancient("data/electricity_demand_raw.csv"),
-        synthetic=lambda w: (
-            ancient("data/load_synthetic_raw.csv")
-            if config_provider("load", "supplement_synthetic")(w)
-            else []
-        ),
-    output:
-        resources("electricity_demand.csv"),
-    log:
-        logs("build_electricity_demand.log"),
-    benchmark:
-        benchmarks("build_electricity_demand")
-    resources:
-        mem_mb=5000,
-    conda:
-        "../envs/environment.yaml"
-    script:
-        "../scripts/build_electricity_demand.py"
+elif str(config_provider("ee","non_historic_cutout","enable")(wildcards={})) == 'False':
+    print('Build electricity demand for historic cutout')
+    rule build_electricity_demand:
+            params:
+                snapshots=config_provider("snapshots"),
+                drop_leap_day=config_provider("enable", "drop_leap_day"),
+                countries=config_provider("countries"),
+                load=config_provider("load"),
+            input:
+                reported=ancient("data/electricity_demand_raw.csv"),
+                synthetic=lambda w: (
+                    ancient("data/load_synthetic_raw.csv")
+                    if config_provider("load", "supplement_synthetic")(w)
+                    else []
+                ),
+            output:
+                resources("electricity_demand.csv"),
+            log:
+                logs("build_electricity_demand.log"),
+            benchmark:
+                benchmarks("build_electricity_demand")
+            resources:
+                mem_mb=5000,
+            conda:
+                "../envs/environment.yaml"
+            script:
+                "../scripts/build_electricity_demand.py"
+else:
+    raise ValueError('config[ee][non_historic_cutout][enable] must be false or true')
 
 
 rule build_powerplants:
@@ -52,6 +107,50 @@ rule build_powerplants:
         "../envs/environment.yaml"
     script:
         "../scripts/build_powerplants.py"
+
+
+rule build_powerplants_cooling_type_share:
+    params:
+        pps_type=config_provider('ee','pp_cooling','add_cooling_types')
+    input:
+        jrc_list = 'data/EE_GitHub/JRC-PPDB-OPEN.ver1.0/JRC_OPEN_UNITS.csv',
+        regions_onshore=resources("regions_onshore_base_s_{clusters}.geojson")
+    output:
+        pp_ct_share = resources('powerplants_s_{clusters}_cooling_share.csv')
+    log:
+        logs('build_powerplants_s_{clusters}_cooling_type_share.log')
+    benchmark:
+        benchmarks('build_powerplants_s_{clusters}_cooling_type_share')
+    threads: 1
+    resources:
+        mem_mb=1000,
+    conda:
+        "../envs/environment.yaml"
+    script:
+        "../scripts/build_powerplants_cooling_type_share.py"
+
+rule build_powerplants_p_max_pu:
+    params:
+        climatedata_generators_t_p_max_pu_path = config_provider('ee','pp_cooling','climatedata_generators_t_p_max_pu_path'),
+        clim = lambda wildcards: wildcards.clim,
+        cool_type = lambda wildcards: wildcards.CT,
+        pp_type = lambda wildcards: wildcards.PP,
+        cd2es_mapping = config_provider("ee", "pp_cooling","cd2es_mapping")
+    input:
+        regions_onshore=resources("regions_onshore_base_s_{clusters}.geojson"),
+    output:
+        CF_profile_tpp_agg = resources("tpp{CT}_{PP}_m{clim}_s{clusters}.csv")
+    log:
+        logs('build_powerplants_tpp{CT}_{PP}_{clim}_s_{clusters}_p_max_pu.log')
+    benchmark:
+        benchmarks('build_powerplants_tpp{CT}_{PP}_{clim}_s_{clusters}_p_max_pu')
+    threads: 4
+    resources:
+        mem_mb=2000,
+    conda:
+        "../envs/environment.yaml"
+    script:
+        "../scripts/build_powerplants_p_max_pu.py"
 
 
 def input_base_network(w):
@@ -401,6 +500,7 @@ rule build_hydro_profile:
         countries=config_provider("countries"),
         snapshots=config_provider("snapshots"),
         drop_leap_day=config_provider("enable", "drop_leap_day"),
+        non_historic_cutout = config_provider("ee","non_historic_cutout","enable"),
     input:
         country_shapes=resources("country_shapes.geojson"),
         eia_hydro_generation="data/eia_hydro_annual_generation.csv",
@@ -697,6 +797,16 @@ def input_profile_tech(w):
         for tech in config_provider("electricity", "renewable_carriers")(w)
     }
 
+def input_profile_tpp_cooling(w):
+    climatedata_generators_t_p_max_pu = [config_provider("ee", "pp_cooling","climatedata_generators_t_p_max_pu")(w)]
+    pp_list_pypsa = config_provider("ee", "pp_cooling","add_cooling_types")(w)
+    if  climatedata_generators_t_p_max_pu[0]:
+        return {
+            f"CF_profile_tpp{CT}_{PP}":
+                resources(f"tpp{CT}_{PP}_m{clim}_s{w.clusters}.csv")
+            for PP, CT, clim in product(pp_list_pypsa, ['OT', 'CL'], climatedata_generators_t_p_max_pu)
+        }
+    return {}
 
 def input_conventional(w):
     carriers = [
@@ -710,10 +820,15 @@ def input_conventional(w):
         for attr, fn in d.items()
         if str(fn).startswith("data/")
     }
+def input_cooling_type(w):
+    if config_provider('ee',"pp_cooling",'add_cooling_types')(w): #if not empty
+        return {'pp_ct_share':resources('powerplants_s_{clusters}_cooling_share.csv')}
+    return {}
 
 
 rule add_electricity:
     params:
+        pps_type=config_provider('ee','pp_cooling','add_cooling_types'),
         line_length_factor=config_provider("lines", "length_factor"),
         link_length_factor=config_provider("links", "length_factor"),
         scaling_factor=config_provider("load", "scaling_factor"),
@@ -734,6 +849,9 @@ rule add_electricity:
         unpack(input_profile_tech),
         unpack(input_class_regions),
         unpack(input_conventional),
+        unpack(input_profile_tpp_cooling),
+        unpack(input_cooling_type),
+        pp_ct_cost_change="data/EE_GitHub/powerplant_cost_eff.csv",
         base_network=resources("networks/base_s_{clusters}.nc"),
         tech_costs=lambda w: resources(
             f"costs_{config_provider('costs', 'year')(w)}.csv"
@@ -760,8 +878,8 @@ rule add_electricity:
         mem_mb=10000,
     conda:
         "../envs/environment.yaml"
-    script:
-        "../scripts/add_electricity.py"
+    notebook:
+        "../scripts/add_electricity.py.ipynb"
 
 
 rule prepare_network:

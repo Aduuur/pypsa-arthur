@@ -2,6 +2,23 @@
 #
 # SPDX-License-Identifier: CC0-1.0
 
+#additional config
+ee:
+  non_historic_cutout:
+    enable: false #false if historic cutout is used (pypsa_default)
+  #Following only applies if non_historic_cutout is enabled
+    # Regression behavior of energy_totals:
+    # - If the cutout year is outside 2007–2021 → regression is always applied.
+    # - If the cutout year is within 2007–2021 → that year is removed from historical data
+    #   and replaced by regression (missing years affect the regression parameters).
+    # - If et_regression = False → demand is taken directly from energy_totals_year (without regression), if available.
+    et_regression: false
+  pp_cooling: #split [nuclear, lignite, coal, CCGT, biomass, H2] into closed-loop, dry-cooling and once-through
+    pp_add_cooling_types: [nuclear, lignite, coal, CCGT, biomass, H2] #[nuclear, lignite, coal, CCGT, biomass, H2] and skipp pp_cooling completely for []
+    #Add time dependent CF for thermal powerplants (generators_t.p_max.pu)
+    climatedata_generators_t_p_max_pu: False #Name of climate data file (e.g. MPI-M-MPI-ESM-LR_rcp85_2041) or False to skipp
+    climatedata_generators_t_p_max_pu_path: '/home/paul/src/cd2es/results/europe/MPI-M-MPI-ESM-LR/techfiles' #path to folder where CF from tpp are stored
+
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#top-level-configuration
 version: v2025.07.0
 tutorial: false
@@ -161,7 +178,7 @@ atlite:
   default_cutout: europe-2013-sarah3-era5
   nprocesses: 16
   show_progress: false
-  cutouts:
+  cutouts:    
     # use 'base' to determine geographical bounds and time span from config
     # base:
       # module: era5

@@ -1,0 +1,7 @@
+# Cooling technology cost and efficiency adjustments
+# Investment cost add-ons in €/MW relative to once-through cooling, based on EPRI Technical Report 1005358 (2011)  https://restservice.epri.com/publicdownload/000000000001005358/0/Product
+# Efficiency factors represent relative performance compared to once-through systems, based on van Vliet et al. (2014, Global Environmental Change, doi:10.1016/j.gloenvcha.2014.01.005)
+cooling_type,inv_add_on,efficiency_factor
+once-through,0,1.0
+closed-loop,11163,0.9741
+dry-cooling,43005,0.9421
