@@ -1,7 +1,6 @@
+.. SPDX-FileCopyrightText: Contributors to PyPSA-Eur <https://github.com/pypsa/pypsa-eur>
 ..
-  SPDX-FileCopyrightText: Contributors to PyPSA-Eur <https://github.com/pypsa/pypsa-eur>
-
-  SPDX-License-Identifier: CC-BY-4.0
+.. SPDX-License-Identifier: CC-BY-4.0
 
 ##################################################################################
 PyPSA-Eur: A Sector-Coupled Open Optimisation Model of the European Energy System
@@ -30,7 +29,7 @@ PyPSA-Eur: A Sector-Coupled Open Optimisation Model of the European Energy Syste
 .. image:: https://img.shields.io/discord/911692131440148490?logo=discord
     :target: https://discord.gg/AnuJBk23FU
     :alt: Discord
-    
+
 .. image:: https://api.reuse.software/badge/github.com/pypsa/pypsa-eur
     :target: https://api.reuse.software/info/github.com/pypsa/pypsa-eur
     :alt: REUSE
@@ -142,7 +141,7 @@ Workflow
 
 .. note::
     The graph above was generated using
-    ``snakemake --rulegraph -F | sed -n "/digraph/,/}/p" | dot -Tpng -o workflow.png``
+    ``pixi run dot -c && snakemake --rulegraph -F | sed -n "/digraph/,/}/p" | dot -Tpng -o doc/img/workflow.png``
 
 
 Learning Energy System Modelling
@@ -247,6 +246,7 @@ The PyPSA-Eur workflow is continuously tested for Linux, macOS and Windows (WSL 
    preparation
    sector
    solving
+   oetc
    plotting
 
 .. toctree::
