@@ -40,7 +40,7 @@ def load_timeseries(fn, years, countries):
         Load time-series with UTC timestamps x ISO-2 countries
     """
     return (
-        pd.read_csv(fn, index_col=0, parse_dates=[0], date_format="%Y-%m-%dT%H:%M:%SZ")
+        pd.read_csv(fn, index_col=0, parse_dates=[0])#, date_format="%Y-%m-%dT%H:%M:%SZ")
         .tz_localize(None)
         .dropna(how="all", axis=0)
         .rename(columns={"GB_UKM": "GB"})
