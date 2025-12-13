@@ -110,7 +110,7 @@ rule build_powerplants:
 
 rule build_powerplants_cooling_type_share:
     params:
-        pps_type=config_provider('ee','pp_cooling','add_cooling_types')
+        pps_type=config_provider('ee','pp_cooling','pp_add_cooling_types')
     input:
         jrc_list = 'data/EE_GitHub/JRC-PPDB-OPEN.ver1.0/JRC_OPEN_UNITS.csv',
         regions_onshore=resources("regions_onshore_base_s_{clusters}.geojson")
@@ -794,7 +794,7 @@ def input_profile_tech(w):
 
 def input_profile_tpp_cooling(w):
     climatedata_generators_t_p_max_pu = [config_provider("ee", "pp_cooling","climatedata_generators_t_p_max_pu")(w)]
-    pp_list_pypsa = config_provider("ee", "pp_cooling","add_cooling_types")(w)
+    pp_list_pypsa = config_provider("ee", "pp_cooling","pp_add_cooling_types")(w)
     if  climatedata_generators_t_p_max_pu[0]:
         return {
             f"CF_profile_tpp{CT}_{PP}":
@@ -816,14 +816,14 @@ def input_conventional(w):
         if str(fn).startswith("data/")
     }
 def input_cooling_type(w):
-    if config_provider('ee',"pp_cooling",'add_cooling_types')(w): #if not empty
+    if config_provider('ee',"pp_cooling",'pp_add_cooling_types')(w): #if not empty
         return {'pp_ct_share':resources('powerplants_s_{clusters}_cooling_share.csv')}
     return {}
 
 
 rule add_electricity:
     params:
-        pps_type=config_provider('ee','pp_cooling','add_cooling_types'),
+        pps_type=config_provider('ee','pp_cooling','pp_add_cooling_types'),
         line_length_factor=config_provider("lines", "length_factor"),
         link_length_factor=config_provider("links", "length_factor"),
         scaling_factor=config_provider("load", "scaling_factor"),
