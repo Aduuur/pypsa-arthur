@@ -18,7 +18,8 @@ ee:
     #Add time dependent CF for thermal powerplants (generators_t.p_max.pu)
     climatedata_generators_t_p_max_pu: False #Name of climate data file (e.g. MPI-M-MPI-ESM-LR_rcp85_2041) or False to skipp
     climatedata_generators_t_p_max_pu_path: '/home/paul/src/cd2es/results/europe/MPI-M-MPI-ESM-LR/techfiles' #path to folder where CF from tpp are stored
-
+    cd2es_mapping: {'nuclear':'Nuclear', 'lignite':'Coal', 'coal':'Coal', 'CCGT':'CCGT', 'biomass':'Biomass','H2':'H2'} #Generators named differently in cd2es and pypsa-eur 
+    
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#top-level-configuration
 version: v2025.07.0
 tutorial: false
