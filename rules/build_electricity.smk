@@ -65,7 +65,7 @@ elif str(config_provider("ee","non_historic_cutout","enable")(wildcards={})) == 
             input:
                 reported=ancient(rules.retrieve_synthetic_electricity_demand.output["csv"]),
                 synthetic=lambda w: (
-                    ancient("data/load_synthetic_raw.csv")
+                    ancient(rules.retrieve_synthetic_electricity_demand.output["csv"])
                     if config_provider("load", "supplement_synthetic")(w)
                     else []
                 ),
