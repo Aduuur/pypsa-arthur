@@ -84,12 +84,37 @@ elif str(config_provider("ee","non_historic_cutout","enable")(wildcards={})) == 
 else:
     raise ValueError('config[ee][non_historic_cutout][enable] must be false or true')
 
+def build_powerplants_everywhere(w):
+    """
+    Ensures all pp_list_pypsa powerplants that are extendable are included 
+    in everywhere_powerplants and warns about inconsistencies.
+    """
+    everywhere_powerplants = set(config_provider("electricity", "everywhere_powerplants")(w))
+    pp_list_pypsa = set(config_provider("ee", "pp_cooling", "pp_add_cooling_types")(w))
+    extendable_generators = set(config_provider("electricity", "extendable_carriers", "Generator")(w))
+    conventional_carriers = set(config_provider("electricity", "conventional_carriers")(w))
+
+    extendable_conventional = extendable_generators & conventional_carriers
+
+    # Warn if some extendable generators are missing from everywhere_powerplants
+    missing = extendable_conventional - everywhere_powerplants
+    if missing:
+        print(f"WARNING: Powerplants {missing} are not extendable in every bus. Consider adding to everywhere_powerplants.")
+
+    # Add pp_list_pypsa powerplants that are extendable but missing
+    missing = (pp_list_pypsa - everywhere_powerplants) & extendable_conventional
+    if missing:
+        everywhere_powerplants |= missing
+        print(f"WARNING: Automatically added {missing} to everywhere_powerplants (extendable and in pp_add_cooling_types).")
+
+    return list(everywhere_powerplants)
+
 
 rule build_powerplants:
     params:
         powerplants_filter=config_provider("electricity", "powerplants_filter"),
         custom_powerplants=config_provider("electricity", "custom_powerplants"),
-        everywhere_powerplants=config_provider("electricity", "everywhere_powerplants"),
+        everywhere_powerplants=build_powerplants_everywhere,
         countries=config_provider("countries"),
     input:
         network=resources("networks/base_s_{clusters}.nc"),
