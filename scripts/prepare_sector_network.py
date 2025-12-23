@@ -516,6 +516,7 @@ def add_carrier_buses(
     options: dict,
     cf_industry: dict | None = None,
     nodes: pd.Index | list | set | None = None,
+    skip_existing_carrier: bool = True,
 ) -> None:
     """
     Add buses and associated components for a specific carrier to the network.
@@ -561,7 +562,7 @@ def add_carrier_buses(
     location = vars(spatial)[carrier].locations
 
     # skip if carrier already exists
-    if carrier in n.carriers.index:
+    if (carrier in n.carriers.index) and skip_existing_carrier:
         return
 
     if not isinstance(nodes, pd.Index):
@@ -644,13 +645,15 @@ def add_carrier_buses(
             marginal_cost=costs.at[carrier, "fuel"],
         )
 
-
 # TODO: PyPSA-Eur merge issue
-def remove_elec_base_techs(n: pypsa.Network, carriers_to_keep: dict) -> None:
+def remove_elec_base_techs(
+    n: pypsa.Network,
+    carriers_to_keep: dict,
+):
     """
-    Remove conventional generators (e.g. OCGT) and storage units (e.g.
+        Remove conventional generators (e.g. OCGT) and storage units (e.g.
     batteries and H2) from base electricity-only network, since they're added
-    here differently using links.
+    here differently using links. Returns removed components as DataFrames.
 
     Parameters
     ----------
@@ -659,16 +662,65 @@ def remove_elec_base_techs(n: pypsa.Network, carriers_to_keep: dict) -> None:
     carriers_to_keep : dict
         Dictionary specifying which carriers to keep for each component type
         e.g. {'Generator': ['hydro'], 'StorageUnit': ['PHS']}
+
+    Returns
+    -------
+    removed : dict
+        {
+            "Generator": {
+                "df": DataFrame,
+                "pnl": {"p_max_pu": DataFrame, ...}
+            },
+            "StorageUnit": {
+                ...
+            }
+        }
     """
+
+    removed = {}
+
     for c in n.iterate_components(carriers_to_keep):
+
         to_keep = carriers_to_keep[c.name]
-        to_remove = pd.Index(c.df.carrier.unique()).symmetric_difference(to_keep)
+        to_remove = pd.Index(c.df.carrier.unique()).difference(to_keep)
+
         if to_remove.empty:
             continue
-        logger.info(f"Removing {c.list_name} with carrier {list(to_remove)}")
+
         names = c.df.index[c.df.carrier.isin(to_remove)]
+        if names.empty:
+            continue
+
+        logger.info(
+            f"Removing {c.list_name} with carrier {list(to_remove)}"
+        )
+
+        ## Static attributes like n.generators
+        removed_df = c.df.loc[names].copy()
+
+        ## Time dependent attributes like generators_t.p_max_pu 
+        removed_pnl = {}
+
+        for attr, pnl in c.pnl.items():
+            if pnl.empty:
+                continue
+
+            existing = pnl.columns.intersection(names)
+            if existing.empty:
+                continue
+
+            removed_pnl[attr] = pnl[existing].copy()
+
+        ## safe
+        removed[c.name] = {
+            "df": removed_df,
+            "pnl": removed_pnl,
+        }
+
+        ## remove (default)
         n.remove(c.name, names)
-        n.carriers.drop(to_remove, inplace=True, errors="ignore")
+
+    return removed
 
 
 # TODO: PyPSA-Eur merge issue
@@ -682,7 +734,7 @@ def remove_non_electric_buses(n):
 
 
 def patch_electricity_network(n, costs, carriers_to_keep, profiles, landfall_lengths):
-    remove_elec_base_techs(n, carriers_to_keep)
+    removed_techs = remove_elec_base_techs(n, carriers_to_keep)
     remove_non_electric_buses(n)
     update_wind_solar_costs(
         n, costs, landfall_lengths=landfall_lengths, profiles=profiles
@@ -693,6 +745,8 @@ def patch_electricity_network(n, costs, carriers_to_keep, profiles, landfall_len
     # remove trailing white space of load index until new PyPSA version after v0.18.
     n.loads.rename(lambda x: x.strip(), inplace=True)
     n.loads_t.p_set.rename(lambda x: x.strip(), axis=1, inplace=True)
+
+    return removed_techs
 
 
 def add_eu_bus(n, x=-5.5, y=46):
@@ -1313,6 +1367,7 @@ def add_generation(
     spatial: SimpleNamespace,
     options: dict,
     cf_industry: dict,
+    removed: dict,
 ) -> None:
     """
     Add conventional electricity generation to the network.
@@ -1320,42 +1375,55 @@ def add_generation(
     Creates links between carrier buses and demand nodes for conventional generators,
     including their efficiency, costs, and CO2 emissions.
 
+    Uses the from elec network removed generators as a basis, including cooling type (e.g., once-trough, closed-loop, open-loop)
+    and time-dependent p_max_pu (from n.generators_t.p_max_pu -> n.links_t.p_max_pu).
+
     Parameters
     ----------
     n : pypsa.Network
-        The PyPSA network container object
+        The PyPSA network container object.
     costs : pd.DataFrame
-        DataFrame containing cost and technical parameters for different technologies
+        DataFrame containing cost and technical parameters for different technologies.
     pop_layout : pd.DataFrame
-        DataFrame with population layout data, used for demand nodes
+        DataFrame with population layout data, used for demand nodes.
     conventionals : Dict[str, str]
-        Dictionary mapping generator types to their energy carriers
-        e.g., {'OCGT': 'gas', 'CCGT': 'gas', 'coal': 'coal'}
+        Dictionary mapping generator types to their energy carriers,
+        e.g., {'OCGT': 'gas', 'CCGT': 'gas', 'coal': 'coal'}.
     spatial : SimpleNamespace
         Namespace containing spatial information for different carriers,
-        including nodes and locations
+        including nodes and locations.
     options : dict
-        Configuration dictionary containing settings for the model
+        Configuration dictionary containing settings for the model.
     cf_industry : dict
-        Dictionary of industrial conversion factors, needed for carrier buses
+        Dictionary of industrial conversion factors, needed for carrier buses.
+    removed : dict
+        Dictionary of the from electric network removed generators.
 
     Returns
     -------
     None
-        Modifies the network object in-place by adding generation components
+        Modifies the network object in-place by adding generation components.
 
     Notes
     -----
-    - Costs (VOM and fixed) are given per MWel and automatically adjusted by efficiency
-    - CO2 emissions are tracked through a link to the 'co2 atmosphere' bus
-    - Generator lifetimes are considered in the capital cost calculation
+    - Costs (VOM and fixed) are given per MWel and automatically adjusted by efficiency.
+    - CO2 emissions are tracked through a link to the 'co2 atmosphere' bus.
+    - Generator lifetimes are considered in the capital cost calculation.
     """
+
     logger.info("Adding electricity generation")
 
-    nodes = pop_layout.index
+    # Data frame with removed generators from elec network
+    df_gen = removed["Generator"]["df"]
 
-    for generator, carrier in conventionals.items():
-        carrier_nodes = vars(spatial)[carrier].nodes
+    # extract generator names (e.g., 'CCGT closed-loop' or 'lignite') and technologies
+    generators = (df_gen.index.str.split(" ", n=2).str[2].unique().tolist())
+    # unique techs like 'CCGT' or 'lignite'
+    unique_techs = list(dict.fromkeys(g.split(" ")[0] for g in generators))
+
+    ## 1) Add carrier buses
+    for tech in unique_techs:
+        carrier = conventionals[tech]
 
         add_carrier_buses(
             n=n,
@@ -1364,24 +1432,64 @@ def add_generation(
             spatial=spatial,
             options=options,
             cf_industry=cf_industry,
+            skip_existing_carrier=False,
         )
 
+    ## 2) Add generators as Links
+    for generator in generators:
+        # select all generators of this type e.g., 'CCGT closed-loop' in every bus (e.g., 'DE0 0 CCGT closed-loop', 'FR0 0 CCGT closed-loop', ...)
+        selected = df_gen.loc[df_gen.index.str.contains(generator, regex=False, na=False)]
+
+        # determine technology from generator e.g., 'DE0 0 CCGT closed-loop' -> 'CCGT'
+        tech = list(dict.fromkeys(s.split(" ")[2] for s in selected.index))[0]
+        # carrier dict from config conventional_generation
+        carrier = conventionals[tech]
+
+        # generator buses
+        nodes = selected.bus.values
+        carrier_nodes = vars(spatial)[carrier].nodes
+
+        # if carrier is EU-wide, use single EU node
+        if len(carrier_nodes) == 1 and "EU" in str(carrier_nodes[0]):
+            selected_carrier_nodes = carrier_nodes
+        else:
+            # otherwise match carrier_nodes to generator buses
+            selected_carrier_nodes = [
+                node for node in carrier_nodes
+                if " ".join(node.split(" ")[:2]) in nodes
+            ]
+
+        # Link attributes (from removed elec generators)
+        # take all columns that exist in both links and generators
+        common_cols = set(n.links.columns) & set(df_gen.columns)
+        link_attrs = {col: selected[col] for col in common_cols}
+        # manual adjustments
+        link_attrs["marginal_cost"] = (selected.efficiency * costs.at[tech, "VOM"])  # VOM per MWel. Updated efficiency. Value lower than in electric network cause fuel price is considered by buses
+        link_attrs["capital_cost"] = (selected.efficiency * selected.capital_cost)  # fixed cost per MWel. Updated efficiency.
+        link_attrs["carrier"] = carrier
+
+        # Add link to the network
         n.add(
             "Link",
-            nodes + " " + generator,
-            bus0=carrier_nodes,
+            selected.index,
+            bus0=selected_carrier_nodes,
             bus1=nodes,
             bus2="co2 atmosphere",
-            marginal_cost=costs.at[generator, "efficiency"]
-            * costs.at[generator, "VOM"],  # NB: VOM is per MWel
-            capital_cost=costs.at[generator, "efficiency"]
-            * costs.at[generator, "capital_cost"],  # NB: fixed cost is per MWel
-            p_nom_extendable=True,
-            carrier=generator,
-            efficiency=costs.at[generator, "efficiency"],
-            efficiency2=costs.at[carrier, "CO2 intensity"],
-            lifetime=costs.at[generator, "lifetime"],
+            efficiency2=costs.at[tech, "CO2 intensity"],
+            **link_attrs,
         )
+
+    ## 3) Add time-dependent n.links_t.p_max_pu from n.generators_t.p_max_pu
+    
+    # safed from n.generators_t.p_max_pu
+    src = removed['Generator']['pnl']['p_max_pu']
+
+    # if p_max_pu already has entries preserve them
+    if isinstance(n.links_t.p_max_pu, pd.Series):
+        n.links_t.p_max_pu = n.links_t.p_max_pu.to_frame()
+
+    # add new, overwrite existing time-dependent p_max_pu (from electric network n.generators_t.p_max_pu)
+    n.links_t.p_max_pu[src.columns] = src
 
 
 def add_ammonia(
@@ -6289,7 +6397,7 @@ if __name__ == "__main__":
         for tech, settings in snakemake.params.renewable.items()
         if "landfall_length" in settings.keys()
     }
-    patch_electricity_network(n, costs, carriers_to_keep, profiles, landfall_lengths)
+    removed_techs_elec = patch_electricity_network(n, costs, carriers_to_keep, profiles, landfall_lengths)
 
     fn = snakemake.input.heating_efficiencies
     year = int(snakemake.params["energy_totals_year"])
@@ -6335,6 +6443,7 @@ if __name__ == "__main__":
         spatial=spatial,
         options=options,
         cf_industry=cf_industry,
+        removed=removed_techs_elec,
     )
 
     add_storage_and_grids(
