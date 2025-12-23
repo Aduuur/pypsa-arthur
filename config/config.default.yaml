@@ -821,9 +821,14 @@ sector:
   biomass_transport: false
   biogas_upgrading: true
   biogas_upgrading_cc: false
-  conventional_generation:
+  conventional_generation:  #Original functionality is overridden by extendable_carriers and is now only used as a dict
+    oil: oil
     OCGT: gas
     CCGT: gas
+    coal: coal
+    lignite: lignite
+    geothermal: geothermal_heat
+    biomass: biomass
   biomass_to_liquid: true
   biomass_to_liquid_cc: false
   electrobiofuels: true
