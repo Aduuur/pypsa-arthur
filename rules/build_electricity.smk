@@ -1,88 +1,81 @@
 # SPDX-FileCopyrightText: Contributors to PyPSA-Eur <https://github.com/pypsa/pypsa-eur>
 #
 # SPDX-License-Identifier: MIT
-if str(config_provider("ee","non_historic_cutout","enable")(wildcards={})) == 'True':
-    print('Build electricity demand for custom temperature data')
-
-    rule build_daily_thermal_demand:
+rule build_electricity_demand:
         params:
-            thermal_type=lambda wildcards: wildcards.thermal_type,
             snapshots=config_provider("snapshots"),
             drop_leap_day=config_provider("enable", "drop_leap_day"),
+            countries=config_provider("countries"),
+            load=config_provider("load"),
         input:
-            cutout=lambda w: input_cutout(w),
-            country_shapes=resources("country_shapes.geojson"),
-            pop_layout_total=resources("pop_layout_total.nc"),
+            reported=ancient(rules.retrieve_synthetic_electricity_demand.output["csv"]),
+            synthetic=lambda w: (
+                ancient(rules.retrieve_synthetic_electricity_demand.output["csv"])
+                if config_provider("load", "supplement_synthetic")(w)
+                else []
+            ),
         output:
-            resources("cutout_daily_{thermal_type}_demand.csv")
+            resources("electricity_demand.csv"),
         log:
-            logs("cutout_daily_{thermal_type}_demand.log"),
+            logs("build_electricity_demand.log"),
         benchmark:
-            benchmarks("cutout_daily_{thermal_type}_demand")
+            benchmarks("build_electricity_demand")
         resources:
             mem_mb=5000,
         conda:
             "../envs/environment.yaml"
         script:
-            "../scripts/build_daily_thermal_demand.py"
+            "../scripts/build_electricity_demand.py"
 
-    rule build_electricity_demand_non_historic_cutout:
-        params:
-            snapshots=config_provider("snapshots"),
-            drop_leap_day=config_provider("enable", "drop_leap_day"),
-            energy_totals_year=config_provider('energy','energy_totals_year'),
-            et_regression = config_provider("ee","non_historic_cutout","et_regression"),
-        input:
-            hdd=resources("cutout_daily_heating_demand.csv"),
-            cdd=resources("cutout_daily_cooling_demand.csv"),
-            energy_totals_heat=resources("heat_totals.csv"),
-            energy_totals_cool=resources("cooling_totals.csv"),
-            heat_profile="data/heat_load_profile_BDEW.csv",
-            demand_no_thermal=f"data/EE_GitHub/electricity/elec_no_termal/elec_demand_no_thermal_{config_provider('energy','energy_totals_year')(wildcards={})}.csv", # In theory, it does not have to match energy_totals_year, but the year must be in the IDEES report and proper electricity demand must be available. Currently, electricity demand is available for: [2007, 2008, 2009, 2011, 2012, 2013, 2014, 2015, 2017, 2018, 2019]
-        output:
-            elec_demand=resources("electricity_demand.csv"),
-            elec_thermal_demand=resources("electricity_thermal_demand.nc")
-        log:
-            logs("electricity_demand.log"),
-        benchmark:
-            benchmarks("electricity_demand")
-        resources:
-            mem_mb=5000,
-        conda:
-            "../envs/environment.yaml"
-        script:
-            "../scripts/build_electricity_demand_non_historic_cutout.py"
+rule build_electricity_demand_non_historic_cutout:
+    params:
+        snapshots=config_provider("snapshots"),
+        drop_leap_day=config_provider("enable", "drop_leap_day"),
+        energy_totals_year=config_provider('energy','energy_totals_year'),
+        et_regression = config_provider("ee","non_historic_cutout","et_regression"),
+    input:
+        hdd=resources("cutout_daily_heating_demand.csv"),
+        cdd=resources("cutout_daily_cooling_demand.csv"),
+        energy_totals_heat=resources("heat_totals.csv"),
+        energy_totals_cool=resources("cooling_totals.csv"),
+        heat_profile="data/heat_load_profile_BDEW.csv",
+        demand_no_thermal=f"data/EE_GitHub/electricity/elec_no_termal/elec_demand_no_thermal_{config_provider('energy','energy_totals_year')(wildcards={})}.csv", # In theory, it does not have to match energy_totals_year, but the year must be in the IDEES report and proper electricity demand must be available. Currently, electricity demand is available for: [2007, 2008, 2009, 2011, 2012, 2013, 2014, 2015, 2017, 2018, 2019]
+    output:
+        elec_demand=resources("electricity_demand_non_hist.csv"),
+        elec_thermal_demand=resources("electricity_thermal_demand_non_hist.nc")
+    log:
+        logs("electricity_demand.log"),
+    benchmark:
+        benchmarks("electricity_demand")
+    resources:
+        mem_mb=5000,
+    conda:
+        "../envs/environment.yaml"
+    script:
+        "../scripts/build_electricity_demand_non_historic_cutout.py"
 
+rule build_daily_thermal_demand:
+    params:
+        thermal_type=lambda wildcards: wildcards.thermal_type,
+        snapshots=config_provider("snapshots"),
+        drop_leap_day=config_provider("enable", "drop_leap_day"),
+    input:
+        cutout=lambda w: input_cutout(w),
+        country_shapes=resources("country_shapes.geojson"),
+        pop_layout_total=resources("pop_layout_total.nc"),
+    output:
+        resources("cutout_daily_{thermal_type}_demand.csv")
+    log:
+        logs("cutout_daily_{thermal_type}_demand.log"),
+    benchmark:
+        benchmarks("cutout_daily_{thermal_type}_demand")
+    resources:
+        mem_mb=5000,
+    conda:
+        "../envs/environment.yaml"
+    script:
+        "../scripts/build_daily_thermal_demand.py"
 
-elif str(config_provider("ee","non_historic_cutout","enable")(wildcards={})) == 'False':
-    print('Build electricity demand for historic cutout')
-    rule build_electricity_demand:
-            params:
-                snapshots=config_provider("snapshots"),
-                drop_leap_day=config_provider("enable", "drop_leap_day"),
-                countries=config_provider("countries"),
-                load=config_provider("load"),
-            input:
-                reported=ancient(rules.retrieve_synthetic_electricity_demand.output["csv"]),
-                synthetic=lambda w: (
-                    ancient(rules.retrieve_synthetic_electricity_demand.output["csv"])
-                    if config_provider("load", "supplement_synthetic")(w)
-                    else []
-                ),
-            output:
-                resources("electricity_demand.csv"),
-            log:
-                logs("build_electricity_demand.log"),
-            benchmark:
-                benchmarks("build_electricity_demand")
-            resources:
-                mem_mb=5000,
-            conda:
-                "../envs/environment.yaml"
-            script:
-                "../scripts/build_electricity_demand.py"
-else:
-    raise ValueError('config[ee][non_historic_cutout][enable] must be false or true')
 
 def build_powerplants_everywhere(w):
     everywhere_powerplants = set(config_provider("electricity", "everywhere_powerplants")(w))
@@ -624,15 +617,28 @@ def input_class_regions(w):
         - {"hydro"}
     }
 
+def get_electricity_demand(w):
+    enabled = config_provider("ee", "non_historic_cutout", "enable")(w)
+
+    if not isinstance(enabled, bool):
+        raise ValueError("config[ee][non_historic_cutout][enable] must be boolean")
+
+    return {
+        'load': (
+            resources("electricity_demand_non_hist.csv")
+            if enabled
+            else resources("electricity_demand.csv")
+        )
+    }
 
 rule build_electricity_demand_base:
     params:
         distribution_key=config_provider("load", "distribution_key"),
     input:
+        unpack(get_electricity_demand),
         base_network=resources("networks/base_s.nc"),
         regions=resources("regions_onshore_base_s.geojson"),
         nuts3=resources("nuts3_shapes.geojson"),
-        load=resources("electricity_demand.csv"),
     output:
         resources("electricity_demand_base_s.nc"),
     log:
