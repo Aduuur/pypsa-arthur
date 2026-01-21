@@ -35,7 +35,7 @@ update-dags = """
 """
 
 [dependencies]
-atlite = ">=0.3"
+#atlite = ">=0.3" #install as editable instead
 bokeh = ">=3.8.0"
 cartopy = ">=0.25.0"
 copernicusmarine = ">=2.2.4"
@@ -99,7 +99,7 @@ args = ["dir", {"arg" = "output", "default" = "html"}]
 cmd = "dot -c && sphinx-build -T -b {{ output }} doc {{ dir }}/{{ output }} "
 
 [feature.doc.dependencies]
-atlite = ">=0.2.9"
+## atlite = ">=0.2.9" #install as editable instead
 cartopy = ">=0.25.0"
 dask = ">=2025.10.0"
 descartes = ">=1.1.0"
@@ -150,6 +150,10 @@ all-tests = {depends-on = ["integration-tests", "clean-tests", "unit-tests"]}
 
 [feature.test.dependencies]
 pytest = ">=8.4.2"
+
+## install modified version of atlite as editable from https://gitlab.ruhr-uni-bochum.de/ee/atlite4cordex
+[pypi-dependencies]
+atlite = { path = "./atlite4cordex", editable = true }
 
 [environments]
 doc = { features = ["doc"], no-default-feature = true }
