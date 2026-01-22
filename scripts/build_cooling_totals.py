@@ -13,7 +13,7 @@ import numpy as np
 import geopandas as gpd
 from numpy.polynomial import Polynomial
 
-from scripts._helpers import configure_logging, load_cutout
+from scripts._helpers import configure_logging, load_cutout, checkBool
 
 logger = logging.getLogger(__name__)
 
@@ -128,14 +128,14 @@ if __name__ == "__main__":
 
     configure_logging(snakemake)
 
-    non_historic_cutout = str(snakemake.params.non_historic_cutout)
-    cool_regression = str(snakemake.params.et_regression)
-    drop_leap_day = bool(snakemake.params.drop_leap_day)
+    non_historic_cutout = checkBool(snakemake.params.non_historic_cutout)
+    cool_regression = checkBool(snakemake.params.et_regression)
+    drop_leap_day = checkBool(snakemake.params.drop_leap_day)
 
     cdd = pd.read_csv(snakemake.input.cdd, index_col=0, parse_dates=True)  # all countries in PyPSA
     energy_totals_cool = pd.read_csv(snakemake.input.energy_totals_cooling, index_col=[0, 1])
 
-    if non_historic_cutout == 'True':
+    if non_historic_cutout == True:
         country_shapes_file = snakemake.input.country_shapes
         cutout_input = snakemake.input.cutout
         country_shapes = gpd.read_file(country_shapes_file).set_index('name')['geometry']
@@ -149,7 +149,7 @@ if __name__ == "__main__":
         # Replace existing and fill all missing timestamps
         cdd = merge_cdd(cdd, s)
 
-        if cool_regression == 'True':
+        if cool_regression == True:
             # Remove historical cooling demand from data and trigger regression
             remove_years = list(s.index.year.unique())
             logger.info(
@@ -157,14 +157,14 @@ if __name__ == "__main__":
             )
             indices_to_drop = energy_totals_cool.index.get_level_values('year').isin(remove_years)
             energy_totals_cool = energy_totals_cool.drop(index=energy_totals_cool.index[indices_to_drop])
-        elif cool_regression == 'False':
+        elif cool_regression == False:
             pass
         else:
             raise ValueError('config[ee][non_historic_cutout][et_regression] must be false or true')
     
         # no water in cooling demand
         cols = product(["total", "electricity"], ["services", "residential"], ["space"])
-    elif non_historic_cutout == 'False':
+    elif non_historic_cutout == False:
         cols = product(["total", "electricity"], ["services", "residential"], ["space"])
     else:
         raise ValueError('config[ee][non_historic_cutout][enable] must be false or true')

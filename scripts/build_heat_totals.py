@@ -19,7 +19,7 @@ import numpy as np
 import geopandas as gpd 
 from numpy.polynomial import Polynomial
 
-from scripts._helpers import configure_logging, load_cutout  # added load_cutout
+from scripts._helpers import configure_logging, load_cutout, checkBool  # added load_cutout
 
 logger = logging.getLogger(__name__)
 
@@ -139,14 +139,14 @@ if __name__ == "__main__":
 
     configure_logging(snakemake)
     
-    non_historic_cutout = str(snakemake.params.non_historic_cutout)
-    heat_regression = str(snakemake.params.et_regression)
-    drop_leap_day = bool(snakemake.params.drop_leap_day)
+    non_historic_cutout = checkBool(snakemake.params.non_historic_cutout)
+    heat_regression = checkBool(snakemake.params.et_regression)
+    drop_leap_day = checkBool(snakemake.params.drop_leap_day)
     
     hdd = pd.read_csv(snakemake.input.hdd, index_col=0, parse_dates=True)  # all countries in PyPSA
     energy_totals = pd.read_csv(snakemake.input.energy_totals, index_col=[0, 1])
     
-    if non_historic_cutout == 'True':
+    if non_historic_cutout == True:
         # snippets from https://gist.github.com/fneum/d99e24e19da423038fd55fe3a4ddf875
         country_shapes_file = snakemake.input.country_shapes
         cutout_input = snakemake.input.cutout
@@ -162,7 +162,7 @@ if __name__ == "__main__":
         # Replace existing and fill all missing timestamps
         hdd = merge_hdd(hdd, s)
         
-        if heat_regression == 'True':
+        if heat_regression == True:
             # Remove historical heat demand from data and so triggers regression 
             remove_years = list(s.index.year.unique())
             logger.info(
@@ -170,14 +170,14 @@ if __name__ == "__main__":
             )
             indices_to_drop = energy_totals.index.get_level_values('year').isin(remove_years)
             energy_totals = energy_totals.drop(index=energy_totals.index[indices_to_drop])
-        elif heat_regression == 'False':
+        elif heat_regression == False:
             pass
         else:
             raise ValueError('config[ee][non_historic_cutout][et_regression] must be false or true')
 
         #Allow regression for water too
         cols=product(["total", "electricity"], ["services", "residential"],['space', 'water'])
-    elif non_historic_cutout == 'False':
+    elif non_historic_cutout == False:
         #Preserve default functionality. Updated for water by energy totals in prepare_sector_network
         cols=product(["total", "electricity"], ["services", "residential"],['space'])
     else:

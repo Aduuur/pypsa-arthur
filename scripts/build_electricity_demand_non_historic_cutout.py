@@ -13,7 +13,7 @@ import xarray as xr
 
 
 
-from scripts._helpers import configure_logging, set_scenario_config, generate_periodic_profiles
+from scripts._helpers import configure_logging, set_scenario_config, generate_periodic_profiles, checkBool
 
 
 def calc_hourly_space_demand(daily_space_demand, intraday_profiles,drop_leap_day, uses, sectors):
@@ -117,19 +117,19 @@ if __name__ == "__main__":
     cooling_demand_path = snakemake.input.energy_totals_cool
     heating_demand_path = snakemake.input.energy_totals_heat
     electric_demand_no_thermal_path = snakemake.input.demand_no_thermal
-    drop_leap_day = bool(snakemake.params.drop_leap_day)
+    drop_leap_day = checkBool(snakemake.params.drop_leap_day)
     energy_totals_year=int(snakemake.params.energy_totals_year)
-    et_regression = str(snakemake.params.et_regression)
+    et_regression = checkBool(snakemake.params.et_regression)
 
     time_start = pd.to_datetime(snakemake.params.snapshots["start"])
     time_end = pd.to_datetime(snakemake.params.snapshots["end"])
     snapshot_year = int(time_start.year)
     
     # Note: whole script only applies if config['ee']['historic_cutout']['enable'] == true (if statement in snakefile)
-    if et_regression == 'True':
+    if et_regression == True:
         year_demand = snapshot_year  # equals time_end.year
         logger.info(f'Using demand year {year_demand} derived by regression')
-    elif et_regression == 'False':
+    elif et_regression == False:
         year_demand = energy_totals_year
         logger.info(f'Using reported demand year {year_demand}')
     else:

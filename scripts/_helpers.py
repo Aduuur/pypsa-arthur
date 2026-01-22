@@ -30,6 +30,16 @@ REGION_COLS = ["geometry", "name", "x", "y", "country"]
 
 PYPSA_V1 = bool(re.match(r"^1\.\d", pypsa.__version__))
 
+def checkBool(value):
+    if isinstance(value, bool):
+        return bool
+    value=str(value)
+    if value.lower() == 'true':
+        return True
+    elif value.lower() == 'false':
+        return False
+    else: 
+        raise ValueError(f'Expect bool but {value} is given!')
 
 def get_scenarios(run):
     scenario_config = run.get("scenarios", {})

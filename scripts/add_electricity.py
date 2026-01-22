@@ -688,12 +688,13 @@ def time_dependent_p_max_pu(n, pp_CF_path, smk_input_name):
     nuclear, lignite, coal, CCGT, biomass and H2.
     """
     try:
-        df = pd.read_csv(pp_CF_path, index_col=0)
+        df = pd.read_csv(pp_CF_path, index_col=0,parse_dates=True)
     except Exception:
         raise ValueError(f"Could not open {pp_CF_path}")
 
     valid_cols = df.columns.intersection(n.generators.index)
-    n.generators_t.p_max_pu[valid_cols] = df[valid_cols].values
+    df_sel = df.loc[n.snapshots]
+    n.generators_t.p_max_pu[valid_cols] = df_sel[valid_cols]
 
     name_pp_tech = smk_input_name.rsplit('_', 1)[-1]
     logger.info(f"Using time-dependent values for p_max_pu for {name_pp_tech} (generators_t.p_max_pu)")

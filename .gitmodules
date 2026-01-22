@@ -1,0 +1,3 @@
+[submodule "atlite4cordex"]
+	path = atlite4cordex
+	url = https://gitlab.ruhr-uni-bochum.de/ee/atlite4cordex

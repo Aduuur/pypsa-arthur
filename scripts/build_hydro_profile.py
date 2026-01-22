@@ -35,6 +35,7 @@ from scripts._helpers import (
     get_snapshots,
     load_cutout,
     set_scenario_config,
+    checkBool,
 )
 
 cc = coco.CountryConverter()
@@ -174,11 +175,7 @@ if __name__ == "__main__":
     set_scenario_config(snakemake)
 
     params_hydro = snakemake.params.hydro
-    non_historic_cutout=str(snakemake.params.non_historic_cutout)
-    if non_historic_cutout not in ['False', 'True']:
-        raise ValueError('config[ee][non_historic_cutout][enable] must be false or true')
-    else:
-        non_historic_cutout=bool(non_historic_cutout)
+    non_historic_cutout=checkBool(snakemake.params.non_historic_cutout)
 
     time = get_snapshots(snakemake.params.snapshots, snakemake.params.drop_leap_day)
 
