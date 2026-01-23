@@ -118,12 +118,14 @@ def approximate_missing_eia_stats(
 
     ##### Changes #####
     cutout_time = cutout.data['time'] # Time dimension from atlite cutout
-    cutout_years = cutout_time.to_index().year.unique() # Unique years in the cutout
+    cutout_years = list(map(int, cutout_time.to_index().year.unique())) # Unique years in the cutout
 
     if non_historic_cutout: #remove years if already exist in report -> triggers regression
-        logger.info(f'Drop year {list(cutout_years)} if existing in datasets')
-        eia_stats = eia_stats.drop(cutout_years) 
-        runoff = runoff.drop(cutout_years)
+        cutout_years = list(map(int, cutout_time.to_index().year.unique()))
+        logger.info(f"Drop year(s) {cutout_years} if existing in datasets")
+
+        eia_stats = eia_stats.drop(cutout_years, errors='ignore')
+        runoff = runoff.drop(cutout_years, errors='ignore')
 
         if full_years_available: # If the cutout covers a full year and the data is not in ERA5 yet
             logger.info(f'Calculate runoff for year {list(cutout_years)}')

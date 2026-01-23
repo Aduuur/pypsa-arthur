@@ -67,28 +67,61 @@ def create_capacity_map_storage(table_fn: str, map_fn: str) -> gpd.GeoDataFrame:
     """
     Create a GeoDataFrame of CO2 storage capacities.
 
-    Parameters
-    ----------
-    table_fn : str
-        Path to CSV file containing storage capacity data
-    map_fn : str
-        Path to geographic file containing storage unit geometries
-
-    Returns
-    -------
-    gpd.GeoDataFrame
-        GeoDataFrame with storage units and their capacity estimates
+    Fix for CO2Stop KML schema:
+    - KML provides only ['Name','Description','geometry'] (no ID/COUNTRYCOD).
+    - CSV provides STORAGE_UNIT_NAME and COUNTRYCODE.
+    We therefore:
+      * map KML.Name -> ID
+      * join CSV.COUNTRYCODE -> COUNTRYCOD via STORAGE_UNIT_NAME
+      * merge capacities via STORAGE_UNIT_NAME (not STORAGE_UNIT_ID)
     """
     df = pd.read_csv(table_fn)
 
-    sel = ["COUNTRYCOD", "ID", "geometry"]
-    gdf = gpd.read_file(map_fn).rename(columns={"id": "ID"})[sel]
+    # --- Read polygons from KML ---
+    gdf = gpd.read_file(map_fn)
+
+    # KML schema: Name, Description, geometry
+    if "ID" not in gdf.columns:
+        if "id" in gdf.columns:
+            gdf = gdf.rename(columns={"id": "ID"})
+        elif "Name" in gdf.columns:
+            gdf = gdf.rename(columns={"Name": "ID"})
+        else:
+            # last resort: stable ID
+            gdf["ID"] = gdf.index.astype(str)
+
+    gdf["ID"] = gdf["ID"].astype(str).str.strip()
+
+    # Fix potential invalid geometries
     gdf.geometry = gdf.geometry.buffer(0)
 
-    # Combine shapes with the same id into one multi-polygon
+    # --- Add country code from CSV (via name match) ---
+    # We have: CSV.STORAGE_UNIT_NAME and CSV.COUNTRYCODE
+    if "COUNTRYCOD" not in gdf.columns:
+        df["STORAGE_UNIT_NAME"] = df["STORAGE_UNIT_NAME"].astype(str).str.strip()
+
+        cc_map = (
+            df.dropna(subset=["STORAGE_UNIT_NAME", "COUNTRYCODE"])
+              .drop_duplicates("STORAGE_UNIT_NAME")[["STORAGE_UNIT_NAME", "COUNTRYCODE"]]
+              .rename(columns={"STORAGE_UNIT_NAME": "ID", "COUNTRYCODE": "COUNTRYCOD"})
+        )
+
+        gdf = gdf.merge(cc_map, on="ID", how="left")
+
+    # Keep only what we need for grouping
+    sel = ["COUNTRYCOD", "ID", "geometry"]
+    for c in sel:
+        if c not in gdf.columns:
+            gdf[c] = None
+    gdf = gdf[sel]
+
+    # Combine shapes with the same (country, id) into one multi-polygon
     gdf = gdf.groupby(["COUNTRYCOD", "ID"]).agg(unary_union).reset_index()
-    gdf.set_geometry("geometry", inplace=True)
-    gdf.set_crs(CRS, inplace=True)
+    gdf = gpd.GeoDataFrame(gdf, geometry="geometry", crs=CRS)
+
+    # ---------------------------------------------------------------------
+    # Capacity calculations (unchanged logic)
+    # ---------------------------------------------------------------------
 
     # conservative estimate: use MIN
     df["conservative estimate Mt"] = (
@@ -119,48 +152,85 @@ def create_capacity_map_storage(table_fn: str, map_fn: str) -> gpd.GeoDataFrame:
         .fillna(df["neutral estimate Mt"])
     )
 
+    # Keep the relevant columns
     sel = [
-        "STORAGE_UNIT_ID",
         "STORAGE_UNIT_NAME",
         "ASSESS_UNIT_TYPE",
         "conservative estimate Mt",
         "neutral estimate Mt",
         "optimistic estimate Mt",
     ]
-    df = df[sel]
+    df = df[sel].copy()
+    df["STORAGE_UNIT_NAME"] = df["STORAGE_UNIT_NAME"].astype(str).str.strip()
 
-    gdf = gdf.merge(df, left_on="ID", right_on="STORAGE_UNIT_ID", how="left").drop(
-        "STORAGE_UNIT_ID", axis=1
+    # ---------------------------------------------------------------------
+    # IMPORTANT FIX: merge on NAME (KML.ID == CSV.STORAGE_UNIT_NAME)
+    # ---------------------------------------------------------------------
+    gdf = gdf.merge(df, left_on="ID", right_on="STORAGE_UNIT_NAME", how="left").drop(
+        "STORAGE_UNIT_NAME", axis=1
     )
-    return gdf
 
+    return gdf
 
 def create_capacity_map_traps(table_fn: list[str], map_fn: str) -> gpd.GeoDataFrame:
     """
     Create a GeoDataFrame of CO2 trap capacities.
 
-    Parameters
-    ----------
-    table_fn : list[str]
-        List of paths to CSV files containing trap capacity data
-    map_fn : str
-        Path to geographic file containing trap geometries
-
-    Returns
-    -------
-    gpd.GeoDataFrame
-        GeoDataFrame with traps and their capacity estimates for different
-        types (aquifer, oil, gas) and scenarios (conservative, neutral, optimistic)
+    Fix for CO2Stop KML schema:
+    - KML provides only ['Name','Description','geometry'] (no ID/COUNTRYCOD).
+    - Trap CSVs provide TRAP_NAME and COUNTRYCODE (in CO2Stop DataInterrogationSystem tables).
+    We therefore:
+      * map KML.Name -> ID
+      * join COUNTRYCODE -> COUNTRYCOD via TRAP_NAME
+      * merge capacities via TRAP_NAME (not TRAP_ID)
     """
     df = pd.concat([pd.read_csv(path) for path in table_fn], ignore_index=True)
 
-    sel = ["COUNTRYCOD", "ID", "geometry"]
-    gdf = gpd.read_file(map_fn).rename(columns={"id": "ID"})[sel]
+    # --- Read polygons from KML ---
+    gdf = gpd.read_file(map_fn)
 
-    # Combine shapes with the same id into one multi-polygon
+    # Map KML Name -> ID
+    if "ID" not in gdf.columns:
+        if "id" in gdf.columns:
+            gdf = gdf.rename(columns={"id": "ID"})
+        elif "Name" in gdf.columns:
+            gdf = gdf.rename(columns={"Name": "ID"})
+        else:
+            gdf["ID"] = gdf.index.astype(str)
+
+    gdf["ID"] = gdf["ID"].astype(str).str.strip()
+    gdf.geometry = gdf.geometry.buffer(0)
+
+    # --- Add country code from CSV if possible ---
+    # Typical CO2Stop trap tables contain TRAP_NAME and COUNTRYCODE
+    if "COUNTRYCOD" not in gdf.columns:
+        # Ensure required cols exist in df (some files may not have them)
+        if "TRAP_NAME" in df.columns and "COUNTRYCODE" in df.columns:
+            df["TRAP_NAME"] = df["TRAP_NAME"].astype(str).str.strip()
+
+            cc_map = (
+                df.dropna(subset=["TRAP_NAME", "COUNTRYCODE"])
+                  .drop_duplicates("TRAP_NAME")[["TRAP_NAME", "COUNTRYCODE"]]
+                  .rename(columns={"TRAP_NAME": "ID", "COUNTRYCODE": "COUNTRYCOD"})
+            )
+            gdf = gdf.merge(cc_map, on="ID", how="left")
+        else:
+            gdf["COUNTRYCOD"] = None
+
+    # Keep only required columns for grouping
+    sel = ["COUNTRYCOD", "ID", "geometry"]
+    for c in sel:
+        if c not in gdf.columns:
+            gdf[c] = None
+    gdf = gdf[sel]
+
+    # Combine shapes with same (country, id)
     gdf = gdf.groupby(["COUNTRYCOD", "ID"]).agg(unary_union).reset_index()
-    gdf.set_geometry("geometry", inplace=True)
-    gdf.set_crs(CRS, inplace=True)
+    gdf = gpd.GeoDataFrame(gdf, geometry="geometry", crs=CRS)
+
+    # ---------------------------------------------------------------------
+    # Capacity calculations (original logic unchanged)
+    # ---------------------------------------------------------------------
 
     # conservative estimate: use MIN
     df["conservative estimate aquifer Mt"] = (
@@ -232,8 +302,8 @@ def create_capacity_map_traps(table_fn: list[str], map_fn: str) -> gpd.GeoDataFr
         df[sel].sum(axis=1).replace(0, np.nan).fillna(df["neutral estimate Mt"])
     )
 
+    # Keep relevant cols (we merge by TRAP_NAME)
     sel = [
-        "TRAP_ID",
         "TRAP_NAME",
         "ASSESS_UNIT_TYPE",
         "optimistic estimate Mt",
@@ -249,13 +319,16 @@ def create_capacity_map_traps(table_fn: list[str], map_fn: str) -> gpd.GeoDataFr
         "conservative estimate OIL Mt",
         "conservative estimate GAS Mt",
     ]
-    df = df[sel]
+    df = df[sel].copy()
+    df["TRAP_NAME"] = df["TRAP_NAME"].astype(str).str.strip()
 
-    gdf = gdf.merge(df, left_on="ID", right_on="TRAP_ID", how="left").drop(
-        "TRAP_ID", axis=1
+    # IMPORTANT: merge on name (KML.ID == CSV.TRAP_NAME)
+    gdf = gdf.merge(df, left_on="ID", right_on="TRAP_NAME", how="left").drop(
+        "TRAP_NAME", axis=1
     )
 
     return gdf
+
 
 
 def merge_maps(

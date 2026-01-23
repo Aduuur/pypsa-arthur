@@ -28,7 +28,7 @@ gurobi.log
 /tmp
 doc/_build
 /config
-!/config/config.default.yaml
+!/config/config.yaml
 
 /scripts/old
 /scripts/create_scenarios.py

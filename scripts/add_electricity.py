@@ -29,7 +29,115 @@ It further adds extendable ``generators`` with **zero** capacity for
 - additional open- and combined-cycle gas turbines (if ``OCGT`` and/or ``CCGT``
   is listed in the config setting ``electricity: extendable_carriers``)
 
-Furthermore, it attaches additional extendable components to the clustered
+Furthermore, it attaches additional extenda
+[Fri Jan 23 08:06:12 2026]
+localrule add_electricity:
+    input: resources/profile_5_solar.nc, resources/profile_5_solar-hsat.nc, resources/profile_5_onwind.nc, resources/profile_5_offwind-ac.nc, resources/profile_5_offwind-dc.nc, resources/profile_5_offwind-float.nc, resources/profile_hydro.nc, resources/regions_by_class_5_offwind-dc.geojson, resources/regions_by_class_5_solar.geojson, resources/regions_by_class_5_solar-hsat.geojson, resources/regions_by_class_5_offwind-float.geojson, resources/regions_by_class_5_onwind.geojson, resources/regions_by_class_5_offwind-ac.geojson, data/nuclear_p_max_pu.csv, resources/powerplants_s_5_cooling_share.csv, data/EE_GitHub/powerplant_cost_eff.csv, resources/networks/base_s_5.nc, resources/costs_2050_processed.csv, resources/regions_onshore_base_s_5.geojson, resources/powerplants_s_5.csv, data/hydro_capacities.csv, data/unit_commitment.csv, resources/electricity_demand_base_s.nc, resources/busmap_base_s_5.csv
+    output: resources/networks/base_s_5_elec.nc
+    log: logs/add_electricity_5.log
+    jobid: 57
+    benchmark: benchmarks/add_electricity_5
+    reason: Missing output files: resources/networks/base_s_5_elec.nc
+    wildcards: clusters=5
+    resources: tmpdir=/tmp, mem_mb=10000, mem_mib=9537
+Select jobs to execute...
+<frozen importlib._bootstrap>:488: RuntimeWarning:
+
+numpy.ndarray size changed, may indicate binary incompatibility. Expected 16 from C header, got 96 from PyObject
+
+INFO:pypsa.network.io:New version 1.0.7 available! (Current: 1.0.4)
+INFO:pypsa.network.io:Imported network 'Unnamed Network' has buses, carriers, lines, links, sub_networks
+/home/endata/PycharmProjects/pypsa-ee/.snakemake/scripts/tmp84n78oui.add_electricity.py:384: FutureWarning:
+
+errors='ignore' is deprecated and will raise in a future version. Use to_numeric without passing `errors` and catch exceptions explicitly instead
+
+/home/endata/PycharmProjects/pypsa-ee/.snakemake/scripts/tmp84n78oui.add_electricity.py:384: FutureWarning:
+
+errors='ignore' is deprecated and will raise in a future version. Use to_numeric without passing `errors` and catch exceptions explicitly instead
+
+/home/endata/PycharmProjects/pypsa-ee/.snakemake/scripts/tmp84n78oui.add_electricity.py:384: FutureWarning:
+
+errors='ignore' is deprecated and will raise in a future version. Use to_numeric without passing `errors` and catch exceptions explicitly instead
+
+/home/endata/PycharmProjects/pypsa-ee/.snakemake/scripts/tmp84n78oui.add_electricity.py:384: FutureWarning:
+
+errors='ignore' is deprecated and will raise in a future version. Use to_numeric without passing `errors` and catch exceptions explicitly instead
+
+/home/endata/PycharmProjects/pypsa-ee/.snakemake/scripts/tmp84n78oui.add_electricity.py:384: FutureWarning:
+
+errors='ignore' is deprecated and will raise in a future version. Use to_numeric without passing `errors` and catch exceptions explicitly instead
+
+/home/endata/PycharmProjects/pypsa-ee/.snakemake/scripts/tmp84n78oui.add_electricity.py:384: FutureWarning:
+
+errors='ignore' is deprecated and will raise in a future version. Use to_numeric without passing `errors` and catch exceptions explicitly instead
+
+/home/endata/PycharmProjects/pypsa-ee/.snakemake/scripts/tmp84n78oui.add_electricity.py:384: FutureWarning:
+
+errors='ignore' is deprecated and will raise in a future version. Use to_numeric without passing `errors` and catch exceptions explicitly instead
+
+/home/endata/PycharmProjects/pypsa-ee/.snakemake/scripts/tmp84n78oui.add_electricity.py:384: FutureWarning:
+
+errors='ignore' is deprecated and will raise in a future version. Use to_numeric without passing `errors` and catch exceptions explicitly instead
+
+/home/endata/PycharmProjects/pypsa-ee/.snakemake/scripts/tmp84n78oui.add_electricity.py:384: FutureWarning:
+
+errors='ignore' is deprecated and will raise in a future version. Use to_numeric without passing `errors` and catch exceptions explicitly instead
+
+/home/endata/PycharmProjects/pypsa-ee/.snakemake/scripts/tmp84n78oui.add_electricity.py:384: FutureWarning:
+
+errors='ignore' is deprecated and will raise in a future version. Use to_numeric without passing `errors` and catch exceptions explicitly instead
+
+/home/endata/PycharmProjects/pypsa-ee/.snakemake/scripts/tmp84n78oui.add_electricity.py:384: FutureWarning:
+
+errors='ignore' is deprecated and will raise in a future version. Use to_numeric without passing `errors` and catch exceptions explicitly instead
+
+/home/endata/PycharmProjects/pypsa-ee/.snakemake/scripts/tmp84n78oui.add_electricity.py:384: FutureWarning:
+
+errors='ignore' is deprecated and will raise in a future version. Use to_numeric without passing `errors` and catch exceptions explicitly instead
+
+INFO:__main__:Divided all powerplants with carrier ['nuclear', 'lignite', 'coal', 'CCGT', 'biomass', 'H2'] into cooling type dry-cooling, once-through and closed loop.
+INFO:__main__:Load data scaled by factor 1.0.
+INFO:__main__:Adding 66 generators with capacities [GW]pp
+carrier
+CCGT       27.59
+OCGT        0.02
+biomass     0.00
+coal       18.10
+lignite    21.70
+oil         2.66
+Name: p_nom, dtype: float64
+INFO:__main__:Added connection cost of 3962-6230 Eur/MW/a to offwind-ac
+ERROR:root:Uncaught exception
+Traceback (most recent call last):
+  File "/home/endata/PycharmProjects/pypsa-ee/.snakemake/scripts/tmp84n78oui.add_electricity.py", line 1248, in <module>
+    attach_wind_and_solar(
+  File "/home/endata/PycharmProjects/pypsa-ee/.snakemake/scripts/tmp84n78oui.add_electricity.py", line 586, in attach_wind_and_solar
+    n.add(
+  File "/home/endata/.local/lib/python3.12/site-packages/pypsa/network/transform.py", line 274, in add
+    raise ValueError(msg.format(f"DataFrame {k}", "network snapshots"))
+ValueError: DataFrame p_max_pu has an index which does not align with the passed network snapshots.
+RuleException:
+CalledProcessError in file "/home/endata/PycharmProjects/pypsa-ee/rules/build_electricity.smk", line 893:
+Command 'set -euo pipefail;  /home/endata/PycharmProjects/pypsa-ee/.pixi/envs/default/bin/python3.12 /home/endata/PycharmProjects/pypsa-ee/.snakemake/scripts/tmp84n78oui.add_electricity.py' returned non-zero exit status 1.
+[Fri Jan 23 08:06:20 2026]
+Error in rule add_electricity:
+    message: None
+    jobid: 57
+    input: resources/profile_5_solar.nc, resources/profile_5_solar-hsat.nc, resources/profile_5_onwind.nc, resources/profile_5_offwind-ac.nc, resources/profile_5_offwind-dc.nc, resources/profile_5_offwind-float.nc, resources/profile_hydro.nc, resources/regions_by_class_5_offwind-dc.geojson, resources/regions_by_class_5_solar.geojson, resources/regions_by_class_5_solar-hsat.geojson, resources/regions_by_class_5_offwind-float.geojson, resources/regions_by_class_5_onwind.geojson, resources/regions_by_class_5_offwind-ac.geojson, data/nuclear_p_max_pu.csv, resources/powerplants_s_5_cooling_share.csv, data/EE_GitHub/powerplant_cost_eff.csv, resources/networks/base_s_5.nc, resources/costs_2050_processed.csv, resources/regions_onshore_base_s_5.geojson, resources/powerplants_s_5.csv, data/hydro_capacities.csv, data/unit_commitment.csv, resources/electricity_demand_base_s.nc, resources/busmap_base_s_5.csv
+    output: resources/networks/base_s_5_elec.nc
+    log: logs/add_electricity_5.log (check log file(s) for error details)
+Shutting down, this might take some time.
+Exiting because a job execution failed. Look below for error messages
+[Fri Jan 23 08:06:20 2026]
+Error in rule add_electricity:
+    message: None
+    jobid: 57
+    input: resources/profile_5_solar.nc, resources/profile_5_solar-hsat.nc, resources/profile_5_onwind.nc, resources/profile_5_offwind-ac.nc, resources/profile_5_offwind-dc.nc, resources/profile_5_offwind-float.nc, resources/profile_hydro.nc, resources/regions_by_class_5_offwind-dc.geojson, resources/regions_by_class_5_solar.geojson, resources/regions_by_class_5_solar-hsat.geojson, resources/regions_by_class_5_offwind-float.geojson, resources/regions_by_class_5_onwind.geojson, resources/regions_by_class_5_offwind-ac.geojson, data/nuclear_p_max_pu.csv, resources/powerplants_s_5_cooling_share.csv, data/EE_GitHub/powerplant_cost_eff.csv, resources/networks/base_s_5.nc, resources/costs_2050_processed.csv, resources/regions_onshore_base_s_5.geojson, resources/powerplants_s_5.csv, data/hydro_capacities.csv, data/unit_commitment.csv, resources/electricity_demand_base_s.nc, resources/busmap_base_s_5.csv
+    output: resources/networks/base_s_5_elec.nc
+    log: logs/add_electricity_5.log (check log file(s) for error details)
+Complete log(s): /home/endata/PycharmProjects/pypsa-ee/.snakemake/log/2026-01-23T080607.299027.snakemake.log
+WorkflowError:
+At least one job did not complete successfully. ble components to the clustered
 network with **zero** initial capacity:
 
 - ``StorageUnits`` of carrier 'H2' and/or 'battery'. If this option is chosen,
@@ -414,6 +522,28 @@ def attach_load(
     logger.info(f"Load data scaled by factor {scaling}.")
     load *= scaling
 
+    # --- Robust snapshot alignment (must match n.snapshots exactly) ---
+    # Ensure DateTimeIndex without timezone
+    load.index = pd.to_datetime(load.index)
+    if getattr(load.index, "tz", None) is not None:
+        load.index = load.index.tz_convert(None)
+
+    snap = pd.DatetimeIndex(n.snapshots)
+    if getattr(snap, "tz", None) is not None:
+        snap = snap.tz_convert(None)
+
+    # 1) If load has extra timestamps: drop them (this fixes your current case)
+    # 2) If load is missing timestamps: create them (NaN) and then fill
+    load = load.reindex(snap)
+
+    # Forward/backward fill to cover small gaps at boundaries; then fill any remaining holes with 0
+    # (choose behavior depending on your preference; this is conservative for power system models)
+    load = load.ffill().bfill().fillna(0.0)
+
+    # Optional safety: enforce exact index equality
+    assert load.index.equals(snap), "Load index still not aligned with network snapshots."
+    # --- end alignment --
+
     n.add("Load", load.columns, bus=load.columns, p_set=load)  # carrier="electricity"
 
 
@@ -557,6 +687,18 @@ def attach_wind_and_solar(
 
             p_max_pu = ds["profile"].to_pandas()
             p_max_pu.columns = p_max_pu.columns.map(flatten)
+
+            # --- Robust snapshot alignment for p_max_pu ---
+            p_max_pu.index = pd.to_datetime(p_max_pu.index)
+            if getattr(p_max_pu.index, "tz", None) is not None:
+                p_max_pu.index = p_max_pu.index.tz_convert(None)
+
+            snap = pd.DatetimeIndex(n.snapshots)
+            if getattr(snap, "tz", None) is not None:
+                snap = snap.tz_convert(None)
+
+            p_max_pu = p_max_pu.reindex(snap).ffill().bfill()
+            # --- end alignment ---
 
             n.add(
                 "Generator",

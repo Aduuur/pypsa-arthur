@@ -6,7 +6,7 @@ To download CORINE dataset from the primary data source - https://land.copernicu
 
 Usage Instructions:
     1. Login using EU login at https://land.copernicus.eu/user/login and create an API key
-    2. Copy API key into the config.default.yaml -> (save from portal)
+    2. Copy API key into the config.yaml -> (save from portal)
     #   secrets:
     #       corine: ''
 """
@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 def load_access_token(apikey):
     # Login using EU login at https://land.copernicus.eu/user/login and create an API key
-    # Copy API key into the config.default.yaml -> (save from portal)
+    # Copy API key into the config.yaml -> (save from portal)
     #   secrets:
     #       corine: ''
     try:

@@ -29,7 +29,7 @@ def ac_dc_network():
 
 @pytest.fixture(scope="session")
 def config():
-    path_config = pathlib.Path(pathlib.Path.cwd(), "config", "config.default.yaml")
+    path_config = pathlib.Path(pathlib.Path.cwd(), "config", "config.yaml")
     with open(path_config) as file:
         config_dict = yaml.safe_load(file)
     return config_dict

@@ -1482,7 +1482,14 @@ def add_generation(
     ## 3) Add time-dependent n.links_t.p_max_pu from n.generators_t.p_max_pu
     
     # safed from n.generators_t.p_max_pu
-    src = removed['Generator']['pnl']['p_max_pu']
+    #src = removed['Generator']['pnl']['p_max_pu']
+    pnl = removed["Generator"].get("pnl", {})
+    src = pnl.get("p_max_pu", None)
+
+    # If removed generators have no time-dependent p_max_pu, fall back to 1.0
+    if src is None:
+        gen_i = removed["Generator"]["df"].index  # removed generator names
+        src = pd.DataFrame(1.0, index=n.snapshots, columns=gen_i)
 
     # if p_max_pu already has entries preserve them
     if isinstance(n.links_t.p_max_pu, pd.Series):
