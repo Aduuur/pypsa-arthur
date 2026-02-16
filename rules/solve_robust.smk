@@ -29,6 +29,13 @@ EPS_LS = float(ROB.get("eps_ls", 1e-6))
 
 RUN_NAME = config["run"]["name"]
 
+FORESIGHT = config.get("foresight")
+if FORESIGHT not in {"overnight", "myopic", "perfect"}:
+    raise ValueError(
+        "Invalid config['foresight'] value "
+        f"{FORESIGHT!r}. Expected one of: overnight, myopic, perfect. "
+        "A misspelling here prevents nested robust builds from finding the base-network rule."
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -50,6 +57,22 @@ PLANNING_HORIZON = _require_singleton("planning_horizons", SC.get("planning_hori
 
 
 
+def _normalise_wildcard_token(x) -> str:
+    """Map config sentinel values to filename wildcard tokens.
+
+    In several setups, the no-option sentinel appears as ``none`` or ``None`` in
+    config files, while rule outputs use an empty token (``...__...``).
+    """
+    if x is None:
+        return ""
+    token = str(x).strip()
+    if token.lower() == "none":
+        return ""
+    return token
+
+
+OPTS_TOKEN = _normalise_wildcard_token(OPTS)
+SECTOR_OPTS_TOKEN = _normalise_wildcard_token(SECTOR_OPTS)
 
 # -----------------------------------------------------------------------------
 # Solver settings (match your config: solving.solver.name + solving.solver.options)
@@ -97,7 +120,48 @@ def _base_network_path_for_cutout(cutout: str) -> str:
     # PyPSA-Eur output convention:
     # results/<run.name>/networks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.nc
     subrun = _subrun_name_for_cutout(PARENT_RUN, cutout)
-    return f"results/{subrun}/networks/base_s_{CLUSTERS}_{OPTS}_{SECTOR_OPTS}_{PLANNING_HORIZON}.nc"
+    return f"results/{subrun}/networks/base_s_{CLUSTERS}_{OPTS_TOKEN}_{SECTOR_OPTS_TOKEN}_{PLANNING_HORIZON}.nc"
+
+def _base_network_path_candidates_for_cutout(cutout: str) -> list[str]:
+    """Return candidate nested targets for mixed wildcard conventions."""
+    subrun = _subrun_name_for_cutout(PARENT_RUN, cutout)
+
+    opts_raw = "" if OPTS is None else str(OPTS).strip()
+    sector_raw = "" if SECTOR_OPTS is None else str(SECTOR_OPTS).strip()
+
+    candidates = [
+        f"results/{subrun}/networks/base_s_{CLUSTERS}_{OPTS_TOKEN}_{SECTOR_OPTS_TOKEN}_{PLANNING_HORIZON}.nc",
+        f"results/{subrun}/networks/base_s_{CLUSTERS}_{opts_raw}_{sector_raw}_{PLANNING_HORIZON}.nc",
+    ]
+
+    return list(dict.fromkeys(candidates))
+
+
+def _resolve_nested_target(cutout: str, overlay_path: Path) -> str:
+    """Pick the first target whose producing rule can be resolved by Snakemake."""
+    candidates = _base_network_path_candidates_for_cutout(cutout)
+
+    for target in candidates:
+        probe = [
+            "snakemake",
+            "-s", "Snakefile",
+            "--dry-run",
+            "--cores", "1",
+            "--nolock",
+            "--configfile", "config/config.yaml",
+            "--configfile", str(overlay_path),
+            "--",
+            target,
+        ]
+        ret = subprocess.run(probe, capture_output=True, text=True)
+        if ret.returncode == 0:
+            return target
+
+    raise RuntimeError(
+        "Could not resolve nested base-network target for robust cutout "
+        f"{cutout!r}. Tried candidates: {candidates}. "
+        "Check scenario opts/sector_opts tokens and foresight mode."
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -119,14 +183,14 @@ rule build_base_network_per_cutout:
     params:
         cutout=lambda wc: wc.cutout,
         subrun=lambda wc: _subrun_name_for_cutout(PARENT_RUN, wc.cutout),
-        final_base=lambda wc: _base_network_path_for_cutout(wc.cutout),
+      # final_base=lambda wc: _base_network_path_for_cutout(wc.cutout),
     threads: 1
     resources:
         mem_mb=2000
     run:
         cutout = params.cutout
         subrun = params.subrun
-        final_base = params.final_base
+        #final_base = params.final_base
 
         # 1) write overlay config
         overlay = {
@@ -140,11 +204,14 @@ rule build_base_network_per_cutout:
         with open(overlay_path, "w") as f:
             yaml.safe_dump(overlay, f, sort_keys=False)
 
+        final_base = _resolve_nested_target(cutout, overlay_path)
+
+
         cmd = [
             "snakemake",
             "-s", "Snakefile",
-            "--cores", "8",  # <-- NEU (oder "all")
-            "--scheduler", "greedy",  # optional, aber konsistent
+            "--cores", "8",
+            "--scheduler", "greedy",
             "--nolock",
             "--rerun-incomplete",
             "--keep-going",
@@ -198,8 +265,8 @@ rule all_plus_robust:
             "results/{run}/csvs/individual/metrics_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.csv",
             run=RUN_NAME,
             clusters=CLUSTERS,
-            opts=OPTS,
-            sector_opts=SECTOR_OPTS,
+            opts=OPTS_TOKEN,
+            sector_opts=SECTOR_OPTS_TOKEN,
             planning_horizons=PLANNING_HORIZON,
         ),
         OUT_NETWORK,
