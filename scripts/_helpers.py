@@ -1031,7 +1031,33 @@ def load_cutout(
         cutout = atlite.Cutout(NamedTemporaryFile().name, data=combined_data)
 
     if time is not None:
-        cutout.data = cutout.data.sel(time=time)
+        try:
+            # strict: requires exact match of all timestamps
+            cutout.data = cutout.data.sel(time=time)
+        except KeyError:
+            # Fallback: slice + align to requested timestamps
+            req = pd.DatetimeIndex(time)
+            t0 = req[0].strftime("%Y-%m-%dT%H:%M:%S")
+            t1 = req[-1].strftime("%Y-%m-%dT%H:%M:%S")
+
+            # slice is much more robust (also for CFTimeIndex)
+            cutout.data = cutout.data.sel(time=slice(t0, t1))
+
+            # Reindex onto requested timestamps (nearest within tolerance)
+            idx = cutout.data.indexes.get("time", None)
+
+            # If we have normal DatetimeIndex in the cutout, we can reindex to req directly
+            if idx is not None and not isinstance(idx, xr.CFTimeIndex):
+                freq = pd.infer_freq(req) or "H"
+                step = pd.Timedelta(freq)
+                tol = step / 2
+                cutout.data = cutout.data.reindex(time=req, method="nearest", tolerance=tol)
+            else:
+                # CFTimeIndex: build a matching CFTime range for the cutout calendar
+                cal = idx.calendar if idx is not None else "standard"
+                freq = pd.infer_freq(req) or "H"
+                req_cf = xr.cftime_range(start=t0, end=t1, freq=freq, calendar=cal)
+                cutout.data = cutout.data.reindex(time=req_cf, method="nearest")
 
     return cutout
 

@@ -28,7 +28,7 @@ remote:
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#run
 run:
   prefix: ""
-  name: "robus_trial"
+  name: ""
   scenarios:
     enable: false
     file: config/scenarios.yaml
@@ -38,55 +38,62 @@ run:
     exclude: []
   use_shadow_directory: false
 
-
-
-robust:
-  # diskrete Szenarien = manipulierten Cutouts
-  cutouts:
-    - cutout_mCNRM-CERFACS-CM5_rcp45_2010
-    - cutout_mCNRM-CERFACS-CM5_rcp26_2010
-
-
-  prepared_template: "networks/prepared_{cutout}.nc"
-
-
-  # Robust solver outputs
-  out_network: "networks/robust.nc"
-  out_summary: "results/robust_summary.json"
-
-  # Lexicographic tolerance
-  eps_ls: 1e-6
-
-
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#foresight
-foresight: myoptic
+foresight: overnight
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#scenario
 # Wildcard docs in https://pypsa-eur.readthedocs.io/en/latest/wildcards.html
 scenario:
   clusters:
-  - 20
+  - 50
   opts:
-  - 'none'
+  - ''
   sector_opts:
-  - 'none'
+  - ''
   planning_horizons:
   - 2050
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#countries
 countries:
-
+- AL
+- AT
+- BA
+- BE
+- BG
+- CH
+- CZ
 - DE
-- GB
-- FR
+- DK
+- EE
 - ES
+- FI
+- FR
+- GB
+- GR
+- HR
+- HU
+- IE
 - IT
+- LT
+- LU
+- LV
+- ME
+- MK
+- NL
+- 'NO'
 - PL
+- PT
+- RO
+- RS
+- SE
+- SI
+- SK
+- XK
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#snapshots
 snapshots:
-  start: "2050-01-01"
-  end: "2050-01-07"
+  start: "2013-01-01"
+  end: "2014-01-01"
   inclusive: 'left'
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#enable
@@ -154,24 +161,14 @@ electricity:
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#atlite
 atlite:
-  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2010
+  default_cutout: europe-2013-sarah3-era5
   nprocesses: 16
   show_progress: false
   cutouts:    
     # use 'base' to determine geographical bounds and time span from config
     # base:
       # module: era5
-    cutout_mCNRM-CERFACS-CM5_rcp45_2050:
-      module: cordex
-      x: [ -12., 42. ]
-      y: [ 33., 72. ]
-      dx: 0.3
-      dy: 0.3
-      time: [ '2050', '2050' ]
-      prepare_kwargs:
-        features: [ 'temperature', 'runoff', 'height' ]
-
-    europe-2010-sarah3-era5:
+    europe-2013-sarah3-era5:
       module: [sarah, era5] # in priority order
       x: [-12., 42.]
       y: [33., 72.]
@@ -195,51 +192,15 @@ atlite:
         monthly_requests: true
         tmpdir: "./cutouts_tmp/"
 
-    europe-2045-cordex:
-      module: cordex
-      x: [ -12., 42. ]
-      y: [ 33., 72. ]
-      dx: 0.3
-      dy: 0.3
-      time: [ '2045', '2045' ]
-      prepare_kwargs:
-        features: [ 'temperature', 'runoff', 'height' ]
-
-
-    cutout_mCNRM-CERFACS-CM5_rcp26_2010:
-      module: cordex
-      x: [ -12., 42. ]
-      y: [ 33., 72. ]
-      dx: 0.3
-      dy: 0.3
-      time: [ '2045', '2045' ]
-      prepare_kwargs:
-        features: [ 'temperature', 'runoff', 'height' ]
-
-    cutout_mCNRM-CERFACS-CM5_rcp45_2010:
-        module: cordex
-        x: [ -12., 42. ]
-        y: [ 33., 72. ]
-        dx: 0.3
-        dy: 0.3
-        time: [ '2045', '2045' ]
-        prepare_kwargs:
-          features: [ 'temperature', 'runoff', 'height' ]
-
-
-
-
-
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#renewable
 renewable:
   onwind:
     cutout: default
     resource:
       method: wind
-      #turbine: Vestas_V112_3MW
-      turbine: /mnt/endata/Cordex/pypsa-Compatibility/results/europe/CNRM-CERFACS-CM5/techfiles/wind_mCNRM-CERFACS-CM5_rcp26_2010_notAgg_pypsa.nc
+      turbine: Vestas_V112_3MW
       smooth: false
-      add_cutout_windspeed: false
+      add_cutout_windspeed: true
     resource_classes: 1
     capacity_per_sqkm: 3
     # correction_factor: 0.93
@@ -258,10 +219,9 @@ renewable:
     cutout: default
     resource:
       method: wind
-      #turbine: NREL_ReferenceTurbine_2020ATB_5.5MW
-      turbine: /mnt/endata/Cordex/Pypsa-Compatibility/results/europe/CNRM-CERFACS-CM5/techfiles/wind_offshore_mCNRM-CERFACS-CM5_rcp26_2010_notAgg_pypsa.nc
+      turbine: NREL_ReferenceTurbine_2020ATB_5.5MW
       smooth: false
-      add_cutout_windspeed: false
+      add_cutout_windspeed: true
     resource_classes: 1
     capacity_per_sqkm: 2
     correction_factor: 0.8855
@@ -278,10 +238,9 @@ renewable:
     cutout: default
     resource:
       method: wind
-      #turbine: NREL_ReferenceTurbine_2020ATB_5.5MW
-      turbine: /mnt/endata/Cordex/Pypsa-Compatibility/results/europe/CNRM-CERFACS-CM5/techfiles/wind_offshore_mCNRM-CERFACS-CM5_rcp26_2010_notAgg_pypsa.nc
+      turbine: NREL_ReferenceTurbine_2020ATB_5.5MW
       smooth: false
-      add_cutout_windspeed: false
+      add_cutout_windspeed: true
     resource_classes: 1
     capacity_per_sqkm: 2
     correction_factor: 0.8855
@@ -298,10 +257,9 @@ renewable:
     cutout: default
     resource:
       method: wind
-      #turbine: NREL_ReferenceTurbine_2020ATB_5.5MW
-      turbine: /mnt/endata/Cordex/Pypsa-Compatibility/results/europe/CNRM-CERFACS-CM5/techfiles/wind_offshore_mCNRM-CERFACS-CM5_rcp26_2010_notAgg_pypsa.nc
+      turbine: NREL_ReferenceTurbine_5MW_offshore
       smooth: false
-      add_cutout_windspeed: false
+      add_cutout_windspeed: true
     resource_classes: 1
     # ScholzPhd Tab 4.3.1: 10MW/km^2
     capacity_per_sqkm: 2
@@ -321,8 +279,7 @@ renewable:
     cutout: default
     resource:
       method: pv
-      #panel: CSi
-      panel: /mnt/endata/Cordex/Pypsa-Compatibility/results/europe/CNRM-CERFACS-CM5/techfiles/pv_mCNRM-CERFACS-CM5_rcp26_2010_notAgg_pypsa.nc
+      panel: CSi
       orientation:
         slope: 35.
         azimuth: 180.
@@ -338,8 +295,7 @@ renewable:
     cutout: default
     resource:
       method: pv
-      #panel: CSi
-      panel: /mnt/endata/Cordex/Pypsa-Compatibility/results/europe/CNRM-CERFACS-CM5/techfiles/pv_mCNRM-CERFACS-CM5_rcp26_2010_notAgg_pypsa.nc
+      panel: CSi
       orientation:
         slope: 35.
         azimuth: 180.
@@ -361,7 +317,7 @@ renewable:
     clip_min_inflow: 1.0
     eia_norm_year: false
     eia_correct_by_capacity: false
-    eia_approximate_missing: true
+    eia_approximate_missing: false
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#conventional
 conventional:
@@ -543,13 +499,13 @@ existing_capacities:
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#sector
 sector:
-  transport: false
+  transport: true
   heating: true
   biomass: true
-  industry: false
-  shipping: false
-  aviation: false
-  agriculture: false
+  industry: true
+  shipping: true
+  aviation: true
+  agriculture: true
   fossil_fuels: true
   district_heating:
     potential: 0.6
@@ -756,7 +712,7 @@ sector:
     - solid biomass # For solid biomass, CHP with and without CC are added
     - gas # For all other fuels the same techno economic data from gas CHP is taken
     micro_chp: false # Only gas is used for micro_chp
-  solar_thermal: false
+  solar_thermal: true
   solar_cf_correction: 0.788457  # =  >>> 1/1.2683
   methanation: true
   coal_cc: false
@@ -1257,10 +1213,6 @@ solving:
   solver:
     name: gurobi
     options: gurobi-default
-    solver_options:
-      Threads: 8
-      MIPGap: 1e-4
-
 
   solver_options:
     highs-default:
@@ -1339,4 +1291,3 @@ solving:
   mem_mb: 128000
   memory_logging_frequency: 5 # in seconds
   runtime: 48h #runtime in humanfriendly style https://humanfriendly.readthedocs.io/en/latest/
-

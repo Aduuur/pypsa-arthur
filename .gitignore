@@ -6,7 +6,7 @@ master
 
 .env
 
-.snakemake*
+
 .ipynb_checkpoints
 __pycache__
 *.egg-info
@@ -27,15 +27,9 @@ gurobi.log
 /cutouts
 /tmp
 doc/_build
-/config
-!/config/config.yaml
-
 /scripts/old
 /scripts/create_scenarios.py
-/config/create_scenarios.py
 
-config/config.yaml
-config/scenarios.yaml
 
 dconf
 /data/*
@@ -92,3 +86,6 @@ CLAUDE.local.md
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+
+# snakemake runtime
+.snakemake/

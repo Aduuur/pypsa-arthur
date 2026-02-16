@@ -1,0 +1,540 @@
+# -*- coding: utf-8 -*-
+# SPDX-FileCopyrightText: Contributors to PyPSA-Eur <https://github.com/pypsa/pypsa-eur>
+#
+# SPDX-License-Identifier: MIT
+
+# This file is used to define the scenarios that are run by snakemake. Each entry on the first level is a scenario. Each scenario can contain configuration overrides with respect to the config/config.yaml settings.
+#
+# Example
+#
+# custom-scenario: # name of the scenario
+#   electricity:
+#       renewable_carriers: [wind, solar] # override the list of renewable carriers
+
+demand_2025:
+  scenario:
+    planning_horizons:
+    - 2025
+  snapshots:
+    start: "2025-01-01"
+    end: "2025-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2025
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2025:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2025', '2025' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+
+demand_2026:
+  scenario:
+    planning_horizons:
+    - 2026
+  snapshots:
+    start: "2026-01-01"
+    end: "2026-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2026
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2026:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2026', '2026' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+demand_2027:
+  scenario:
+    planning_horizons:
+    - 2027
+  snapshots:
+    start: "2027-01-01"
+    end: "2027-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2027
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2027:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2027', '2027' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+demand_2028:
+  scenario:
+    planning_horizons:
+    - 2028
+  snapshots:
+    start: "2028-01-01"
+    end: "2028-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2028
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2028:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2028', '2028' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+
+demand_2029:
+  scenario:
+    planning_horizons:
+    - 2029
+  snapshots:
+    start: "2029-01-01"
+    end: "2029-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2029
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2029:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2029', '2029' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+demand_2030:
+  scenario:
+    planning_horizons:
+    - 2030
+  snapshots:
+    start: "2030-01-01"
+    end: "2030-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2030
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2030:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2030', '2030' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+demand_2031:
+  scenario:
+    planning_horizons:
+    - 2031
+  snapshots:
+    start: "2031-01-01"
+    end: "2031-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2031
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2031:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2031', '2031' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+demand_2032:
+  scenario:
+    planning_horizons:
+    - 2032
+  snapshots:
+    start: "2032-01-01"
+    end: "2032-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2032
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2032:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2032', '2032' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+demand_2033:
+  scenario:
+    planning_horizons:
+    - 2033
+  snapshots:
+    start: "2033-01-01"
+    end: "2033-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2033
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2033:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2033', '2033' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+demand_2034:
+  scenario:
+    planning_horizons:
+    - 2034
+  snapshots:
+    start: "2034-01-01"
+    end: "2034-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2034
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2034:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2034', '2034' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+
+demand_2035:
+  scenario:
+    planning_horizons:
+    - 2035
+  snapshots:
+    start: "2035-01-01"
+    end: "2035-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2035
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2035:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2035', '2035' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+demand_2036:
+  scenario:
+    planning_horizons:
+    - 2036
+  snapshots:
+    start: "2036-01-01"
+    end: "2036-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2036
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2036:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2036', '2036' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+
+demand_2037:
+  scenario:
+    planning_horizons:
+    - 2037
+  snapshots:
+    start: "2037-01-01"
+    end: "2037-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2037
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2037:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2037', '2037' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+demand_2038:
+  scenario:
+    planning_horizons:
+    - 2038
+  snapshots:
+    start: "2038-01-01"
+    end: "2038-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2038
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2038:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2038', '2038' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+demand_2039:
+  scenario:
+    planning_horizons:
+    - 2039
+  snapshots:
+    start: "2039-01-01"
+    end: "2039-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2039
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2039:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2039', '2039' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+
+demand_2040:
+  scenario:
+    planning_horizons:
+    - 2040
+  snapshots:
+    start: "2040-01-01"
+    end: "2040-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2040
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2040:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2040', '2040' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+demand_2041:
+  scenario:
+    planning_horizons:
+    - 2041
+  snapshots:
+    start: "2041-01-01"
+    end: "2041-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2041
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2041:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2041', '2041' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+demand_2042:
+  scenario:
+    planning_horizons:
+    - 2042
+  snapshots:
+    start: "2042-01-01"
+    end: "2042-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2042
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2042:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2042', '2042' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+
+demand_2043:
+  scenario:
+    planning_horizons:
+    - 2043
+  snapshots:
+    start: "2043-01-01"
+    end: "2043-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2043
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2043:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2043', '2043' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+demand_2044:
+  scenario:
+    planning_horizons:
+    - 2044
+  snapshots:
+    start: "2044-01-01"
+    end: "2044-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2044
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2044:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2044', '2044' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+
+demand_2045:
+  scenario:
+    planning_horizons:
+    - 2045
+  snapshots:
+    start: "2045-01-01"
+    end: "2045-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2045
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2045:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2045', '2045' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+demand_2046:
+  scenario:
+    planning_horizons:
+    - 2046
+  snapshots:
+    start: "2046-01-01"
+    end: "2046-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2046
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2046:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2046', '2046' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+demand_2047:
+  scenario:
+    planning_horizons:
+    - 2047
+  snapshots:
+    start: "2047-01-01"
+    end: "2047-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2047
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2047:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2047', '2047' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+demand_2048:
+  scenario:
+    planning_horizons:
+    - 2048
+  snapshots:
+    start: "2048-01-01"
+    end: "2048-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2048
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2048:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2048', '2048' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+demand_2049:
+  scenario:
+    planning_horizons:
+    - 2049
+  snapshots:
+    start: "2049-01-01"
+    end: "2049-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2049
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2049:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2049', '2049' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
+
+
+demand_2050:
+  scenario:
+    planning_horizons:
+    - 2050
+  snapshots:
+    start: "2050-01-01"
+    end: "2050-12-31"
+    inclusive: "both"
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2050
+  cutouts:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2050:
+      module: cordex
+      x: [ -12., 42. ]
+      y: [ 33., 72. ]
+      dx: 0.3
+      dy: 0.3
+      time: [ '2050', '2050' ]
+      prepare_kwargs:
+        features: [ 'temperature', 'runoff', 'height' ]
