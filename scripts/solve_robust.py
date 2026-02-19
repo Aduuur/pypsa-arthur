@@ -183,6 +183,9 @@ def _ensure_load_shedding_generators(
         logger.info("Found %d existing load-shedding generators.", len(existing))
         return existing
 
+    if "load_shedding" not in n.carriers.index:
+        n.add("Carrier", "load_shedding")
+
     logger.info("Adding load-shedding generators (one per bus).")
     ls_names: List[str] = []
     for bus in n.buses.index:
@@ -262,13 +265,12 @@ def stack_scenarios_to_multisnapshot_network(
         # fallback if no investment periods are defined
         period_value = 0
 
-    # --- build snapshots MultiIndex in PyPSA-compatible form: (period, timestep) ---
-    # timestep encodes (scenario, time) to avoid polluting 'period'
+    # timestep encodes (scenario, time)
     timestep_labels = [(scen, ts) for scen in scenario_names for ts in base_snaps]
-    periods = np.full(len(timestep_labels), period_value, dtype=int)
 
-    stacked_snaps = pd.MultiIndex.from_arrays(
-        [periods, pd.Index(timestep_labels, dtype=object)],
+    # Build MultiIndex as list of tuples (period, (scenario, timestamp))
+    stacked_snaps = pd.MultiIndex.from_tuples(
+        [(period_value, label) for label in timestep_labels],
         names=["period", "timestep"],
     )
 
@@ -323,12 +325,9 @@ def stack_scenarios_to_multisnapshot_network(
 
                 dfs.append(df)
 
-            df_stacked = pd.concat(dfs, keys=scenario_names, names=["period", "timestep"])
-
-            df_stacked = pd.concat(dfs, keys=scenario_names, names=["period", "timestep"])
-
-            # enforce exact index match with n.snapshots
-            df_stacked = df_stacked.reindex(n.snapshots)
+            df_stacked = pd.concat(dfs, axis=0)
+            df_stacked.index = n.snapshots
+            setattr(n_t, attr, df_stacked)
 
             try:
                 setattr(n_t, attr, df_stacked)
@@ -486,18 +485,37 @@ def _build_ls_energy_expression(n: pypsa.Network, ls_generators: List[str], mask
     m = n.model
     gen_p, gen_p_name = _get_linopy_var(m, ["Generator-p"], strict=True)
 
+    # --- find generator dimension name (PyPSA/Linopy may use 'Generator' OR 'name') ---
+    gen_dim = None
+    for cand in ("Generator", "name", "generator"):
+        if cand in getattr(gen_p, "dims", ()):
+            gen_dim = cand
+            break
+    if gen_dim is None:
+        # last resort: assume the non-time dimension is the asset dimension
+        td = _get_time_dimension(gen_p)
+        other_dims = [d for d in gen_p.dims if d != td]
+        if len(other_dims) != 1:
+            raise RuntimeError(
+                f"Cannot infer generator dimension for {gen_p_name}. dims={gen_p.dims}"
+            )
+        gen_dim = other_dims[0]
+
+    # --- available generator labels ---
     try:
-        available_gens = set(gen_p.coords["Generator"].values.tolist())
+        available_gens = set(gen_p.coords[gen_dim].values.tolist())
     except Exception as e:
-        raise RuntimeError(f"Cannot access 'Generator' coordinate on {gen_p_name}: {e}") from e
+        raise RuntimeError(f"Cannot access '{gen_dim}' coordinate on {gen_p_name}: {e}") from e
 
     missing = set(ls_generators) - available_gens
     if missing:
         raise ValueError(f"Load shedding generators not found in model: {sorted(missing)}")
 
-    gen_p_ls = gen_p.sel(Generator=ls_generators)
-    w = _weights_objective_series(n)
+    # --- select LS generators ---
+    gen_p_ls = gen_p.sel({gen_dim: ls_generators})
 
+    # --- select scenario time slice + weight ---
+    w = _weights_objective_series(n)
     td = _get_time_dimension(gen_p_ls)
     idx = _mask_to_isel_indices(mask)
 
@@ -506,7 +524,10 @@ def _build_ls_energy_expression(n: pypsa.Network, ls_generators: List[str], mask
 
     import xarray as xr
     w_da = xr.DataArray(w_s, dims=[td], coords={td: gen_p_ls_s.coords[td]})
+
+    # sum over time and generator dim(s)
     return (gen_p_ls_s * w_da).sum()
+
 
 
 def _build_investment_cost_expression(n: pypsa.Network):
@@ -523,7 +544,12 @@ def _build_investment_cost_expression(n: pypsa.Network):
         var, _ = _get_linopy_var(m, ["Generator-p_nom"], strict=False)
         if var is not None:
             cap_cost = n.generators["capital_cost"].reindex(n.generators.index).fillna(0.0)
-            cc = xr.DataArray(cap_cost.to_numpy(), dims=["Generator"], coords={"Generator": n.generators.index})
+            gen_idx = n.generators.index.to_numpy()
+            cc = xr.DataArray(
+                cap_cost.to_numpy(),
+                dims=["Generator"],
+                coords={"Generator": ("Generator", gen_idx)},
+            )
             expr = expr + (var * cc).sum()
 
     # Links
@@ -531,7 +557,12 @@ def _build_investment_cost_expression(n: pypsa.Network):
         var, _ = _get_linopy_var(m, ["Link-p_nom"], strict=False)
         if var is not None:
             cap_cost = n.links["capital_cost"].reindex(n.links.index).fillna(0.0)
-            cc = xr.DataArray(cap_cost.to_numpy(), dims=["Link"], coords={"Link": n.links.index})
+            link_idx = n.links.index.to_numpy()
+            cc = xr.DataArray(
+                cap_cost.to_numpy(),
+                dims=["Link"],
+                coords={"Link": ("Link", link_idx)},
+            )
             expr = expr + (var * cc).sum()
 
     # StorageUnits
@@ -539,7 +570,12 @@ def _build_investment_cost_expression(n: pypsa.Network):
         var, _ = _get_linopy_var(m, ["StorageUnit-p_nom"], strict=False)
         if var is not None:
             cap_cost = n.storage_units["capital_cost"].reindex(n.storage_units.index).fillna(0.0)
-            cc = xr.DataArray(cap_cost.to_numpy(), dims=["StorageUnit"], coords={"StorageUnit": n.storage_units.index})
+            su_idx = n.storage_units.index.to_numpy()
+            cc = xr.DataArray(
+                cap_cost.to_numpy(),
+                dims=["StorageUnit"],
+                coords={"StorageUnit": ("StorageUnit", su_idx)},
+            )
             expr = expr + (var * cc).sum()
 
     # Stores
@@ -547,7 +583,12 @@ def _build_investment_cost_expression(n: pypsa.Network):
         var, _ = _get_linopy_var(m, ["Store-e_nom"], strict=False)
         if var is not None:
             cap_cost = n.stores["capital_cost"].reindex(n.stores.index).fillna(0.0)
-            cc = xr.DataArray(cap_cost.to_numpy(), dims=["Store"], coords={"Store": n.stores.index})
+            st_idx = n.stores.index.to_numpy()
+            cc = xr.DataArray(
+                cap_cost.to_numpy(),
+                dims=["Store"],
+                coords={"Store": ("Store", st_idx)},
+            )
             expr = expr + (var * cc).sum()
 
     return expr
@@ -571,7 +612,13 @@ def _build_operational_cost_expression(n: pypsa.Network, mask: np.ndarray):
         var, _ = _get_linopy_var(m, ["Generator-p"], strict=False)
         if var is not None:
             mc = n.generators["marginal_cost"].reindex(n.generators.index).fillna(0.0)
-            mc_da = xr.DataArray(mc.to_numpy(), dims=["Generator"], coords={"Generator": n.generators.index})
+            gen_idx = n.generators.index.to_numpy()
+            mc_da = xr.DataArray(
+                mc.to_numpy(),
+                dims=["Generator"],
+                coords={"Generator": ("Generator", gen_idx)},
+            )
+
             td = _get_time_dimension(var)
             var_s = var.isel({td: idx})
             w_s = w.to_numpy()[idx]
@@ -583,7 +630,13 @@ def _build_operational_cost_expression(n: pypsa.Network, mask: np.ndarray):
         var, _ = _get_linopy_var(m, ["Link-p0", "Link-p"], strict=False)
         if var is not None:
             mc = n.links["marginal_cost"].reindex(n.links.index).fillna(0.0)
-            mc_da = xr.DataArray(mc.to_numpy(), dims=["Link"], coords={"Link": n.links.index})
+            link_idx = n.links.index.to_numpy()
+            mc_da = xr.DataArray(
+                mc.to_numpy(),
+                dims=["Link"],
+                coords={"Link": ("Link", link_idx)},
+            )
+
             td = _get_time_dimension(var)
             var_s = var.isel({td: idx})
             w_s = w.to_numpy()[idx]
@@ -595,7 +648,13 @@ def _build_operational_cost_expression(n: pypsa.Network, mask: np.ndarray):
         var, _ = _get_linopy_var(m, ["StorageUnit-p_dispatch", "StorageUnit-p"], strict=False)
         if var is not None:
             mc = n.storage_units["marginal_cost"].reindex(n.storage_units.index).fillna(0.0)
-            mc_da = xr.DataArray(mc.to_numpy(), dims=["StorageUnit"], coords={"StorageUnit": n.storage_units.index})
+            su_idx = n.storage_units.index.to_numpy()
+            mc_da = xr.DataArray(
+                mc.to_numpy(),
+                dims=["StorageUnit"],
+                coords={"StorageUnit": ("StorageUnit", su_idx)},
+            )
+
             td = _get_time_dimension(var)
             var_s = var.isel({td: idx})
             w_s = w.to_numpy()[idx]
@@ -607,7 +666,13 @@ def _build_operational_cost_expression(n: pypsa.Network, mask: np.ndarray):
         var, _ = _get_linopy_var(m, ["Store-p"], strict=False)
         if var is not None:
             mc = n.stores["marginal_cost"].reindex(n.stores.index).fillna(0.0)
-            mc_da = xr.DataArray(mc.to_numpy(), dims=["Store"], coords={"Store": n.stores.index})
+            st_idx = n.stores.index.to_numpy()
+            mc_da = xr.DataArray(
+                mc.to_numpy(),
+                dims=["Store"],
+                coords={"Store": ("Store", st_idx)},
+            )
+
             td = _get_time_dimension(var)
             var_s = var.isel({td: idx})
             w_s = w.to_numpy()[idx]
@@ -680,8 +745,8 @@ def solve_robust_lexicographic(
         z_ls = m.add_variables(lower=0, name="z_ls")
         for s in scenarios:
             ls_energy = _build_ls_energy_expression(network, ls_generators, masks[s])
-            m.add_constraints(z_ls >= ls_energy, name=f"robust_ls_epigraph::{s}")
-        m.objective = z_ls
+            m.add_constraints(1.0 * z_ls >= ls_energy, name=f"robust_ls_epigraph::{s}")
+        m.objective = 1.0 * z_ls
 
     logger.info("Stage 1: minimising worst-case load shedding energy ...")
     _ = n.optimize(
@@ -709,18 +774,18 @@ def solve_robust_lexicographic(
 
         for s in scenarios:
             ls_energy = _build_ls_energy_expression(network, ls_generators, masks[s])
-            m.add_constraints(z_ls >= ls_energy, name=f"robust_ls_epigraph::{s}")
+            m.add_constraints(1.0 * z_ls >= ls_energy, name=f"robust_ls_epigraph::{s}")
 
-        m.add_constraints(z_ls <= (z_ls_star + eps_ls), name="robust_ls_fix")
+        m.add_constraints(1.0 * z_ls <= (z_ls_star + eps_ls), name="robust_ls_fix")
 
         inv_cost = _build_investment_cost_expression(network)
 
         for s in scenarios:
             op_cost_s = _build_operational_cost_expression(network, masks[s])
             total_cost_s = inv_cost + op_cost_s
-            m.add_constraints(z_cost >= total_cost_s, name=f"robust_cost_epigraph::{s}")
+            m.add_constraints(1.0 * z_cost >= total_cost_s, name=f"robust_cost_epigraph::{s}")
 
-        m.objective = z_cost
+        m.objective = 1.0 * z_cost
 
     logger.info("Stage 2: minimising worst-case total cost given optimal LS ...")
     _ = n.optimize(
@@ -780,6 +845,46 @@ def extract_capacities(n: pypsa.Network) -> Dict[str, Dict[str, float]]:
 
     return out
 
+def export_network_flat_snapshots(n: pypsa.Network, out_network: str) -> None:
+    """
+    Workaround: PyPSA/xarray CF-NetCDF export can fail with MultiIndex snapshots that
+    contain nested tuples/objects. For export only, flatten snapshots to a simple Index
+    of strings and export that copy.
+    """
+    # detach solver model so that .copy() works
+    if getattr(n, "model", None) is not None:
+        try:
+            n.model.solver_model = None
+        except Exception:
+            pass
+
+    n_out = n.copy()
+
+    if isinstance(n_out.snapshots, pd.MultiIndex):
+        # expected structure: levels ["period","timestep"], where timestep is (scenario, timestamp)
+        periods = n_out.snapshots.get_level_values("period")
+        timesteps = n_out.snapshots.get_level_values("timestep")
+
+        flat = []
+        for p, ts in zip(periods, timesteps):
+            if isinstance(ts, tuple) and len(ts) >= 2:
+                scen, t = ts[0], ts[1]
+            else:
+                scen, t = "scen", ts
+            # timestamp to stable string
+            try:
+                t_str = pd.Timestamp(t).isoformat()
+            except Exception:
+                t_str = str(t)
+            flat.append(f"{p}::{scen}::{t_str}")
+
+        flat_idx = pd.Index(flat, name="snapshot")
+        n_out.set_snapshots(flat_idx)
+
+    Path(out_network).parent.mkdir(parents=True, exist_ok=True)
+    n_out.export_to_netcdf(out_network)
+
+
 
 def run_robust(
     *,
@@ -819,7 +924,7 @@ def run_robust(
     Path(out_summary_json).parent.mkdir(parents=True, exist_ok=True)
 
     logger.info("Exporting robust network to %s", out_network)
-    n.export_to_netcdf(out_network)
+    export_network_flat_snapshots(n, out_network)
 
     payload = {
         "scenario_names": list(scen_names),
