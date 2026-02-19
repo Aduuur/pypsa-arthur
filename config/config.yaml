@@ -46,6 +46,7 @@ robust:
     - cutout_mCNRM-CERFACS-CM5_rcp45_2010
     - cutout_mCNRM-CERFACS-CM5_rcp26_2010
 
+  base_target: "networks/base.nc"
 
   prepared_template: "networks/prepared_{cutout}.nc"
 
@@ -67,9 +68,9 @@ scenario:
   clusters:
   - 20
   opts:
-  - ''
+  - 'elec'
   sector_opts:
-  - ''
+  - 'none'
   planning_horizons:
   - 2050
 
@@ -85,8 +86,8 @@ countries:
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#snapshots
 snapshots:
-  start: "2050-01-01"
-  end: "2050-01-07"
+  start: "2010-01-01"
+  end: "2010-01-07"
   inclusive: 'left'
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#enable

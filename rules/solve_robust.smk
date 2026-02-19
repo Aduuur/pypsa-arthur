@@ -28,6 +28,7 @@ OUT_SUMMARY = ROB.get("out_summary", "results/robust_summary.json")
 EPS_LS = float(ROB.get("eps_ls", 1e-6))
 
 RUN_NAME = config["run"]["name"]
+BASE_TARGET = ROB.get("base_target", "networks/base.nc")
 
 FORESIGHT = config.get("foresight")
 if FORESIGHT not in {"overnight", "myopic", "perfect"}:
@@ -37,11 +38,12 @@ if FORESIGHT not in {"overnight", "myopic", "perfect"}:
         "A misspelling here prevents nested robust builds from finding the base-network rule."
     )
 
-
 # -----------------------------------------------------------------------------
 # Scenario singleton contract
 # -----------------------------------------------------------------------------
 SC = config.get("scenario", {})
+
+
 def _require_singleton(name: str, xs):
     if not isinstance(xs, list) or len(xs) != 1:
         raise ValueError(
@@ -50,19 +52,15 @@ def _require_singleton(name: str, xs):
         )
     return xs[0]
 
+
 CLUSTERS = _require_singleton("clusters", SC.get("clusters", []))
 OPTS = _require_singleton("opts", SC.get("opts", []))
 SECTOR_OPTS = _require_singleton("sector_opts", SC.get("sector_opts", []))
 PLANNING_HORIZON = _require_singleton("planning_horizons", SC.get("planning_horizons", []))
 
 
-
 def _normalise_wildcard_token(x) -> str:
-    """Map config sentinel values to filename wildcard tokens.
-
-    In several setups, the no-option sentinel appears as ``none`` or ``None`` in
-    config files, while rule outputs use an empty token (``...__...``).
-    """
+    """Map config sentinel values to filename wildcard tokens."""
     if x is None:
         return ""
     token = str(x).strip()
@@ -90,7 +88,6 @@ else:
 
 SOLVER_OPTIONS_JSON = json.dumps(SOLVER_OPTIONS)
 
-
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
@@ -100,7 +97,6 @@ def _sanitize_for_run_name(s: str) -> str:
 
 
 def _parent_run_name() -> str:
-    # Assumption: results dir uses run.name (prefix not used in your observed paths)
     run = config.get("run", {})
     name = run.get("name", "run")
     prefix = run.get("prefix", "")
@@ -116,52 +112,55 @@ def _subrun_name_for_cutout(parent_run: str, cutout: str) -> str:
     return f"{parent_run}__cutout__{_sanitize_for_run_name(cutout)}__{h}"
 
 
-def _base_network_path_for_cutout(cutout: str) -> str:
-    # PyPSA-Eur output convention:
-    # results/<run.name>/networks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.nc
+def _nested_target_for_cutout(cutout: str) -> str:
+    """
+    Return the file path expected from the nested run for the base network artefact.
+
+    NOTE: we DO NOT call Snakemake with this file path as a target!
+          We call the RULE name (prepare_elec_networks) and then *locate* the produced file.
+    """
     subrun = _subrun_name_for_cutout(PARENT_RUN, cutout)
-    return f"results/{subrun}/networks/base_s_{CLUSTERS}_{OPTS_TOKEN}_{SECTOR_OPTS_TOKEN}_{PLANNING_HORIZON}.nc"
 
-def _base_network_path_candidates_for_cutout(cutout: str) -> list[str]:
-    """Return candidate nested targets for mixed wildcard conventions."""
+    opts_tok = OPTS_TOKEN or str(OPTS).strip()
+    sect_tok = SECTOR_OPTS_TOKEN  # '' if none
+
+    # prepare_elec_networks output (from your repo): resources("networks/base_s_{clusters}_elec.nc")
+    # Some variants might include opts; we cover in the candidates finder below.
+    return f"resources/{subrun}/networks/base_s_{CLUSTERS}_elec.nc"
+
+
+def _base_network_candidates_for_cutout(cutout: str) -> list[str]:
+    """
+    Candidate file names to locate the produced base network after nested run.
+
+    We prefer resources/<subrun>/networks/ (unsolved build artefacts),
+    and fall back to results/<subrun>/networks/ if needed.
+    """
     subrun = _subrun_name_for_cutout(PARENT_RUN, cutout)
 
-    opts_raw = "" if OPTS is None else str(OPTS).strip()
-    sector_raw = "" if SECTOR_OPTS is None else str(SECTOR_OPTS).strip()
+    opts_tok = OPTS_TOKEN or str(OPTS).strip()
+    sect_tok = SECTOR_OPTS_TOKEN
+    ph = str(PLANNING_HORIZON).strip()  # should be "2050"
 
-    candidates = [
-        f"results/{subrun}/networks/base_s_{CLUSTERS}_{OPTS_TOKEN}_{SECTOR_OPTS_TOKEN}_{PLANNING_HORIZON}.nc",
-        f"results/{subrun}/networks/base_s_{CLUSTERS}_{opts_raw}_{sector_raw}_{PLANNING_HORIZON}.nc",
-    ]
+    cands: list[str] = []
 
-    return list(dict.fromkeys(candidates))
+    # --- (1) resources/ (preferred) ---
+    # from prepare_elec_networks:
+    cands.append(f"resources/{subrun}/networks/base_s_{CLUSTERS}_elec.nc")
 
+    # from prepare_network variants (repo-dependent):
+    cands.append(f"resources/{subrun}/networks/base_s_{CLUSTERS}_elec_{opts_tok}.nc")
+    if sect_tok:
+        cands.append(f"resources/{subrun}/networks/base_s_{CLUSTERS}_elec_{opts_tok}_{sect_tok}.nc")
 
-def _resolve_nested_target(cutout: str, overlay_path: Path) -> str:
-    """Pick the first target whose producing rule can be resolved by Snakemake."""
-    candidates = _base_network_path_candidates_for_cutout(cutout)
+    # --- (2) results/ (fallback) ---
+    # common solved base naming patterns:
+    cands.append(f"results/{subrun}/networks/base_s_{CLUSTERS}_{opts_tok}_{ph}.nc")
+    if sect_tok:
+        cands.append(f"results/{subrun}/networks/base_s_{CLUSTERS}_{opts_tok}_{sect_tok}_{ph}.nc")
 
-    for target in candidates:
-        probe = [
-            "snakemake",
-            "-s", "Snakefile",
-            "--dry-run",
-            "--cores", "1",
-            "--nolock",
-            "--configfile", "config/config.yaml",
-            "--configfile", str(overlay_path),
-            "--",
-            target,
-        ]
-        ret = subprocess.run(probe, capture_output=True, text=True)
-        if ret.returncode == 0:
-            return target
-
-    raise RuntimeError(
-        "Could not resolve nested base-network target for robust cutout "
-        f"{cutout!r}. Tried candidates: {candidates}. "
-        "Check scenario opts/sector_opts tokens and foresight mode."
-    )
+    # unique, preserve order
+    return list(dict.fromkeys(cands))
 
 
 # -----------------------------------------------------------------------------
@@ -169,13 +168,19 @@ def _resolve_nested_target(cutout: str, overlay_path: Path) -> str:
 # -----------------------------------------------------------------------------
 rule robust:
     input:
+        expand("results/robust_scenarios/{cutout}/base.nc", cutout=CUTOUTS),
+        expand(PREPARED_TEMPLATE, cutout=CUTOUTS),
         OUT_NETWORK,
         OUT_SUMMARY
 
 
 # -----------------------------------------------------------------------------
 # Rule 1: build per-cutout base network (nested snakemake)
-# IMPORTANT: output contains {cutout} so Snakemake can bind it.
+# IMPORTANT CHANGE:
+# - We call the RULE name `prepare_elec_networks` as nested target (NOT a file target),
+#   to avoid MissingRuleException and the snakemake fmt_iofile/is_storage crash you hit.
+# - Afterwards, we locate the produced .nc in resources/<subrun>/networks (preferred)
+#   and copy it into results/robust_scenarios/<cutout>/base.nc for the robust DAG.
 # -----------------------------------------------------------------------------
 rule build_base_network_per_cutout:
     output:
@@ -183,14 +188,14 @@ rule build_base_network_per_cutout:
     params:
         cutout=lambda wc: wc.cutout,
         subrun=lambda wc: _subrun_name_for_cutout(PARENT_RUN, wc.cutout),
-      # final_base=lambda wc: _base_network_path_for_cutout(wc.cutout),
+        nested_target_rule="prepare_elec_networks",
     threads: 1
     resources:
         mem_mb=2000
     run:
         cutout = params.cutout
         subrun = params.subrun
-        #final_base = params.final_base
+        nested_target_rule = params.nested_target_rule
 
         # 1) write overlay config
         overlay = {
@@ -204,11 +209,9 @@ rule build_base_network_per_cutout:
         with open(overlay_path, "w") as f:
             yaml.safe_dump(overlay, f, sort_keys=False)
 
-        final_base = _resolve_nested_target(cutout, overlay_path)
-
-
         cmd = [
-            "snakemake",
+            "/home/endata/PycharmProjects/pypsa-ee/.pixi/envs/default/bin/python3.12",
+            "-m", "snakemake",
             "-s", "Snakefile",
             "--cores", "8",
             "--scheduler", "greedy",
@@ -217,23 +220,54 @@ rule build_base_network_per_cutout:
             "--keep-going",
             "--configfile", "config/config.yaml",
             "--configfile", str(overlay_path),
-            "--",
-            final_base,
+            "--until", "prepare_elec_networks",
         ]
 
         print("\n[robust] Building per-cutout base network via nested snakemake:")
         print("         cutout    :", cutout)
         print("         subrun    :", subrun)
-        print("         target    :", final_base)
+        print("         target    :", nested_target_rule)
         print("         cmd       :", " ".join(cmd))
 
         subprocess.run(cmd, check=True)
 
-        # 3) copy to a stable location that carries {cutout} for DAG stability
+        # 2) locate produced base network file
+        # Prefer explicit candidates first (fast), then glob fallback.
+        candidate_paths = [Path(p) for p in _base_network_candidates_for_cutout(cutout)]
+        existing = [p for p in candidate_paths if p.exists()]
+
+        if not existing:
+            # glob fallback in both dirs
+            cand_dirs = [
+                Path("resources") / subrun / "networks",
+                Path("results") / subrun / "networks",
+            ]
+            globbed = []
+            for d in cand_dirs:
+                if d.exists():
+                    globbed += sorted(d.glob("base_s_*.nc"))
+                    globbed += sorted(d.glob("base*_elec*.nc"))
+                    globbed += sorted(d.glob("base*.nc"))
+            existing = globbed
+
+        if not existing:
+            looked = "\n  - " + "\n  - ".join(_base_network_candidates_for_cutout(cutout))
+            raise FileNotFoundError(
+                f"[robust] Nested run produced no base network artefact.\n"
+                f"Looked for candidates:{looked}\n"
+                f"Also tried globbing in:\n"
+                f"  - resources/{subrun}/networks/\n"
+                f"  - results/{subrun}/networks/\n"
+            )
+
+        # Take newest by mtime (defensive)
+        final_base = max(existing, key=lambda p: p.stat().st_mtime)
+
+        # 3) stage it for robust DAG
         Path(os.path.dirname(output.base)).mkdir(parents=True, exist_ok=True)
 
         print("\n[robust] Staging base network for robust DAG:")
-        print("         src :", final_base)
+        print("         src :", str(final_base))
         print("         dst :", output.base)
 
         shutil.copyfile(final_base, output.base)
@@ -259,6 +293,9 @@ rule prepared_network_for_robust:
         shutil.copyfile(input.staged, output.prepared)
 
 
+# -----------------------------------------------------------------------------
+# Optional: a combined target that keeps your "normal" pipeline outputs + robust
+# -----------------------------------------------------------------------------
 rule all_plus_robust:
     input:
         expand(
@@ -272,11 +309,15 @@ rule all_plus_robust:
         OUT_NETWORK,
         OUT_SUMMARY
 
+
 # -----------------------------------------------------------------------------
 # Rule 3: robust solve using prepared scenario networks
 # -----------------------------------------------------------------------------
 rule solve_robust:
     input:
+        # enforce Build/Staging of the base nets per cutout
+        staged_bases=expand("results/robust_scenarios/{cutout}/base.nc", cutout=CUTOUTS),
+        # and then the prepared inputs
         scenario_networks=expand(PREPARED_TEMPLATE, cutout=CUTOUTS),
     output:
         network=OUT_NETWORK,
@@ -286,10 +327,15 @@ rule solve_robust:
         solver_opts=SOLVER_OPTIONS_JSON,
         eps_ls=EPS_LS,
         cutouts=" ".join(CUTOUTS),
-        template=lambda wc: PREPARED_TEMPLATE.replace("{", "{{").replace("}", "}}"),
+        template=lambda wc: PREPARED_TEMPLATE
     shell:
         r"""
         set -euo pipefail
+
+        echo "[robust] Staged base networks:"
+        for f in {input.staged_bases}; do
+          echo "  - $f"
+        done
 
         echo "[robust] Scenario networks:"
         for f in {input.scenario_networks}; do
