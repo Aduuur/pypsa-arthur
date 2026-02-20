@@ -28,7 +28,7 @@ remote:
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#run
 run:
   prefix: ""
-  name: "demand-test-2027"
+  name: "demand-test-2028"
   scenarios:
     enable: false
     file: config/scenarios.yaml
@@ -169,20 +169,20 @@ electricity:
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#atlite
 atlite:
-  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2027
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2028
   nprocesses: 16
   show_progress: false
   cutouts:    
     # use 'base' to determine geographical bounds and time span from config
     # base:
       # module: era5
-    cutout_mCNRM-CERFACS-CM5_rcp45_2027:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2028:
       module: cordex
       x: [ -12., 42. ]
       y: [ 33., 72. ]
       dx: 0.3
       dy: 0.3
-      time: [ '2027', '2027' ]
+      time: [ '2028', '2028' ]
       prepare_kwargs:
         features: [ 'temperature', 'runoff', 'height' ]
 
