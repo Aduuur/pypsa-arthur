@@ -188,7 +188,7 @@ rule build_base_network_per_cutout:
     params:
         cutout=lambda wc: wc.cutout,
         subrun=lambda wc: _subrun_name_for_cutout(PARENT_RUN, wc.cutout),
-        nested_target_rule="prepare_elec_networks",
+        nested_target_rule="prepare_networks",
     threads: 1
     resources:
         mem_mb=2000

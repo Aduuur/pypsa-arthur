@@ -62,6 +62,7 @@ include: "rules/solve_electricity.smk"
 include: "rules/postprocess.smk"
 include: "rules/development.smk"
 include: "rules/solve_robust.smk"
+include: "rules/solve_aro.smk"
 
 
 if config["foresight"] == "overnight":

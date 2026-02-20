@@ -1004,6 +1004,11 @@ def rename_techs(label: str) -> str:
     return label
 
 
+def _as_datetimeindex(t):
+    # handles xarray time (np.datetime64) nicely; cftime would need extra handling
+    return pd.DatetimeIndex(pd.to_datetime(t))
+
+
 def load_cutout(
     cutout_files: Union[str, list[str]], time: Union[None, pd.DatetimeIndex] = None
 ) -> atlite.Cutout:
@@ -1030,34 +1035,88 @@ def load_cutout(
         combined_data = xr.concat(cutout_da, dim="time", data_vars="minimal")
         cutout = atlite.Cutout(NamedTemporaryFile().name, data=combined_data)
 
+    # --- OLD VERSION (kept for reference) ----------------------------------------
+    # if time is not None:
+    #     try:
+    #         # strict: requires exact match of all timestamps
+    #         cutout.data = cutout.data.sel(time=time)
+    #     except KeyError:
+    #         # Fallback: slice + align to requested timestamps
+    #         req = pd.DatetimeIndex(time)
+    #         t0 = req[0].strftime("%Y-%m-%dT%H:%M:%S")
+    #         t1 = req[-1].strftime("%Y-%m-%dT%H:%M:%S")
+    #
+    #         # slice is much more robust (also for CFTimeIndex)
+    #         cutout.data = cutout.data.sel(time=slice(t0, t1))
+    #
+    #         # Reindex onto requested timestamps (nearest within tolerance)
+    #         idx = cutout.data.indexes.get("time", None)
+    #
+    #         # If we have normal DatetimeIndex in the cutout, we can reindex to req directly
+    #         if idx is not None and not isinstance(idx, xr.CFTimeIndex):
+    #             freq = pd.infer_freq(req) or "H"
+    #             step = pd.Timedelta(freq)
+    #             tol = step / 2
+    #             cutout.data = cutout.data.reindex(time=req, method="nearest", tolerance=tol)
+    #         else:
+    #             # CFTimeIndex: build a matching CFTime range for the cutout calendar
+    #             cal = idx.calendar if idx is not None else "standard"
+    #             freq = pd.infer_freq(req) or "H"
+    #             req_cf = xr.cftime_range(start=t0, end=t1, freq=freq, calendar=cal)
+    #             cutout.data = cutout.data.reindex(time=req_cf, method="nearest")
+
+    # --- NEW VERSION --------------------------------------------------------------
     if time is not None:
         try:
             # strict: requires exact match of all timestamps
             cutout.data = cutout.data.sel(time=time)
         except KeyError:
-            # Fallback: slice + align to requested timestamps
+            # Requested timestamps are not present in the cutout (e.g. snapshots=2024, cutout=2026).
+            # We support two robust fallbacks:
+            #   (1) positional mapping (preferred) if lengths match (after optional leapday drop)
+            #   (2) nearest reindex (last resort) if lengths do not match but overlap exists
+
             req = pd.DatetimeIndex(time)
-            t0 = req[0].strftime("%Y-%m-%dT%H:%M:%S")
-            t1 = req[-1].strftime("%Y-%m-%dT%H:%M:%S")
 
-            # slice is much more robust (also for CFTimeIndex)
-            cutout.data = cutout.data.sel(time=slice(t0, t1))
+            # If snapshots include leap day (8784) but cutout is non-leap (8760),
+            # drop Feb 29 from requested timestamps to allow 1:1 positional mapping.
+            cutout_len = int(cutout.data.sizes.get("time", 0))
+            if len(req) == 8784 and cutout_len == 8760:
+                req = req[~((req.month == 2) & (req.day == 29))]
 
-            # Reindex onto requested timestamps (nearest within tolerance)
-            idx = cutout.data.indexes.get("time", None)
-
-            # If we have normal DatetimeIndex in the cutout, we can reindex to req directly
-            if idx is not None and not isinstance(idx, xr.CFTimeIndex):
-                freq = pd.infer_freq(req) or "H"
-                step = pd.Timedelta(freq)
-                tol = step / 2
-                cutout.data = cutout.data.reindex(time=req, method="nearest", tolerance=tol)
+            # --- (1) positional mapping: keep values, overwrite time coordinate ---
+            if cutout_len == len(req):
+                cutout.data = cutout.data.assign_coords(time=req)
             else:
-                # CFTimeIndex: build a matching CFTime range for the cutout calendar
-                cal = idx.calendar if idx is not None else "standard"
-                freq = pd.infer_freq(req) or "H"
-                req_cf = xr.cftime_range(start=t0, end=t1, freq=freq, calendar=cal)
-                cutout.data = cutout.data.reindex(time=req_cf, method="nearest")
+                # --- (2) last resort: nearest reindex onto requested timestamps ---
+                idx = cutout.data.indexes.get("time", None)
+
+                # If index is CFTimeIndex we can't safely reindex to pandas timestamps;
+                # in that case we try to create a CFTime target range for the cutout calendar.
+                if idx is not None and isinstance(idx, xr.CFTimeIndex):
+                    cal = idx.calendar
+
+                    # infer frequency; ensure pandas-friendly (needs a number: "h" -> "1h")
+                    f = pd.infer_freq(req) or "h"
+                    if isinstance(f, str) and f.isalpha():
+                        f = f"1{f}"
+
+                    t0 = req[0].strftime("%Y-%m-%dT%H:%M:%S")
+                    t1 = req[-1].strftime("%Y-%m-%dT%H:%M:%S")
+                    req_cf = xr.cftime_range(start=t0, end=t1, freq=f, calendar=cal)
+
+                    cutout.data = cutout.data.reindex(time=req_cf, method="nearest")
+                else:
+                    # DatetimeIndex (or unknown) -> try nearest with tolerance ~ half step
+                    f = pd.infer_freq(req) or "h"
+                    # pd.Timedelta requires a number: "h" -> "1h", "H" -> "1H"
+                    if isinstance(f, str) and f.isalpha():
+                        f = f"1{f}"
+
+                    step = pd.Timedelta(f)
+                    tol = step / 2
+
+                    cutout.data = cutout.data.reindex(time=req, method="nearest", tolerance=tol)
 
     return cutout
 
