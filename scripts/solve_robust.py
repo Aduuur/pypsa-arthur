@@ -1061,16 +1061,15 @@ def _build_operational_cost_expression(
     _add_mc(n.links, ["Link-p4"], "Link")
 
 
-if co2_cost_mode == "global_constraint_constant_cost":
-    total = total + _build_co2_cost_expression(n, mask)
-elif co2_cost_mode != "off":
-    raise ValueError(
-        f"Unknown co2_cost_mode='{co2_cost_mode}'. "
-        "Use 'off' or 'global_constraint_constant_cost'."
-    )
+    if co2_cost_mode == "global_constraint_constant_cost":
+        total = total + _build_co2_cost_expression(n, mask)
+    elif co2_cost_mode != "off":
+        raise ValueError(
+         f"Unknown co2_cost_mode='{co2_cost_mode}'. "
+         "Use 'off' or 'global_constraint_constant_cost'."
+        )
 
-return total
-
+    return total
 
 def _evaluate_scenario_costs(n: pypsa.Network, masks: Dict[str, np.ndarray], co2_cost_mode: str) -> Dict[str, float]:
     # gemeinsamer Investitionskosten­anteil
