@@ -28,7 +28,7 @@ remote:
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#run
 run:
   prefix: ""
-  name: "demand-test-2028"
+  name: "demand-test-2029"
   scenarios:
     enable: false
     file: config/scenarios.yaml
@@ -68,9 +68,9 @@ scenario:
   clusters:
   - 24
   opts:
-  - 'elec'
+  - ''
   sector_opts:
-  - 'none'
+  - ''
   planning_horizons:
   - 2050
 
@@ -169,20 +169,20 @@ electricity:
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#atlite
 atlite:
-  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2028
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2029
   nprocesses: 16
   show_progress: false
   cutouts:    
     # use 'base' to determine geographical bounds and time span from config
     # base:
       # module: era5
-    cutout_mCNRM-CERFACS-CM5_rcp45_2028:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2029:
       module: cordex
       x: [ -12., 42. ]
       y: [ 33., 72. ]
       dx: 0.3
       dy: 0.3
-      time: [ '2028', '2028' ]
+      time: [ '2029', '2029' ]
       prepare_kwargs:
         features: [ 'temperature', 'runoff', 'height' ]
 
