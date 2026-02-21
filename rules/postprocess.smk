@@ -2,6 +2,8 @@
 #
 # SPDX-License-Identifier: MIT
 
+import matplotlib
+matplotlib.use("Agg")
 
 if config["foresight"] != "perfect":
 
@@ -411,6 +413,7 @@ rule plot_summary:
         RESULTS + "logs/plot_summary.log",
     script:
         "../scripts/plot_summary.py"
+
 
 
 rule plot_balance_timeseries:

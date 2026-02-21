@@ -855,7 +855,7 @@ def _build_co2_cost_expression(
     """
     OPT-IN approximation of CO2 cost via GlobalConstraint with constant_cost.
 
-    Enable only if your networks represent CO2 cost via GlobalConstraint constant_cost
+    Enable only if networks represent CO2 cost via GlobalConstraint constant_cost
     and NOT via marginal_cost (risk of double counting otherwise).
     """
     import xarray as xr
@@ -1177,6 +1177,34 @@ def _extract_scalar_solution(sol: Dict, key: str) -> float:
     except Exception:
         return float(np.asarray(v).item())
 
+def _ensure_standard_pypsa_result_frames(n: pypsa.Network) -> None:
+    """
+    Ensure standard PyPSA result tables exist with expected shape so that
+    PyPSA-Eur postprocess (make_summary) does not crash.
+
+    In particular, buses_t.marginal_price must be a DataFrame with:
+      index   = n.snapshots
+      columns = n.buses.index
+    """
+    # Ensure buses_t exists
+    if not hasattr(n, "buses_t"):
+        return
+
+    try:
+        mp = getattr(n.buses_t, "marginal_price", None)
+    except Exception:
+        mp = None
+
+    # If marginal_price is missing or not a DataFrame, create an empty one
+    if mp is None or not isinstance(mp, pd.DataFrame):
+        mp = pd.DataFrame(index=n.snapshots)
+
+    # Reindex to the canonical shape expected by postprocess
+    mp = mp.reindex(index=n.snapshots, columns=n.buses.index)
+
+    # Assign back
+    n.buses_t.marginal_price = mp
+
 
 # =============================================================================
 # Robust solve (lexicographic)
@@ -1248,6 +1276,7 @@ def solve_robust_lexicographic(
         solver_name=solver_name,
         solver_options=solver_options,
         extra_functionality=extra_stage1,
+        assign_all_duals=True,
     )
 
     _check_solver_status(n, "Stage 1", hard_fail_suboptimal=hard_fail_suboptimal)
@@ -1311,6 +1340,7 @@ def solve_robust_lexicographic(
         solver_name=solver_name,
         solver_options=solver_options,
         extra_functionality=extra_stage2,
+        assign_all_duals=True,
     )
 
     _check_solver_status(n, "Stage 2", hard_fail_suboptimal=hard_fail_suboptimal)
@@ -1397,6 +1427,153 @@ def extract_capacities(n: pypsa.Network) -> Dict[str, Dict[str, float]]:
     }
     return {k: v for k, v in out.items() if v}
 
+def export_network_stacked(n: pypsa.Network, out_network: str) -> None:
+    """
+    Export the stacked robust network (MultiIndex snapshots) as NetCDF.
+    This preserves the 'final robust solution across all scenarios'.
+    """
+
+    # detach solver object if present (avoids pickling/serialization issues)
+    if getattr(n, "model", None) is not None:
+        try:
+            n.model.solver_model = None
+        except Exception:
+            pass
+
+    # Ensure buses_t.marginal_price exists with canonical shape:
+    # index = n.snapshots, columns = n.buses.index
+    if hasattr(n, "buses_t"):
+        try:
+            mp = getattr(n.buses_t, "marginal_price", None)
+        except Exception:
+            mp = None
+
+        if mp is None or not isinstance(mp, pd.DataFrame):
+            mp = pd.DataFrame(index=n.snapshots)
+
+        mp = mp.reindex(index=n.snapshots, columns=n.buses.index)
+        n.buses_t.marginal_price = mp
+
+    Path(out_network).parent.mkdir(parents=True, exist_ok=True)
+    n.export_to_netcdf(out_network)
+
+def export_network_standard_single_scenario(
+    n_stacked: pypsa.Network,
+    *,
+    scenario: str,
+    scenario_network_file: str,
+    out_network: str,
+) -> None:
+    """
+    Export a standard PyPSA network (DatetimeIndex snapshots, standard *_t tables)
+    for ONE scenario from the stacked robust solution.
+
+    This makes PyPSA-Eur postprocess compatible.
+    """
+    if not isinstance(n_stacked.snapshots, pd.MultiIndex):
+        raise ValueError("export_network_standard_single_scenario expects stacked MultiIndex snapshots.")
+
+    # masks + select rows for scenario
+    masks = _scenario_masks_from_snapshots(n_stacked.snapshots)
+    if scenario not in masks:
+        raise KeyError(f"Scenario '{scenario}' not found. Available: {list(masks.keys())}")
+
+    mask = masks[scenario]
+    idx = np.flatnonzero(mask.astype(bool))
+
+    # extract datetime snapshots for this scenario
+    ts = n_stacked.snapshots.get_level_values("timestep")
+    times = [pd.Timestamp(ts[i][1]) for i in idx]
+    times = pd.DatetimeIndex(times, name="snapshot")
+
+    # start from the prepared (standard) network for that scenario
+    n_std = pypsa.Network(str(Path(scenario_network_file)))
+    n_std.set_snapshots(times)
+
+    # ---- transfer optimized capacities (static) ----
+    # For extendable assets, copy *_opt and set nominal to *_opt
+    for comp, opt_col, nom_col, ext_col in [
+        ("generators", "p_nom_opt", "p_nom", "p_nom_extendable"),
+        ("links", "p_nom_opt", "p_nom", "p_nom_extendable"),
+        ("storage_units", "p_nom_opt", "p_nom", "p_nom_extendable"),
+        ("stores", "e_nom_opt", "e_nom", "e_nom_extendable"),
+        ("lines", "s_nom_opt", "s_nom", "s_nom_extendable"),
+        ("transformers", "s_nom_opt", "s_nom", "s_nom_extendable"),
+    ]:
+        df_sol = getattr(n_stacked, comp, None)
+        df_std = getattr(n_std, comp, None)
+        if df_sol is None or df_std is None or len(df_std) == 0:
+            continue
+        if opt_col not in df_sol.columns or ext_col not in df_std.columns:
+            continue
+
+        common = df_std.index.intersection(df_sol.index)
+        if len(common) == 0:
+            continue
+
+        # copy opt column
+        df_std.loc[common, opt_col] = df_sol.loc[common, opt_col]
+
+        # set nominal to opt for extendables
+        ext = df_std[ext_col].fillna(False).astype(bool)
+        ext_common = common.intersection(df_std.index[ext])
+        if len(ext_common) > 0 and nom_col in df_std.columns:
+            df_std.loc[ext_common, nom_col] = df_sol.loc[ext_common, opt_col].fillna(0.0).astype(float)
+
+    # ---- transfer time-dependent results for this scenario ----
+    # copy allowed *_t attrs from stacked to standard network for the selected rows
+    for t_container_name, attrs in _T_ATTRS.items():
+        if not hasattr(n_stacked, t_container_name) or not hasattr(n_std, t_container_name):
+            continue
+
+        src = getattr(n_stacked, t_container_name)
+        dst = getattr(n_std, t_container_name)
+
+        for attr in attrs:
+            df = getattr(src, attr, None)
+            if df is None or not isinstance(df, (pd.DataFrame, pd.Series)) or len(df) == 0:
+                continue
+            if isinstance(df, pd.Series):
+                df = df.to_frame()
+
+            # select scenario rows and reindex to standard timestamps
+            df_s = df.iloc[idx].copy()
+            df_s.index = times
+
+            # reindex columns to current component index if possible (avoid stray cols)
+            # marginal_price -> buses
+            if t_container_name == "buses_t" and attr == "marginal_price":
+                df_s = df_s.reindex(columns=n_std.buses.index)
+            elif t_container_name == "generators_t":
+                df_s = df_s.reindex(columns=n_std.generators.index)
+            elif t_container_name == "links_t":
+                df_s = df_s.reindex(columns=n_std.links.index)
+            elif t_container_name == "storage_units_t":
+                df_s = df_s.reindex(columns=n_std.storage_units.index)
+            elif t_container_name == "stores_t":
+                df_s = df_s.reindex(columns=n_std.stores.index)
+            elif t_container_name == "lines_t":
+                df_s = df_s.reindex(columns=n_std.lines.index)
+            elif t_container_name == "transformers_t":
+                df_s = df_s.reindex(columns=n_std.transformers.index)
+            elif t_container_name == "loads_t":
+                df_s = df_s.reindex(columns=n_std.loads.index)
+
+            setattr(dst, attr, df_s)
+
+    # Hard guarantee for postprocess: marginal_price exists with bus columns
+    try:
+        mp = getattr(n_std.buses_t, "marginal_price", None)
+    except Exception:
+        mp = None
+    if mp is None or not isinstance(mp, pd.DataFrame):
+        mp = pd.DataFrame(index=n_std.snapshots, columns=n_std.buses.index)
+    mp = mp.reindex(index=n_std.snapshots, columns=n_std.buses.index)
+    n_std.buses_t.marginal_price = mp
+
+    Path(out_network).parent.mkdir(parents=True, exist_ok=True)
+    n_std.export_to_netcdf(out_network)
+
 
 def export_network_flat_snapshots(n: pypsa.Network, out_network: str) -> None:
     """
@@ -1449,12 +1626,26 @@ def run_robust(
         warn_unknown_t: bool,
         strict_unknown_t: bool,
 ) -> None:
+    """
+    Run the stacked robust optimisation across ALL cutouts and export:
+
+      1) The FINAL ROBUST solution network across all scenarios (stacked MultiIndex snapshots)
+         -> written to out_network
+
+      2) Additionally (for PyPSA-Eur postprocess compatibility), write a standard single-scenario
+         network next to it:
+            out_network_std = out_network.replace(".nc", "__std.nc")
+         This file is NOT the robust result; it is a postprocess adapter.
+
+    The summary JSON always describes the robust (stacked) solve.
+    """
     scenario_files = _resolve_scenario_networks_from_cutouts(cutouts, scenario_network_template)
 
     logger.info("=== Robust solve configuration ===")
     for c, f in zip(cutouts, scenario_files):
         logger.info("  %-35s -> %s", c, f)
 
+    # Build stacked MultiIndex-snapshot network (scenario, datetime) × (investment period)
     n, scen_names = stack_scenarios_to_multisnapshot_network(
         scenario_files=scenario_files,
         scenario_names=list(cutouts),
@@ -1462,6 +1653,7 @@ def run_robust(
         strict_unknown_t=strict_unknown_t,
     )
 
+    # Solve robust lexicographic problem on the STACKED network
     diag = solve_robust_lexicographic(
         n,
         solver_name=solver_name,
@@ -1474,17 +1666,55 @@ def run_robust(
     )
 
     capacities = extract_capacities(n)
+
     Path(out_network).parent.mkdir(parents=True, exist_ok=True)
     Path(out_summary_json).parent.mkdir(parents=True, exist_ok=True)
 
-    logger.info("Exporting network to %s", out_network)
-    export_network_flat_snapshots(n, out_network)
+    # ------------------------------------------------------------------
+    # (A) Export the FINAL robust solution across ALL scenarios (stacked)
+    # ------------------------------------------------------------------
+    logger.info("Exporting STACKED robust network (all scenarios) to %s", out_network)
 
+    # Make sure stacked network contains standard-shaped result frames (at least marginal_price)
+    _ensure_standard_pypsa_result_frames(n)
+
+    # Export stacked network as-is (NO snapshot flattening)
+    export_network_stacked(n, out_network)
+
+    # ------------------------------------------------------------------
+    # (B) Postprocess adapter: export a STANDARD single-scenario network
+    #     (PyPSA-Eur postprocess expects DatetimeIndex snapshots)
+    # ------------------------------------------------------------------
+    out_network_std = str(Path(out_network).with_suffix("")) + "__std.nc"
+
+    # Strategy: use first scenario as adapter (you can switch to worst_case_scenario if desired)
+    export_scenario = str(list(cutouts)[0])
+    export_file = str(scenario_files[0])
+
+    logger.info(
+        "Exporting STANDARD adapter network for scenario=%s to %s",
+        export_scenario, out_network_std
+    )
+    export_network_standard_single_scenario(
+        n,
+        scenario=export_scenario,
+        scenario_network_file=export_file,
+        out_network=out_network_std,
+    )
+
+    # ------------------------------------------------------------------
+    # Summary JSON (describes the stacked robust solve)
+    # ------------------------------------------------------------------
     payload: Dict[str, Any] = {
         "scenario_names": list(scen_names),
         "scenario_networks": list(map(str, scenario_files)),
         "diagnostics": diag,
         "capacities": capacities,
+        "outputs": {
+            "robust_stacked_network": str(out_network),
+            "postprocess_adapter_network": str(out_network_std),
+            "postprocess_adapter_scenario": export_scenario,
+        },
         "assumptions": {
             "design_target": "single shared-investment 2050 portfolio robust across all cutouts",
             "static_assets_identical": True,

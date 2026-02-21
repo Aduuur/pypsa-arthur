@@ -28,7 +28,7 @@ remote:
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#run
 run:
   prefix: ""
-  name: "compare-robust-mormal"
+  name: "compare-robust-robust"
   scenarios:
     enable: false
     file: config/scenarios.yaml

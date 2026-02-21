@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import re
+import hashlib
 from pathlib import Path
 
 # =============================================================================
@@ -17,9 +19,14 @@ ROB = config.get("robust", {})  # fallback: reuse robust block
 
 CUTOUTS = list(ARO.get("cutouts", ROB.get("cutouts", [])))
 if not CUTOUTS:
-    raise ValueError("ARO requires a non-empty cutout list in config['aro']['cutouts'] or config['robust']['cutouts'].")
+    raise ValueError(
+        "ARO requires a non-empty cutout list in config['aro']['cutouts'] or config['robust']['cutouts']."
+    )
 
-PREPARED_TEMPLATE = ARO.get("prepared_template", ROB.get("prepared_template", "networks/prepared_{cutout}.nc"))
+PREPARED_TEMPLATE = ARO.get(
+    "prepared_template",
+    ROB.get("prepared_template", "networks/prepared_{cutout}.nc"),
+)
 
 # Where ARO writes its final artefacts (inside classic run folder)
 OUT_NETWORK = ARO.get("out_network", RESULTS_DIR + "networks/aro_robust.nc")
@@ -43,6 +50,51 @@ else:
     SOLVER_OPTIONS = SOLVER_BLOCK.get("solver_options", {}) or {}
 SOLVER_OPTIONS_JSON = json.dumps(SOLVER_OPTIONS)
 
+# =============================================================================
+# Scenario singleton contract (bind wildcards to concrete filenames)
+# =============================================================================
+SC = config.get("scenario", {})
+
+
+def _require_singleton(name: str, xs):
+    if not isinstance(xs, list) or len(xs) != 1:
+        raise ValueError(
+            f"ARO workflow requires scenario.{name} to be a singleton list, got: {xs}. "
+            "Reason: aro_postprocess must bind wildcards to concrete filenames."
+        )
+    return xs[0]
+
+
+CLUSTERS = _require_singleton("clusters", SC.get("clusters", []))
+OPTS = _require_singleton("opts", SC.get("opts", []))
+SECTOR_OPTS = _require_singleton("sector_opts", SC.get("sector_opts", []))
+PLANNING_HORIZON = _require_singleton("planning_horizons", SC.get("planning_horizons", []))
+
+
+def _normalise_wildcard_token(x) -> str:
+    """Map config sentinel values to filename tokens."""
+    if x is None:
+        return ""
+    token = str(x).strip()
+    if token.lower() == "none":
+        return ""
+    return token
+
+
+OPTS_TOKEN = _normalise_wildcard_token(OPTS)
+SECTOR_OPTS_TOKEN = _normalise_wildcard_token(SECTOR_OPTS)
+
+# Canonical solved-network filename expected by standard postprocess (NO WILDCARDS!)
+CANONICAL_SOLVED = (
+    RESULTS_DIR
+    + f"networks/base_s_{CLUSTERS}_{OPTS_TOKEN}_{SECTOR_OPTS_TOKEN}_{PLANNING_HORIZON}.nc"
+)
+
+# Canonical metrics filename (NO WILDCARDS!)
+CANONICAL_METRICS = (
+    RESULTS_DIR
+    + f"csvs/individual/metrics_s_{CLUSTERS}_{OPTS_TOKEN}_{SECTOR_OPTS_TOKEN}_{PLANNING_HORIZON}.csv"
+)
 
 # =============================================================================
 # Targets
@@ -109,7 +161,7 @@ rule aro_as_canonical_solved_network:
     input:
         aro=OUT_NETWORK
     output:
-        canonical=RESULTS_DIR + "networks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.nc"
+        canonical=CANONICAL_SOLVED
     shell:
         r"""
         set -euo pipefail
@@ -119,12 +171,12 @@ rule aro_as_canonical_solved_network:
 
 
 # =============================================================================
-# Target: run ARO + classical postprocess outputs
+# Target: run ARO + classical postprocess outputs (NO WILDCARDS!)
 # =============================================================================
 rule aro_postprocess:
     input:
-        RESULTS_DIR + "networks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.nc",
-        RESULTS_DIR + "csvs/individual/metrics_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.csv",
+        CANONICAL_SOLVED,
+        CANONICAL_METRICS,
         RESULTS_DIR + "csvs/costs.csv",
         RESULTS_DIR + "graphs/costs.svg",
         RESULTS_DIR + "graphs/energy.svg",

@@ -21,7 +21,7 @@ plotting:
     x: -5.5
     y: 46.
   costs_max: 1000
-  costs_threshold: 1
+  costs_threshold: 0
   energy_max: 20000
   energy_min: -20000
   energy_threshold: 50.
