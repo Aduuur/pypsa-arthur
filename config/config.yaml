@@ -28,7 +28,7 @@ remote:
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#run
 run:
   prefix: ""
-  name: "demand-test-2029"
+  name: "compare-robust-mormal"
   scenarios:
     enable: false
     file: config/scenarios.yaml
@@ -44,7 +44,7 @@ robust:
   # diskrete Szenarien = manipulierten Cutouts
   cutouts:
     - cutout_mCNRM-CERFACS-CM5_rcp45_2010
-    - cutout_mCNRM-CERFACS-CM5_rcp26_2010
+
 
   base_target: "networks/base.nc"
 
@@ -57,7 +57,10 @@ robust:
 
   # Lexicographic tolerance
   eps_ls: 1e-6
-
+  aro:
+    initial_cutouts:
+      - cutout_mCNRM-CERFACS-CM5_rcp45_2010
+    max_iter: 5
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#foresight
 foresight: myopic
@@ -82,26 +85,26 @@ countries:
 - FR
 - ES
 - IT
-- PL
-- CZ
-- AT
-- CH
-- BE
-- NL
-- DK
-- SE
-- PT
-- 'NO'
-- FI
-- LT
-- LV
-- EE
+#- PL
+#- CZ
+#- AT
+#- CH
+#- BE
+#- NL
+#- DK
+#- SE
+#- PT
+#- 'NO'
+#- FI
+#- LT
+#- LV
+#- EE
 
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#snapshots
 snapshots:
-  start: "2024-01-01"
-  end: "2024-12-31"
+  start: "2010-01-01"
+  end: "2010-01-07"
   inclusive: 'left'
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#enable
@@ -169,20 +172,20 @@ electricity:
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#atlite
 atlite:
-  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2029
+  default_cutout: cutout_mCNRM-CERFACS-CM5_rcp45_2010
   nprocesses: 16
   show_progress: false
   cutouts:    
     # use 'base' to determine geographical bounds and time span from config
     # base:
       # module: era5
-    cutout_mCNRM-CERFACS-CM5_rcp45_2029:
+    cutout_mCNRM-CERFACS-CM5_rcp45_2050:
       module: cordex
       x: [ -12., 42. ]
       y: [ 33., 72. ]
       dx: 0.3
       dy: 0.3
-      time: [ '2029', '2029' ]
+      time: [ '2050', '2050' ]
       prepare_kwargs:
         features: [ 'temperature', 'runoff', 'height' ]
 

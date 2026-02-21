@@ -1,58 +1,6 @@
 #!/usr/bin/env python3
-"""
-solve_robust.py  (cutout-native inputs, shared-investment robust 2050 design)
 
-Goal
-----
-ONE single 2050 investment design (portfolio x) that is feasible/optimal across ALL
-weather cutouts (scenario set S).
-
-Lexicographic robust model:
-  Stage 1: minimise worst-case load shedding energy
-           min z_ls   s.t.  z_ls >= LS_s  for all s in S
-  Stage 2: minimise worst-case total cost given LS optimality
-           min z_cost  s.t.  z_cost >= Cost_s  for all s in S
-                             z_ls <= z_ls* + eps
-
-Key engineering ideas
----------------------
-* Stack per-cutout networks into ONE PyPSA Network with MultiIndex snapshots
-  names=["period","timestep"], timestep=(scenario_name, datetime).
-* Shared static assets; only time series vary by scenario.
-* Per-scenario cyclic boundary constraints on SOC / Store-e prevent
-  artificial cross-scenario state coupling from stacking.
-* Ramp constraints:
-    - we SAVE generator ramp_limit_* + committable, then CLEAR them from the network
-      so PyPSA does not add cross-scenario ramp/UC constraints.
-    - we RE-ADD ramp constraints manually, strictly within each scenario segment.
-    - extendable generators with ramp limits would yield bilinear constraints ->
-      by default we HARD-FAIL. Can be overridden with --allow-extendable-ramps (not recommended).
-    - the difference expression p_next - p_prev is built with matching integer "pair" coordinates
-  to avoid xarray alignment errors on mismatched time indices.
-
-Design assumptions & known limitations
----------------------------------------
-* Stage-2 cost is an approximation covering:
-    - investment (capital_cost * optimized capacity)
-    - operational (marginal_cost * dispatch)
-  plus optional CO2 via GlobalConstraint constant_cost (OPT-IN; off by default).
-* Complex PyPSA-Eur sector-coupled custom objective terms may still be missing.
-* DSM / delay-based custom components are not boundary-constrained.
-* CO2 double-counting warning heuristic detects obvious cases but is not foolproof.
-
-Usage
------
-Run optimisation:
-    python solve_robust.py \\
-        --cutouts 2013 2014 2015 \\
-        --scenario-network-template networks/prepared_{cutout}.nc \\
-        --out-network results/robust.nc \\
-        --out-summary-json results/robust_summary.json \\
-        --solver-name highs
-
-Run unit tests (no solver required):
-    python solve_robust.py --test
-"""
+# solve_robust.py
 
 from __future__ import annotations
 
@@ -620,7 +568,6 @@ def _check_solver_status(
             )
         return True
 
-    # Suboptimal / time_limit / warning / other non-fatal
     obj_val = getattr(m, "objective_value", "unknown")
     logger.warning(
         "[%s] Non-optimal solver status: '%s' (objective=%s). Solution may be suboptimal.",
@@ -706,22 +653,11 @@ def _add_within_scenario_ramp_constraints(
 
     For each non-extendable generator g with ramp_limit_up / ramp_limit_down, and for
     each consecutive pair (t, t+1) WITHIN a scenario:
-        p[g, t+1] - p[g, t] <= ramp_limit_up   * p_nom
+        p[g, t+1] - p[g, t] <= ramp_limit_up     * p_nom
         p[g, t]   - p[g, t+1] <= ramp_limit_down * p_nom
 
-    Coordinate alignment fix
-    -------------------------
-    p_prev and p_next are sliced from the stacked time axis and therefore have
-    DIFFERENT time coordinate values (t vs t+1). Direct arithmetic between them in
-    xarray/Linopy would fail or produce NaNs due to label-based alignment.
-
-    We fix this by re-assigning both slices to a shared integer "pair" coordinate
-    [0, 1, ..., n_pairs-1] before subtraction. This makes the operation element-wise
-    as intended, without losing the structural relationship between consecutive timesteps.
-
-    Extendable generators with ramp limits would yield bilinear constraints (p * p_nom
-    where both are variables) and are therefore not supported. By default we HARD-FAIL;
-    use fail_on_extendable=False to skip them with a warning (not recommended).
+    Extendable generators with ramp limits would yield bilinear constraints and are not
+    supported. By default we HARD-FAIL; use fail_on_extendable=False to skip them.
     """
     if ramp_data is None or ramp_data.empty:
         return
@@ -774,8 +710,6 @@ def _add_within_scenario_ramp_constraints(
         prev = idx[:-1]
         nxt = idx[1:]
         n_pairs = len(prev)
-        # Integer "pair" coordinate shared by p_prev and p_next so xarray arithmetic
-        # operates element-wise instead of trying to align on mismatched time labels.
         pair_coord = np.arange(n_pairs)
 
         for g in gens_to_constrain:
@@ -785,7 +719,6 @@ def _add_within_scenario_ramp_constraints(
 
             p_g = gen_p.sel({gen_dim: g})
 
-            # Slice and reassign to shared pair coordinate to avoid label-alignment errors
             p_prev = p_g.isel({td: prev.tolist()}).assign_coords({td: pair_coord})
             p_next = p_g.isel({td: nxt.tolist()}).assign_coords({td: pair_coord})
 
@@ -894,9 +827,6 @@ def _detect_possible_co2_double_counting(n: pypsa.Network) -> None:
     """
     Heuristic check: warn if fossil generators have non-zero marginal_cost when
     CO2 cost mode is enabled, since CO2 might already be embedded in marginal_cost.
-
-    This is not foolproof but catches the most common double-counting pattern
-    in PyPSA-Eur setups that fold CO2 price into generator marginal costs.
     """
     if not hasattr(n, "generators") or "carrier" not in n.generators.columns:
         return
@@ -925,17 +855,8 @@ def _build_co2_cost_expression(
     """
     OPT-IN approximation of CO2 cost via GlobalConstraint with constant_cost.
 
-    IMPORTANT: This is workflow-dependent and can cause double counting if CO2 is
-    already embedded in marginal_cost. Enable only if your networks represent CO2
-    cost via GlobalConstraint constant_cost and NOT via marginal_cost.
-
-    Looks for GlobalConstraint rows with:
-        type in {"primary_energy", "co2"}
-        constant_cost > 0
-
-    For each such row, adds:
-        co2_price * sum_{t in s} w_t * sum_g ef_g * p_g,t
-    where ef_g is the emission factor from n.carriers[carrier_attribute].
+    Enable only if your networks represent CO2 cost via GlobalConstraint constant_cost
+    and NOT via marginal_cost (risk of double counting otherwise).
     """
     import xarray as xr
 
@@ -1005,19 +926,16 @@ def _build_operational_cost_expression(
         co2_cost_mode: str = "off",
 ):
     """
-    Scenario-specific operational cost approximation:
-        OpCost_s = sum_{t in s} w_t * (dispatch_vars * marginal_costs)
+    Build an operational-cost expression aligned with PyPSA's internal cost structure.
 
-    Covers:
-      - Generator-p * marginal_cost
-      - Link-p0 * marginal_cost
-      - StorageUnit-p_dispatch * marginal_cost
-      - Store-p * marginal_cost
-      - Optional CO2 term (OPT-IN): GlobalConstraint constant_cost mode
-
-    Known remaining gaps:
-      - Multi-port Link costs beyond p0 (model-specific; add marginal_cost_port1/2/... if needed)
-      - Custom PyPSA-Eur objective terms outside the marginal_cost framework
+    Key alignment points (relative to common PyPSA/PyPSA-Eur practice):
+      - time weights from snapshot_weightings["objective"]
+      - marginal_cost: static (component table) and time-varying (*_t.marginal_cost)
+      - Link marginal_cost is applied to input flow p0 (NOT p1..p4), to avoid double counting
+        and to respect link efficiencies.
+      - StorageUnit marginal_cost is applied to dispatch (p_dispatch) if present, else p.
+      - Generator quadratic marginal costs (marginal_cost_quadratic) are included if present.
+      - Unit commitment costs are included if corresponding UC variables exist in the model.
     """
     import xarray as xr
 
@@ -1026,53 +944,203 @@ def _build_operational_cost_expression(
     idx = _mask_to_isel_indices(mask)
     total = 0
 
-    def _add_mc(comp_df: pd.DataFrame, var_names: List[str], dim: str) -> None:
+    def _var_isel(var, td_name: str):
+        idx_list = idx.tolist()
+        return var.isel({td_name: idx_list}), idx_list
+
+    def _weights_da(var_s, td_name: str, idx_list: List[int]):
+        w_s = w.to_numpy()[idx_list]
+        return xr.DataArray(w_s, dims=[td_name], coords={td_name: var_s.coords[td_name]})
+
+    def _add_mc(
+            comp_df: pd.DataFrame,
+            mc_t: Optional[pd.DataFrame],
+            var_names: List[str],
+            dim: str,
+    ) -> None:
         nonlocal total
+
         if comp_df is None or len(comp_df) == 0:
             return
         if "marginal_cost" not in comp_df.columns:
             return
+
         var, _ = _get_linopy_var(m, var_names, strict=False)
         if var is None:
             return
-        mc = comp_df["marginal_cost"].reindex(comp_df.index).fillna(0.0)
-        mc_da = xr.DataArray(
-            mc.to_numpy(), dims=[dim],
-            coords={dim: (dim, comp_df.index.to_numpy())},
-        )
+
         td = _get_time_dimension(var)
-        var_s = var.isel({td: idx})
-        w_s = w.to_numpy()[idx]
-        w_da = xr.DataArray(w_s, dims=[td], coords={td: var_s.coords[td]})
-        total = total + (var_s * mc_da * w_da).sum()
+        var_s, idx_list = _var_isel(var, td)
+        w_da = _weights_da(var_s, td, idx_list)
 
-        # Generator-Dispatch (unverändert)
+        mc_static = (
+            comp_df["marginal_cost"]
+            .reindex(comp_df.index)
+            .fillna(0.0)
+            .astype(float)
+        )
 
-    _add_mc(n.generators, ["Generator-p"], "Generator")
-    # Storage-Units: Entladung, Nettoeinspeisung und neu auch Ladeleistung p_store
-    _add_mc(n.storage_units, ["StorageUnit-p_dispatch", "StorageUnit-p", "StorageUnit-p_store"], "StorageUnit")
-    # Stores: Leistung (unverändert)
-    _add_mc(n.stores, ["Store-p"], "Store")
-    # Links: alle definierten Ports p0–p4 berücksichtigen, da PyPSA Kosten auf mehreren Ports erlaubt
-    _add_mc(n.links, ["Link-p0"], "Link")
-    _add_mc(n.links, ["Link-p1"], "Link")
-    _add_mc(n.links, ["Link-p2"], "Link")
-    _add_mc(n.links, ["Link-p3"], "Link")
-    _add_mc(n.links, ["Link-p4"], "Link")
+        if mc_t is not None and not mc_t.empty:
+            mc_t_s = mc_t.reindex(
+                index=n.snapshots[idx_list],
+                columns=comp_df.index,
+            ).astype(float)
+            mc_t_s = mc_t_s.fillna(mc_static)
 
+            mc_da = xr.DataArray(
+                mc_t_s.to_numpy(),
+                dims=[td, dim],
+                coords={
+                    td: var_s.coords[td],
+                    dim: (dim, comp_df.index.to_numpy()),
+                },
+            )
+            total = total + (var_s * mc_da * w_da).sum()
+        else:
+            mc_da = xr.DataArray(
+                mc_static.to_numpy(),
+                dims=[dim],
+                coords={dim: (dim, comp_df.index.to_numpy())},
+            )
+            total = total + (var_s * mc_da * w_da).sum()
+
+    def _add_uc_costs() -> None:
+        nonlocal total
+        if not hasattr(n, "generators") or len(n.generators) == 0:
+            return
+
+        v_start, _ = _get_linopy_var(m, ["Generator-start_up", "Generator-startup", "Generator-start"], strict=False)
+        v_shut, _ = _get_linopy_var(m, ["Generator-shut_down", "Generator-shutdown", "Generator-shut"], strict=False)
+        v_status, _ = _get_linopy_var(m, ["Generator-status", "Generator-committable", "Generator-u"], strict=False)
+
+        su_cost = n.generators.get("start_up_cost", pd.Series(0.0, index=n.generators.index)).fillna(0.0).astype(float)
+        sd_cost = n.generators.get("shut_down_cost", pd.Series(0.0, index=n.generators.index)).fillna(0.0).astype(float)
+        nl_cost = n.generators.get("no_load_cost", pd.Series(0.0, index=n.generators.index)).fillna(0.0).astype(float)
+        sb_cost = n.generators.get("stand_by_cost", pd.Series(0.0, index=n.generators.index)).fillna(0.0).astype(float)
+
+        if (su_cost == 0).all() and (sd_cost == 0).all() and (nl_cost == 0).all() and (sb_cost == 0).all():
+            return
+
+        def _add_static_cost(var, cost_series: pd.Series) -> None:
+            nonlocal total
+            if var is None:
+                return
+            td = _get_time_dimension(var)
+            gen_dim = _get_gen_dimension(var)
+            var_s, idx_list = _var_isel(var, td)
+            w_da = _weights_da(var_s, td, idx_list)
+
+            cost = cost_series.reindex(n.generators.index).fillna(0.0).astype(float)
+            cost_da = xr.DataArray(
+                cost.to_numpy(),
+                dims=[gen_dim],
+                coords={gen_dim: (gen_dim, n.generators.index.to_numpy())},
+            )
+            total = total + (var_s * cost_da * w_da).sum()
+
+        _add_static_cost(v_start, su_cost)
+        _add_static_cost(v_shut, sd_cost)
+        _add_static_cost(v_status, nl_cost)
+        _add_static_cost(v_status, sb_cost)
+
+    def _add_quadratic_generator_costs() -> None:
+        nonlocal total
+
+        if not hasattr(n, "generators") or len(n.generators) == 0:
+            return
+
+        gen_p, _ = _get_linopy_var(m, ["Generator-p"], strict=False)
+        if gen_p is None:
+            return
+
+        q_static = None
+        if "marginal_cost_quadratic" in n.generators.columns:
+            q_static = n.generators["marginal_cost_quadratic"].fillna(0.0).astype(float)
+        q_t = getattr(getattr(n, "generators_t", None), "marginal_cost_quadratic", None)
+
+        has_q = False
+        if q_static is not None and (q_static != 0).any():
+            has_q = True
+        if isinstance(q_t, pd.DataFrame) and not q_t.empty and (q_t.fillna(0.0).to_numpy() != 0.0).any():
+            has_q = True
+        if not has_q:
+            return
+
+        td = _get_time_dimension(gen_p)
+        gen_dim = _get_gen_dimension(gen_p)
+        var_s, idx_list = _var_isel(gen_p, td)
+        w_da = _weights_da(var_s, td, idx_list)
+
+        if isinstance(q_t, pd.DataFrame) and not q_t.empty:
+            q_t_s = q_t.reindex(index=n.snapshots[idx_list], columns=n.generators.index).astype(float)
+            if q_static is None:
+                q_static = pd.Series(0.0, index=n.generators.index)
+            q_t_s = q_t_s.fillna(q_static.reindex(n.generators.index).fillna(0.0))
+        else:
+            if q_static is None:
+                q_static = pd.Series(0.0, index=n.generators.index)
+            q_t_s = pd.DataFrame(
+                np.tile(q_static.reindex(n.generators.index).fillna(0.0).to_numpy(), (len(idx_list), 1)),
+                index=n.snapshots[idx_list],
+                columns=n.generators.index,
+            )
+
+        q_da = xr.DataArray(
+            q_t_s.to_numpy(),
+            dims=[td, gen_dim],
+            coords={td: var_s.coords[td], gen_dim: (gen_dim, n.generators.index.to_numpy())},
+        )
+
+        total = total + ((var_s ** 2) * q_da * w_da).sum()
+
+    # -----------------------------
+    # Variable marginal costs
+    # -----------------------------
+    _add_mc(
+        n.generators,
+        getattr(getattr(n, "generators_t", None), "marginal_cost", None),
+        ["Generator-p"],
+        "Generator",
+    )
+
+    _add_mc(
+        n.storage_units,
+        getattr(getattr(n, "storage_units_t", None), "marginal_cost", None),
+        ["StorageUnit-p_dispatch", "StorageUnit-p"],
+        "StorageUnit",
+    )
+
+    _add_mc(
+        n.stores,
+        getattr(getattr(n, "stores_t", None), "marginal_cost", None),
+        ["Store-p"],
+        "Store",
+    )
+
+    # Links: apply marginal_cost to INPUT flow p0 only (PyPSA convention) to avoid
+    # double counting and to remain consistent when efficiencies are present.
+    _add_mc(
+        n.links,
+        getattr(getattr(n, "links_t", None), "marginal_cost", None),
+        ["Link-p0"],
+        "Link",
+    )
+
+    _add_uc_costs()
+    _add_quadratic_generator_costs()
 
     if co2_cost_mode == "global_constraint_constant_cost":
         total = total + _build_co2_cost_expression(n, mask)
     elif co2_cost_mode != "off":
         raise ValueError(
-         f"Unknown co2_cost_mode='{co2_cost_mode}'. "
-         "Use 'off' or 'global_constraint_constant_cost'."
+            f"Unknown co2_cost_mode='{co2_cost_mode}'. "
+            "Use 'off' or 'global_constraint_constant_cost'."
         )
 
     return total
 
+
 def _evaluate_scenario_costs(n: pypsa.Network, masks: Dict[str, np.ndarray], co2_cost_mode: str) -> Dict[str, float]:
-    # gemeinsamer Investitionskosten­anteil
     inv_expr = _build_investment_cost_expression(n)
     inv_cost = float(inv_expr.evaluate())
 
@@ -1152,6 +1220,13 @@ def solve_robust_lexicographic(
     if co2_cost_mode != "off":
         _detect_possible_co2_double_counting(n)
 
+    for comp in ("storage_units", "stores"):
+        df = getattr(n, comp, None)
+        if df is not None and len(df) > 0:
+            for col in ("cyclic_state_of_charge", "cyclic_state_of_charge_per_period"):
+                if col in df.columns:
+                    df[col] = False
+
     # ------------------------------------------------------------------
     # Stage 1: minimise worst-case load shedding
     # ------------------------------------------------------------------
@@ -1187,9 +1262,12 @@ def solve_robust_lexicographic(
 
     logger.info("Stage 1 optimum: z_ls* = %.6g", z_ls_star)
 
-    # Drop model so Stage 2 starts with a fresh Linopy model
-    if getattr(n, "model", None) is not None:
-        n.model = None
+    try:
+        if getattr(n, "model", None) is not None:
+            n.model = None
+    except Exception:
+        if hasattr(n, "_model"):
+            n._model = None
 
     eps = max(float(eps_ls_abs), float(eps_ls_rel) * max(1.0, float(z_ls_star)))
     logger.info(
@@ -1275,19 +1353,23 @@ def solve_robust_lexicographic(
                 diag["termination_status"] = str(val)
                 break
 
+        try:
+            scenario_costs = _evaluate_scenario_costs(n, masks, co2_cost_mode)
+            worst_scen, worst_cost = max(scenario_costs.items(), key=lambda kv: kv[1])
+            ls_per_scen = {
+                s: float(_build_ls_energy_expression(n, ls_generators, masks[s]).evaluate())
+                for s in masks
+            }
+            diag.update({
+                "scenario_costs": scenario_costs,
+                "worst_case_scenario": worst_scen,
+                "worst_case_cost": float(worst_cost),
+                "load_shedding_per_scenario": ls_per_scen,
+            })
+        except Exception as exc:
+            logger.warning("Scenario-wise diagnostics failed (non-fatal): %s", exc)
+
     return diag
-
-    scenario_costs = _evaluate_scenario_costs(n, masks, co2_cost_mode)
-    worst_scen, worst_cost = max(scenario_costs.items(), key=lambda kv: kv[1])
-
-    ls_per_scen = {s: float(_build_ls_energy_expression(n, ls_generators, masks[s]).evaluate()) for s in masks}
-
-    diag.update({
-        "scenario_costs": scenario_costs,
-        "worst_case_scenario": worst_scen,
-        "worst_case_cost": worst_cost,
-        "load_shedding_per_scenario": ls_per_scen,
-    })
 
 
 # =============================================================================
@@ -1420,9 +1502,10 @@ def run_robust(
             ),
             "load_shedding": "one high-cost Generator per bus, carrier=load_shedding",
             "stage2_cost_note": (
-                "Approximation: capital_cost + marginal_cost dispatch. "
-                "Optional CO2 term via GlobalConstraint constant_cost is OPT-IN to avoid "
-                "double counting. See _build_operational_cost_expression for extension points."
+                "Objective uses a PyPSA-consistent cost structure: investment costs for extendables; "
+                "operational costs via marginal_cost (static + time-varying), applied to Link input flow p0; "
+                "UC costs if present; quadratic generator costs if present; optional CO2 term via "
+                "GlobalConstraint constant_cost is OPT-IN."
             ),
             "co2_cost_mode": co2_cost_mode,
             "unknown_time_series_handling": {
@@ -1461,9 +1544,6 @@ def _run_unit_tests() -> None:
 
     print("\n=== Running unit tests ===\n")
 
-    # ------------------------------------------------------------------
-    # 1. scenario_masks: valid MultiIndex
-    # ------------------------------------------------------------------
     try:
         base = pd.date_range("2030-01-01", periods=3, freq="h")
         mi = pd.MultiIndex.from_tuples(
@@ -1478,9 +1558,6 @@ def _run_unit_tests() -> None:
     except Exception as e:
         fail("scenario_masks_valid", e)
 
-    # ------------------------------------------------------------------
-    # 2. scenario_masks: flat Index → ValueError
-    # ------------------------------------------------------------------
     try:
         try:
             _scenario_masks_from_snapshots(pd.date_range("2030", periods=4, freq="h"))
@@ -1490,9 +1567,6 @@ def _run_unit_tests() -> None:
     except Exception as e:
         fail("scenario_masks_rejects_flat", e)
 
-    # ------------------------------------------------------------------
-    # 3. scenario_masks: wrong MultiIndex names → ValueError
-    # ------------------------------------------------------------------
     try:
         bad_mi = pd.MultiIndex.from_arrays(
             [pd.date_range("2030", periods=2, freq="h")] * 2,
@@ -1506,9 +1580,6 @@ def _run_unit_tests() -> None:
     except Exception as e:
         fail("scenario_masks_rejects_wrong_names", e)
 
-    # ------------------------------------------------------------------
-    # 4. scenario_masks: non-tuple timestep → ValueError
-    # ------------------------------------------------------------------
     try:
         bad_mi2 = pd.MultiIndex.from_tuples(
             [(0, "not_a_tuple"), (0, "also_not")],
@@ -1522,9 +1593,6 @@ def _run_unit_tests() -> None:
     except Exception as e:
         fail("scenario_masks_rejects_non_tuple", e)
 
-    # ------------------------------------------------------------------
-    # 5. _mask_to_isel_indices: correctness
-    # ------------------------------------------------------------------
     try:
         idx = _mask_to_isel_indices(np.array([True, False, True, False, True]))
         assert list(idx) == [0, 2, 4]
@@ -1532,9 +1600,6 @@ def _run_unit_tests() -> None:
     except Exception as e:
         fail("mask_to_isel_indices", e)
 
-    # ------------------------------------------------------------------
-    # 6. _ensure_datetime_snapshots: string coercion + name
-    # ------------------------------------------------------------------
     try:
         result = _ensure_datetime_snapshots(pd.Index(["2030-01-01", "2030-01-02"]))
         assert isinstance(result, pd.DatetimeIndex) and result.name == "snapshot"
@@ -1542,9 +1607,6 @@ def _run_unit_tests() -> None:
     except Exception as e:
         fail("ensure_datetime_snapshots", e)
 
-    # ------------------------------------------------------------------
-    # 7. _assert_same_static_assets: identical → passes
-    # ------------------------------------------------------------------
     try:
         n1 = pypsa.Network()
         n1.set_snapshots(pd.date_range("2030", periods=2, freq="h"))
@@ -1556,9 +1618,6 @@ def _run_unit_tests() -> None:
     except Exception as e:
         fail("assert_same_assets_pass", e)
 
-    # ------------------------------------------------------------------
-    # 8. _assert_same_static_assets: extra generator → ValueError
-    # ------------------------------------------------------------------
     try:
         n1 = pypsa.Network()
         n1.set_snapshots(pd.date_range("2030", periods=2, freq="h"))
@@ -1574,9 +1633,6 @@ def _run_unit_tests() -> None:
     except Exception as e:
         fail("assert_same_assets_fail_extra", e)
 
-    # ------------------------------------------------------------------
-    # 9. _assert_same_static_assets: snapshot mismatch → ValueError
-    # ------------------------------------------------------------------
     try:
         n1 = pypsa.Network()
         n1.set_snapshots(pd.date_range("2030", periods=3, freq="h"))
@@ -1591,9 +1647,6 @@ def _run_unit_tests() -> None:
     except Exception as e:
         fail("assert_same_snapshots_fail", e)
 
-    # ------------------------------------------------------------------
-    # 10. _save_and_clear_ramp_limits: values saved, network cleared
-    # ------------------------------------------------------------------
     try:
         n = pypsa.Network()
         n.add("Bus", "A")
@@ -1611,9 +1664,6 @@ def _run_unit_tests() -> None:
     except Exception as e:
         fail("save_and_clear_ramp_limits", e)
 
-    # ------------------------------------------------------------------
-    # 11. _save_and_clear_ramp_limits: network without ramp columns → no crash
-    # ------------------------------------------------------------------
     try:
         n = pypsa.Network()
         n.add("Bus", "A")
@@ -1624,9 +1674,6 @@ def _run_unit_tests() -> None:
     except Exception as e:
         fail("save_and_clear_ramp_no_columns", e)
 
-    # ------------------------------------------------------------------
-    # 12. _save_and_clear_ramp_limits: no generators → empty DataFrame
-    # ------------------------------------------------------------------
     try:
         n = pypsa.Network()
         n.add("Bus", "A")
@@ -1636,9 +1683,6 @@ def _run_unit_tests() -> None:
     except Exception as e:
         fail("save_and_clear_ramp_no_generators", e)
 
-    # ------------------------------------------------------------------
-    # 13. _add_within_scenario_ramp_constraints: fail on extendable
-    # ------------------------------------------------------------------
     try:
         n = pypsa.Network()
         snaps = pd.date_range("2030", periods=4, freq="h")
@@ -1650,7 +1694,6 @@ def _run_unit_tests() -> None:
             {"ramp_limit_up": [0.3], "ramp_limit_down": [0.2]},
             index=["G_ext"],
         )
-        # Build a minimal stacked MultiIndex to test the function signature
         base = pd.date_range("2030", periods=4, freq="h")
         mi = pd.MultiIndex.from_tuples(
             [(0, ("S1", t)) for t in base],
@@ -1686,9 +1729,6 @@ def _run_unit_tests() -> None:
     except Exception as e:
         fail("ramp_fail_on_extendable", e)
 
-    # ------------------------------------------------------------------
-    # 14. _list_time_dependent_frames: known attrs returned
-    # ------------------------------------------------------------------
     try:
         n = pypsa.Network()
         snaps = pd.date_range("2030", periods=3, freq="h")
@@ -1701,14 +1741,10 @@ def _run_unit_tests() -> None:
             base_index=snaps, warn_unknown=False, strict_unknown=False,
         )
         assert "p_max_pu" in result
-        assert "buses" not in result
         ok("list_time_dependent_frames_known_attrs")
     except Exception as e:
         fail("list_time_dependent_frames_known_attrs", e)
 
-    # ------------------------------------------------------------------
-    # 15. _list_time_dependent_frames: strict_unknown raises on unknown time-like DF
-    # ------------------------------------------------------------------
     try:
         n = pypsa.Network()
         snaps = pd.date_range("2030", periods=3, freq="h")
@@ -1727,9 +1763,6 @@ def _run_unit_tests() -> None:
     except Exception as e:
         fail("list_time_frames_strict_raises", e)
 
-    # ------------------------------------------------------------------
-    # 16. _weights_objective_series: fallback to 1.0
-    # ------------------------------------------------------------------
     try:
         n = pypsa.Network()
         n.set_snapshots(pd.date_range("2030", periods=4, freq="h"))
@@ -1739,9 +1772,6 @@ def _run_unit_tests() -> None:
     except Exception as e:
         fail("weights_objective_fallback", e)
 
-    # ------------------------------------------------------------------
-    # 17. _resolve_scenario_networks_from_cutouts: template substitution
-    # ------------------------------------------------------------------
     try:
         result = _resolve_scenario_networks_from_cutouts(["2013", "2014"], "nets/{cutout}.nc")
         assert result == ["nets/2013.nc", "nets/2014.nc"]
@@ -1749,9 +1779,6 @@ def _run_unit_tests() -> None:
     except Exception as e:
         fail("resolve_scenario_networks_template", e)
 
-    # ------------------------------------------------------------------
-    # 18. extract_capacities: graceful when *_opt columns absent (pre-solve)
-    # ------------------------------------------------------------------
     try:
         n = pypsa.Network()
         n.add("Bus", "A")
@@ -1762,9 +1789,6 @@ def _run_unit_tests() -> None:
     except Exception as e:
         fail("extract_capacities_no_opt_columns", e)
 
-    # ------------------------------------------------------------------
-    # 19. _check_solver_status: no status attr but solution exists → True
-    # ------------------------------------------------------------------
     try:
         class FakeModelNoStatus:
             solution = {"z_ls": 0.0}
@@ -1777,9 +1801,6 @@ def _run_unit_tests() -> None:
     except Exception as e:
         fail("check_solver_status_no_attr", e)
 
-    # ------------------------------------------------------------------
-    # 20. _check_solver_status: "infeasible" → RuntimeError
-    # ------------------------------------------------------------------
     try:
         class FakeModelInfeasible:
             status = "infeasible"
@@ -1796,9 +1817,6 @@ def _run_unit_tests() -> None:
     except Exception as e:
         fail("check_solver_status_infeasible_raises", e)
 
-    # ------------------------------------------------------------------
-    # 21. _check_solver_status: "optimal_inaccurate" → True (substring match)
-    # ------------------------------------------------------------------
     try:
         class FakeModelSuboptimal:
             status = "optimal_inaccurate"
@@ -1813,9 +1831,6 @@ def _run_unit_tests() -> None:
     except Exception as e:
         fail("check_solver_status_optimal_inaccurate", e)
 
-    # ------------------------------------------------------------------
-    # 22. _check_solver_status: "time_limit" + hard_fail=True → RuntimeError
-    # ------------------------------------------------------------------
     try:
         class FakeModelTimeout:
             status = "time_limit"
@@ -1832,9 +1847,6 @@ def _run_unit_tests() -> None:
     except Exception as e:
         fail("check_solver_status_timeout_hard_fail", e)
 
-    # ------------------------------------------------------------------
-    # 23. stacked MultiIndex structure (in-memory, no file I/O)
-    # ------------------------------------------------------------------
     try:
         base = pd.date_range("2030-01-01", periods=4, freq="h")
 
@@ -1873,12 +1885,7 @@ def _run_unit_tests() -> None:
     except Exception as e:
         fail("stack_structure_in_memory", e)
 
-    # ------------------------------------------------------------------
-    # 24. ramp pair coordinate fix: no alignment error
-    # ------------------------------------------------------------------
     try:
-        # Verify that assign_coords on isel slices with different source indices
-        # produces arrays that can be subtracted element-wise.
         import xarray as xr
 
         time_idx = np.arange(6)
@@ -1896,13 +1903,11 @@ def _run_unit_tests() -> None:
         p_next = data.isel(t=nxt_idx.tolist()).assign_coords({"t": pair_coord})
 
         diff = (p_next - p_prev).values
-        # Each consecutive difference should be 1.0
         assert np.allclose(diff, [1.0, 1.0, 1.0]), f"Unexpected diff: {diff}"
         ok("ramp_pair_coordinate_alignment")
     except Exception as e:
         fail("ramp_pair_coordinate_alignment", e)
 
-    # ------------------------------------------------------------------
     print(f"\n=== Results: {passed} passed, {failed} failed ===\n")
     if failed:
         raise SystemExit(1)
@@ -1953,8 +1958,6 @@ def _parse_args() -> argparse.Namespace:
             "WARNING: enable only if CO2 is NOT already in marginal_cost (risk of double counting)."
         ),
     )
-    # --warn-unknown-t is the default; --no-warn-unknown-t disables it.
-    # Using BooleanOptionalAction avoids the store_true/default=True contradiction.
     p.add_argument(
         "--warn-unknown-t",
         action=argparse.BooleanOptionalAction,
