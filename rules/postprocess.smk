@@ -5,6 +5,29 @@
 import matplotlib
 matplotlib.use("Agg")
 
+from pathlib import Path
+
+# -----------------------------------------------------------------------------
+# Helper: choose the "best" solved network for postprocessing
+# -----------------------------------------------------------------------------
+def _select_postprocess_network(w):
+    """
+    Prefer ARO standard-dispatch network if present:
+      results/<RDIR>/networks/aro_robust__std.nc
+
+    Fallback:
+      results/<RDIR>/networks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.nc
+    """
+    aro_std = Path(RESULTS + "networks/aro_robust__std.nc")
+    if aro_std.exists():
+        return str(aro_std)
+
+    return (
+        RESULTS
+        + f"networks/base_s_{w.clusters}_{w.opts}_{w.sector_opts}_{w.planning_horizons}.nc"
+    )
+
+
 if config["foresight"] != "perfect":
 
     rule plot_base_network:
@@ -44,8 +67,8 @@ if config["foresight"] != "perfect":
             plotting=config_provider("plotting"),
             transmission_limit=config_provider("electricity", "transmission_limit"),
         input:
-            network=RESULTS
-            + "networks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.nc",
+            # Optional: also prefer ARO std network if present
+            network=lambda w: _select_postprocess_network(w),
             regions=resources("regions_onshore_base_s_{clusters}.geojson"),
         output:
             map=RESULTS
@@ -69,8 +92,8 @@ if config["foresight"] != "perfect":
             plotting=config_provider("plotting"),
             foresight=config_provider("foresight"),
         input:
-            network=RESULTS
-            + "networks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.nc",
+            # Optional: also prefer ARO std network if present
+            network=lambda w: _select_postprocess_network(w),
             regions=resources("regions_onshore_base_s_{clusters}.geojson"),
         output:
             map=RESULTS
@@ -93,8 +116,8 @@ if config["foresight"] != "perfect":
         params:
             plotting=config_provider("plotting"),
         input:
-            network=RESULTS
-            + "networks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.nc",
+            # Optional: also prefer ARO std network if present
+            network=lambda w: _select_postprocess_network(w),
             regions=resources("regions_onshore_base_s_{clusters}.geojson"),
         output:
             map=RESULTS
@@ -117,8 +140,8 @@ if config["foresight"] != "perfect":
         params:
             plotting=config_provider("plotting"),
         input:
-            network=RESULTS
-            + "networks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.nc",
+            # Optional: also prefer ARO std network if present
+            network=lambda w: _select_postprocess_network(w),
             regions=resources("regions_onshore_base_s_{clusters}.geojson"),
         output:
             RESULTS
@@ -207,8 +230,8 @@ if config["foresight"] == "perfect":
 
 rule make_summary:
     input:
-        network=RESULTS
-        + "networks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.nc",
+        # KEY CHANGE: prefer ARO std dispatch network if present
+        network=lambda w: _select_postprocess_network(w),
     output:
         nodal_costs=RESULTS
         + "csvs/individual/nodal_costs_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.csv",
@@ -415,15 +438,14 @@ rule plot_summary:
         "../scripts/plot_summary.py"
 
 
-
 rule plot_balance_timeseries:
     params:
         plotting=config_provider("plotting"),
         snapshots=config_provider("snapshots"),
         drop_leap_day=config_provider("enable", "drop_leap_day"),
     input:
-        network=RESULTS
-        + "networks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.nc",
+        # Optional: prefer ARO std dispatch network if present
+        network=lambda w: _select_postprocess_network(w),
         rc="matplotlibrc",
     threads: 16
     resources:
@@ -449,8 +471,8 @@ rule plot_heatmap_timeseries:
         snapshots=config_provider("snapshots"),
         drop_leap_day=config_provider("enable", "drop_leap_day"),
     input:
-        network=RESULTS
-        + "networks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.nc",
+        # Optional: prefer ARO std dispatch network if present
+        network=lambda w: _select_postprocess_network(w),
         rc="matplotlibrc",
     threads: 16
     resources:
@@ -547,8 +569,8 @@ rule plot_interactive_bus_balance:
             "plotting", "interactive_bus_balance", "bus_name_pattern"
         ),
     input:
-        network=RESULTS
-        + "networks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.nc",
+        # Optional: prefer ARO std dispatch network if present
+        network=lambda w: _select_postprocess_network(w),
         rc="matplotlibrc",
     output:
         directory=directory(

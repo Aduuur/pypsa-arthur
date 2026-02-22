@@ -1454,6 +1454,11 @@ def export_network_stacked(n: pypsa.Network, out_network: str) -> None:
         mp = mp.reindex(index=n.snapshots, columns=n.buses.index)
         n.buses_t.marginal_price = mp
 
+
+    if isinstance(n.snapshots, pd.MultiIndex):
+        export_network_flat_snapshots(n, out_network)
+        return
+    #andernfalls wie bisher exportieren
     Path(out_network).parent.mkdir(parents=True, exist_ok=True)
     n.export_to_netcdf(out_network)
 

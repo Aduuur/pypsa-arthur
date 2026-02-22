@@ -30,6 +30,8 @@ PREPARED_TEMPLATE = ARO.get(
 
 # Where ARO writes its final artefacts (inside classic run folder)
 OUT_NETWORK = ARO.get("out_network", RESULTS_DIR + "networks/aro_robust.nc")
+OUT_NETWORK_STD = OUT_NETWORK.replace(".nc", "__std.nc")
+
 OUT_SUMMARY = ARO.get("out_summary", RESULTS_DIR + "results/aro_summary.json")
 
 # ARO loop controls
@@ -122,6 +124,7 @@ rule solve_aro:
     output:
         network=OUT_NETWORK,
         summary=OUT_SUMMARY,
+        std_network=OUT_NETWORK_STD,
     params:
         # IMPORTANT: params must be fully determined without wildcards -> use lambdas
         cutouts=lambda wc: " ".join(CUTOUTS),
@@ -159,13 +162,16 @@ rule aro_as_canonical_solved_network:
     the standard PyPSA-Eur postprocessing rules are triggered unchanged.
     """
     input:
-        aro=OUT_NETWORK
+        aro=OUT_NETWORK_STD
     output:
         canonical=CANONICAL_SOLVED
     shell:
         r"""
         set -euo pipefail
+        # Ensure the output directory exists
         mkdir -p "$(dirname {output.canonical})"
+        # Link the single-scenario adapter network (OUT_NETWORK_STD) to the
+        # canonical solved network path expected by the postprocessing rules.
         ln -sf "$(realpath {input.aro})" "{output.canonical}"
         """
 

@@ -117,13 +117,22 @@ def _base_network_candidates_for_cutout(cutout: str) -> list[str]:
     ph = str(PLANNING_HORIZON).strip()
 
     cands: list[str] = []
+
+    # --- Prefer sector-coupled network artefacts (as expected by rules/collect.smk) ---
+    # IMPORTANT: the sector network filename ALWAYS contains the sector_opts placeholder,
+    # even if sector_opts is an empty token. Therefore we MUST include it unconditionally.
+    cands.append(f"resources/{subrun}/networks/base_s_{CLUSTERS}_{opts_tok}_{sect_tok}_{ph}.nc")
+    cands.append(f"results/{subrun}/networks/base_s_{CLUSTERS}_{opts_tok}_{sect_tok}_{ph}.nc")
+
+    # Optional fallback for variants that might omit sector token in the filename (older branches)
+    cands.append(f"resources/{subrun}/networks/base_s_{CLUSTERS}_{opts_tok}_{ph}.nc")
+    cands.append(f"results/{subrun}/networks/base_s_{CLUSTERS}_{opts_tok}_{ph}.nc")
+
+    # --- Last resort: electricity-only naming ---
     cands.append(f"resources/{subrun}/networks/base_s_{CLUSTERS}_elec.nc")
     cands.append(f"resources/{subrun}/networks/base_s_{CLUSTERS}_elec_{opts_tok}.nc")
     if sect_tok:
         cands.append(f"resources/{subrun}/networks/base_s_{CLUSTERS}_elec_{opts_tok}_{sect_tok}.nc")
-    cands.append(f"results/{subrun}/networks/base_s_{CLUSTERS}_{opts_tok}_{ph}.nc")
-    if sect_tok:
-        cands.append(f"results/{subrun}/networks/base_s_{CLUSTERS}_{opts_tok}_{sect_tok}_{ph}.nc")
 
     return list(dict.fromkeys(cands))
 
@@ -147,7 +156,7 @@ rule build_base_network_per_cutout:
         base=RESULTS_DIR + "robust_scenarios/{cutout}/base.nc",
     params:
         cutout=lambda wc: wc.cutout,
-        subrun=lambda wc: _subrun_name_for_cutout(PARENT_RUN, wc.cutout),
+        subrun=lambda wc: _subrun_name_for_cutout(PARENT_RUN,wc.cutout),
         nested_target_rule="prepare_elec_networks",
     threads: 1
     resources:
@@ -157,16 +166,71 @@ rule build_base_network_per_cutout:
         subrun = params.subrun
         nested_target_rule = params.nested_target_rule
 
+        # Construct overlay for nested run.  In addition to overriding
+        # ``atlite.default_cutout`` we also update the paths to the
+        # renewable capacity-factor files (wind/solar techfiles).  These
+        # techfiles depend on the chosen cutout and must be varied to match
+        # the climate model, scenario and year encoded in the cutout name.
         overlay = {
             "run": {"name": subrun},
             "atlite": {"default_cutout": cutout},
         }
 
+        # ------------------------------------------------------------------
+        # Dynamic renewable techfile override
+        # ------------------------------------------------------------------
+        # Extract token from the cutout name.  The default naming scheme
+        # follows ``cutout_{model}_{scenario}_{year}``.  We drop the
+        # ``cutout_`` prefix to get the middle part, e.g. ``mCNRM-CERFACS-CM5_rcp45_2010``.
+        token = cutout[7:] if cutout.startswith("cutout_") else cutout
+
+        # Build a mapping from renewable technologies to their file prefix and
+        # resource key.  Onwind uses ``wind_``, all offshore variants use
+        # ``wind_offshore_``, and PV technologies use ``pv_``.
+        techs = {
+            "onwind": ("turbine", "wind"),
+            "offwind-ac": ("turbine", "wind_offshore"),
+            "offwind-dc": ("turbine", "wind_offshore"),
+            "offwind-float": ("turbine", "wind_offshore"),
+            "solar": ("panel", "pv"),
+            "solar-hsat": ("panel", "pv"),
+        }
+
+        renewable_overlay = {}
+        for tech, (res_key, prefix) in techs.items():
+            try:
+                # Retrieve the original path from the top-level config to
+                # preserve the correct base directory (including case).
+                orig_path = config["renewable"][tech]["resource"][res_key]
+            except Exception:
+                # If the technology is missing in the config, skip it.
+                continue
+            # Determine base directory of techfiles and construct new filename.
+            base_dir = os.path.dirname(orig_path)
+            new_file = f"{prefix}_{token}_notAgg_pypsa.nc"
+            new_path = os.path.join(base_dir,new_file)
+
+            if not os.path.exists(new_path):
+                raise FileNotFoundError(
+                    f"[robust] Missing techfile for cutout={cutout!r}: "
+                    f"expected {new_path} (derived from renewable.{tech}.resource.{res_key})"
+                )
+
+            # Populate the overlay for this technology.
+            renewable_overlay.setdefault(tech,{}).setdefault("resource",{})[res_key] = new_path
+
+        # Only add the renewable section if any overrides were computed.  This
+        # merges with the existing config and overrides the turbine/panel
+        # entries for the selected cutout.
+        if renewable_overlay:
+            overlay["renewable"] = renewable_overlay
+
+        # Write overlay to disk and invoke nested snakemake as before.
         overlay_dir = Path("resources") / "robust_overlays"
-        overlay_dir.mkdir(parents=True, exist_ok=True)
+        overlay_dir.mkdir(parents=True,exist_ok=True)
         overlay_path = overlay_dir / f"overlay__{subrun}.yaml"
-        with open(overlay_path, "w") as f:
-            yaml.safe_dump(overlay, f, sort_keys=False)
+        with open(overlay_path,"w") as f:
+            yaml.safe_dump(overlay,f,sort_keys=False)
 
         cmd = [
             sys.executable, "-m", "snakemake",
@@ -182,12 +246,12 @@ rule build_base_network_per_cutout:
         ]
 
         print("\n[robust] Building per-cutout base network via nested snakemake:")
-        print("         cutout    :", cutout)
-        print("         subrun    :", subrun)
-        print("         target    :", nested_target_rule)
-        print("         cmd       :", " ".join(cmd))
+        print("         cutout    :",cutout)
+        print("         subrun    :",subrun)
+        print("         target    :",nested_target_rule)
+        print("         cmd       :"," ".join(cmd))
 
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd,check=True)
 
         candidate_paths = [Path(p) for p in _base_network_candidates_for_cutout(cutout)]
         existing = [p for p in candidate_paths if p.exists()]
@@ -215,15 +279,15 @@ rule build_base_network_per_cutout:
                 f"  - results/{subrun}/networks/\n"
             )
 
-        final_base = max(existing, key=lambda p: p.stat().st_mtime)
+        final_base = max(existing,key=lambda p: p.stat().st_mtime)
 
-        Path(os.path.dirname(output.base)).mkdir(parents=True, exist_ok=True)
+        Path(os.path.dirname(output.base)).mkdir(parents=True,exist_ok=True)
 
         print("\n[robust] Staging base network for robust DAG:")
-        print("         src :", str(final_base))
-        print("         dst :", output.base)
+        print("         src :",str(final_base))
+        print("         dst :",output.base)
 
-        shutil.copyfile(final_base, output.base)
+        shutil.copyfile(final_base,output.base)
 
 
 # =============================================================================

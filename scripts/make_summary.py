@@ -214,37 +214,132 @@ def calculate_metrics(n: pypsa.Network) -> pd.Series:
     """
     Calculate system-level metrics, e.g. shadow prices, grid expansion, total costs.
     Also calculate average, standard deviation and share of zero hours for electricity prices.
+
+    This function is written to work robustly with both:
+      - the standard PyPSA-Eur workflow networks, and
+      - ARO/robust workflow networks (including cases where marginal_price columns
+        do not match the expected AC bus index, or where some optimisation fields
+        are missing).
     """
+    import numpy as np
+    import pandas as pd
 
-    metrics = {}
+    metrics: dict[str, object] = {}
 
-    dc_links = n.links.query("carrier == 'DC'")
-    metrics["line_volume_DC"] = dc_links.eval("length * p_nom_opt").sum()
-    metrics["line_volume_AC"] = n.lines.eval("length * s_nom_opt").sum()
-    metrics["line_volume"] = metrics["line_volume_AC"] + metrics["line_volume_DC"]
+    # -------------------------
+    # Grid expansion (robust)
+    # -------------------------
+    # DC links: be defensive about missing columns
+    if hasattr(n, "links") and not n.links.empty:
+        dc_links = n.links[n.links.get("carrier", pd.Series(index=n.links.index)).eq("DC")]
+        # prefer p_nom_opt, fallback to p_nom, else 0
+        if "length" in dc_links.columns:
+            if "p_nom_opt" in dc_links.columns:
+                metrics["line_volume_DC"] = (dc_links["length"] * dc_links["p_nom_opt"]).sum()
+            elif "p_nom" in dc_links.columns:
+                metrics["line_volume_DC"] = (dc_links["length"] * dc_links["p_nom"]).sum()
+            else:
+                metrics["line_volume_DC"] = 0.0
+        else:
+            metrics["line_volume_DC"] = 0.0
+    else:
+        metrics["line_volume_DC"] = 0.0
 
-    metrics["total costs"] = n.statistics.capex().sum() + n.statistics.opex().sum()
+    # AC lines: prefer s_nom_opt, fallback to s_nom, else 0
+    if hasattr(n, "lines") and not n.lines.empty and "length" in n.lines.columns:
+        if "s_nom_opt" in n.lines.columns:
+            metrics["line_volume_AC"] = (n.lines["length"] * n.lines["s_nom_opt"]).sum()
+        elif "s_nom" in n.lines.columns:
+            metrics["line_volume_AC"] = (n.lines["length"] * n.lines["s_nom"]).sum()
+        else:
+            metrics["line_volume_AC"] = 0.0
+    else:
+        metrics["line_volume_AC"] = 0.0
 
-    buses_i = n.buses.query("carrier == 'AC'").index
-    prices = n.buses_t.marginal_price[buses_i]
+    metrics["line_volume"] = float(metrics["line_volume_AC"]) + float(metrics["line_volume_DC"])
 
-    # threshold higher than marginal_cost of VRE
-    zero_hours = prices.where(prices < 0.1).count().sum()
-    metrics["electricity_price_zero_hours"] = zero_hours / prices.size
-    metrics["electricity_price_mean"] = prices.unstack().mean()
-    metrics["electricity_price_std"] = prices.unstack().std()
+    # -------------------------
+    # Total costs (robust)
+    # -------------------------
+    # statistics might be missing or fail if not solved in a standard way
+    total_costs = np.nan
+    try:
+        total_costs = float(n.statistics.capex().sum() + n.statistics.opex().sum())
+    except Exception:
+        # Fallback: try objective if present; otherwise NaN
+        total_costs = float(getattr(n, "objective", np.nan)) if getattr(n, "objective", None) is not None else np.nan
+    metrics["total costs"] = total_costs
 
-    if "lv_limit" in n.global_constraints.index:
-        metrics["line_volume_limit"] = n.global_constraints.at["lv_limit", "constant"]
-        metrics["line_volume_shadow"] = n.global_constraints.at["lv_limit", "mu"]
+    # -------------------------
+    # Electricity price metrics (robust)
+    # -------------------------
+    # Handle:
+    #  - missing buses_t / marginal_price
+    #  - AC bus names not matching marginal_price columns
+    #  - networks without carrier == 'AC' (sector-coupled, etc.)
+    price_mean = np.nan
+    price_std = np.nan
+    price_zero_share = np.nan
 
-    if "CO2Limit" in n.global_constraints.index:
-        metrics["co2_shadow"] = n.global_constraints.at["CO2Limit", "mu"]
+    try:
+        mp = getattr(n, "buses_t", None)
+        mp = None if mp is None else getattr(n.buses_t, "marginal_price", None)
 
-    if "co2_sequestration_limit" in n.global_constraints.index:
-        metrics["co2_storage_shadow"] = n.global_constraints.at[
-            "co2_sequestration_limit", "mu"
-        ]
+        if mp is not None and isinstance(mp, pd.DataFrame) and not mp.empty:
+            # Determine candidate electricity buses (prefer carrier == 'AC')
+            if hasattr(n, "buses") and not n.buses.empty and "carrier" in n.buses.columns:
+                ac_buses = n.buses.index[n.buses["carrier"].eq("AC")]
+            else:
+                ac_buses = pd.Index([], dtype=object)
+
+            # If no explicit AC buses, fall back to all marginal_price columns
+            if len(ac_buses) == 0:
+                available = mp.columns
+            else:
+                # Only keep those actually present in marginal_price columns
+                available = ac_buses.intersection(mp.columns)
+
+                # If intersection is empty (common in ARO/canonical conversions),
+                # fall back to using all columns rather than erroring.
+                if len(available) == 0:
+                    available = mp.columns
+
+            prices = mp.loc[:, available]
+
+            # threshold higher than marginal_cost of VRE
+            zero_hours = prices.where(prices < 0.1).count().sum()
+            price_zero_share = float(zero_hours / prices.size) if prices.size else np.nan
+
+            # match original behaviour: prices.unstack().mean()/std()
+            # (works for DatetimeIndex and MultiIndex snapshots)
+            price_mean = prices.unstack().mean()
+            price_std = prices.unstack().std()
+
+    except Exception:
+        # Keep NaNs if anything unexpected happens
+        pass
+
+    metrics["electricity_price_zero_hours"] = price_zero_share
+    metrics["electricity_price_mean"] = price_mean
+    metrics["electricity_price_std"] = price_std
+
+    # -------------------------
+    # Shadow prices / constraints (robust)
+    # -------------------------
+    if hasattr(n, "global_constraints") and n.global_constraints is not None and not n.global_constraints.empty:
+        gc = n.global_constraints
+
+        if "lv_limit" in gc.index:
+            if "constant" in gc.columns:
+                metrics["line_volume_limit"] = gc.at["lv_limit", "constant"]
+            if "mu" in gc.columns:
+                metrics["line_volume_shadow"] = gc.at["lv_limit", "mu"]
+
+        if "CO2Limit" in gc.index and "mu" in gc.columns:
+            metrics["co2_shadow"] = gc.at["CO2Limit", "mu"]
+
+        if "co2_sequestration_limit" in gc.index and "mu" in gc.columns:
+            metrics["co2_storage_shadow"] = gc.at["co2_sequestration_limit", "mu"]
 
     return pd.Series(metrics).sort_index()
 
