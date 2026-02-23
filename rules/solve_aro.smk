@@ -213,9 +213,6 @@ rule solve_aro:
 # =============================================================================
 # ARO-only: Adapter + full postprocess targets
 # =============================================================================
-# =============================================================================
-# ARO-only: Adapter + full postprocess targets
-# =============================================================================
 MODE = (config.get("workflow", {}) or {}).get("mode", "plain").lower()
 if MODE not in {"plain", "robust", "aro"}:
     raise ValueError(f"Invalid workflow.mode={MODE!r} (expected plain|robust|aro)")
@@ -227,8 +224,10 @@ if MODE == "aro":
         Expose OUT_NETWORK_STD under the canonical solved-network path so that
         the existing postprocess rules can be triggered unchanged.
 
-        Snakemake-8 note:
-        Use ln -sf directly (avoid tmp+mv atomic swap) to prevent mtime race during DAG build.
+         IMPORTANT (NFS/autofs + Snakemake mtime race fix):
+         Do NOT use symlinks here. On some shared filesystems Snakemake may fail to
+         stat() a symlink target during concurrent updates ("Unable to obtain modification time ...").
+         Instead create a real file at the canonical path via hardlink/copy.
         """
         input:
             aro=str(OUT_NETWORK_STD)
@@ -236,10 +235,19 @@ if MODE == "aro":
             canonical=str(CANONICAL_SOLVED)
         shell:
             r"""
-            set -euo pipefail
-            mkdir -p "$(dirname {output.canonical})"
-            ln -sf "$(realpath {input.aro})" "{output.canonical}"
-            """
+                    set -euo pipefail
+                    mkdir -p "$(dirname {output.canonical})"
+
+                    # If an old broken symlink exists, remove it (extra safety at runtime).
+                    if [ -L "{output.canonical}" ] && [ ! -e "{output.canonical}" ]; then
+                      rm -f "{output.canonical}"
+                    fi
+
+                    tmp="{output.canonical}.tmp.$$"
+                    cp -f "{input.aro}" "$tmp"
+                    mv -f "$tmp" "{output.canonical}"
+                    """
+
 
     rule aro_full_postprocess:
         input:

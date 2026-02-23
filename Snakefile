@@ -38,8 +38,7 @@ scenarios = get_scenarios(run)
 RDIR = get_rdir(run)
 shadow_config = get_shadow(run)
 
-# IMPORTANT: define RESULTS before using it (used by *_DONE below)
-RESULTS = "results/" + RDIR + "/"
+RESULTS = f"results/{RDIR}/"
 # (optional) normalize double slashes
 RESULTS = RESULTS.replace("//", "/")
 
@@ -50,11 +49,11 @@ logs = path_provider("logs/", RDIR, shared_resources, exclude_from_shared)
 benchmarks = path_provider("benchmarks/", RDIR, shared_resources, exclude_from_shared)
 resources = path_provider("resources/", RDIR, shared_resources, exclude_from_shared)
 
-RESULTS = "results/" + RDIR
 
 PLAIN_DONE = RESULTS + "postprocess/__plain_workflow.done"
 ROBUST_DONE = RESULTS + "postprocess/__robust_workflow.done"
-ARO_DONE = RESULTS + "postprocess/__aro_workflow.done"
+ARO_DONE  = RESULTS + "postprocess/__aro_workflow.done"
+
 
 
 localrules:
@@ -536,7 +535,7 @@ elif MODE == "robust":
 
     rule robust_done:
         input:
-            "robust_full_postprocess"
+            rules.robust_postprocess.output.done
         output:
             ROBUST_DONE
         run:
@@ -548,7 +547,7 @@ elif MODE == "aro":
 
     rule aro_done:
         input:
-            "aro_full_postprocess"
+             rules.aro_full_postprocess.output.done
         output:
             ARO_DONE
         run:
