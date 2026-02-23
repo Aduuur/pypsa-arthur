@@ -4,17 +4,21 @@
 from __future__ import annotations
 
 import json
-import re
-import hashlib
+import sys
 from pathlib import Path
 
-# =============================================================================
-# ARO config
-# =============================================================================
-RUN_NAME = config["run"]["name"]
-RESULTS_DIR = f"results/{RUN_NAME}/"
+from scripts._helpers import get_rdir
 
-ARO = config.get("aro", {})  # optional: allow dedicated aro block
+# =============================================================================
+# ARO config (paths MUST match Snakefile logic)
+# =============================================================================
+run = config["run"]
+RDIR = str(get_rdir(run)).strip("/")  # IMPORTANT: same as Snakefile uses (and avoid trailing '/')
+
+RESULTS_DIR = Path("results") / RDIR
+RESOURCES_DIR = Path("resources") / RDIR
+
+ARO = config.get("aro", {})  # optional: dedicated aro block
 ROB = config.get("robust", {})  # fallback: reuse robust block
 
 CUTOUTS = list(ARO.get("cutouts", ROB.get("cutouts", [])))
@@ -29,10 +33,11 @@ PREPARED_TEMPLATE = ARO.get(
 )
 
 # Where ARO writes its final artefacts (inside classic run folder)
-OUT_NETWORK = ARO.get("out_network", RESULTS_DIR + "networks/aro_robust.nc")
-OUT_NETWORK_STD = OUT_NETWORK.replace(".nc", "__std.nc")
-
-OUT_SUMMARY = ARO.get("out_summary", RESULTS_DIR + "results/aro_summary.json")
+OUT_NETWORK = Path(ARO.get("out_network", str(RESULTS_DIR / "networks" / "aro_robust.nc")))
+OUT_NETWORK_STD = Path(
+    ARO.get("out_network_std", str(OUT_NETWORK).replace(".nc", "__std.nc"))
+)
+OUT_SUMMARY = Path(ARO.get("out_summary", str(RESULTS_DIR / "results" / "aro_summary.json")))
 
 # ARO loop controls
 INITIAL = list(ARO.get("initial_scenarios", [CUTOUTS[0]]))
@@ -62,9 +67,17 @@ def _require_singleton(name: str, xs):
     if not isinstance(xs, list) or len(xs) != 1:
         raise ValueError(
             f"ARO workflow requires scenario.{name} to be a singleton list, got: {xs}. "
-            "Reason: aro_postprocess must bind wildcards to concrete filenames."
+            "Reason: we must bind postprocess filenames deterministically."
         )
     return xs[0]
+
+
+def _tok(x) -> str:
+    """Filename token normalization: map None/'none' -> ''."""
+    if x is None:
+        return ""
+    s = str(x).strip()
+    return "" if s.lower() == "none" else s
 
 
 CLUSTERS = _require_singleton("clusters", SC.get("clusters", []))
@@ -72,61 +85,105 @@ OPTS = _require_singleton("opts", SC.get("opts", []))
 SECTOR_OPTS = _require_singleton("sector_opts", SC.get("sector_opts", []))
 PLANNING_HORIZON = _require_singleton("planning_horizons", SC.get("planning_horizons", []))
 
+OPTS_TOKEN = _tok(OPTS)
+SECTOR_OPTS_TOKEN = _tok(SECTOR_OPTS)
+PH_TOKEN = _tok(PLANNING_HORIZON)
 
-def _normalise_wildcard_token(x) -> str:
-    """Map config sentinel values to filename tokens."""
-    if x is None:
-        return ""
-    token = str(x).strip()
-    if token.lower() == "none":
-        return ""
-    return token
+# -----------------------------------------------------------------------------
+# Canonical solved network naming (GENERIC: supports elec-only and sector-coupled)
+# -----------------------------------------------------------------------------
+# You can override the canonical solved network path via:
+#   aro:
+#     canonical_solved: "results/<run>/networks/....nc"
+#
+CANONICAL_SOLVED_OVERRIDE = ARO.get("canonical_solved", None)
+if CANONICAL_SOLVED_OVERRIDE is not None:
+    CANONICAL_SOLVED = Path(str(CANONICAL_SOLVED_OVERRIDE))
+else:
+    # Heuristic: if sector_opts token is non-empty -> sector-coupled naming
+    IS_SECTOR_RUN = bool(SECTOR_OPTS_TOKEN)
+
+    if IS_SECTOR_RUN:
+        # Sector-coupled canonical solved network (PyPSA-Eur style: allow empty tokens -> double underscores)
+        CANONICAL_SOLVED = (
+            RESULTS_DIR
+            / "networks"
+            / f"base_s_{CLUSTERS}_{OPTS_TOKEN}_{SECTOR_OPTS_TOKEN}_{PH_TOKEN}.nc"
+        )
+    else:
+        # Elec-only canonical solved network (upstream style)
+        if OPTS_TOKEN:
+            CANONICAL_SOLVED = RESULTS_DIR / "networks" / f"base_s_{CLUSTERS}_elec_{OPTS_TOKEN}.nc"
+        else:
+            CANONICAL_SOLVED = RESULTS_DIR / "networks" / f"base_s_{CLUSTERS}_elec.nc"
+
+ARO_POSTPROCESS_DONE = RESULTS_DIR / "postprocess" / "aro_postprocess.done"
+
+# =============================================================================
+# Postprocess targets (NO nested snakemake; pure file dependencies)
+# =============================================================================
+def _default_postprocess_targets() -> list[Path]:
+    """
+    Minimal, robust set of concrete outputs to force standard postprocess/plots.
+    Keep it generic (works for elec-only and sector-coupled), and avoid targets that
+    may not exist in some configs/forks.
+
+    Extend via config['aro']['postprocess_targets'] (list[str]).
+    """
+    targets: list[Path] = []
+
+    # Common, stable artefacts
+    targets.append(RESOURCES_DIR / "maps" / "power-network.pdf")
+    targets.append(RESOURCES_DIR / "maps" / f"power-network-s-{CLUSTERS}.pdf")
+
+    # Metrics are usually produced by postprocess
+    targets.append(
+        RESULTS_DIR
+        / "csvs"
+        / "individual"
+        / f"metrics_s_{CLUSTERS}_{OPTS_TOKEN}_{SECTOR_OPTS_TOKEN}_{PH_TOKEN}.csv"
+    )
+
+    return targets
 
 
-OPTS_TOKEN = _normalise_wildcard_token(OPTS)
-SECTOR_OPTS_TOKEN = _normalise_wildcard_token(SECTOR_OPTS)
-
-# Canonical solved-network filename expected by standard postprocess (NO WILDCARDS!)
-CANONICAL_SOLVED = (
-    RESULTS_DIR
-    + f"networks/base_s_{CLUSTERS}_{OPTS_TOKEN}_{SECTOR_OPTS_TOKEN}_{PLANNING_HORIZON}.nc"
-)
-
-# Canonical metrics filename (NO WILDCARDS!)
-CANONICAL_METRICS = (
-    RESULTS_DIR
-    + f"csvs/individual/metrics_s_{CLUSTERS}_{OPTS_TOKEN}_{SECTOR_OPTS_TOKEN}_{PLANNING_HORIZON}.csv"
-)
+_EXTRA = ARO.get("postprocess_targets", None)
+if _EXTRA is not None:
+    if not isinstance(_EXTRA, list) or not all(isinstance(x, str) for x in _EXTRA):
+        raise ValueError("config['aro']['postprocess_targets'] must be a list of strings.")
+    # Interpret as repo-root-relative paths (same as CLI targets)
+    ARO_POSTPROCESS_TARGETS = [Path(x) for x in _EXTRA]
+else:
+    ARO_POSTPROCESS_TARGETS = _default_postprocess_targets()
 
 # =============================================================================
 # Targets
 # =============================================================================
 rule aro:
     input:
-        # ensure the scenario networks exist for all cutouts
         expand(PREPARED_TEMPLATE, cutout=CUTOUTS),
-        OUT_NETWORK,
-        OUT_SUMMARY
-
+        str(OUT_NETWORK),
+        str(OUT_NETWORK_STD),
+        str(OUT_SUMMARY),
+        str(ARO_POSTPROCESS_DONE)
 
 # =============================================================================
 # ARO solve rule
 # =============================================================================
 rule solve_aro:
     """
-    Methodical assumptions:
-    - scripts/solve_aro.py runs an ARO loop that repeatedly calls scripts/solve_robust.py
-      and evaluates candidate cutouts by dispatch-only solves using PyPSA's internal objective.
-    - The produced OUT_NETWORK is a "solved" PyPSA network suitable for standard postprocess.
+    scripts/solve_aro.py must:
+      - write OUT_NETWORK (final robust network),
+      - write OUT_NETWORK_STD (single-network artefact suitable for postprocess),
+      - write OUT_SUMMARY.
     """
     input:
         scenario_networks=expand(PREPARED_TEMPLATE, cutout=CUTOUTS),
     output:
-        network=OUT_NETWORK,
-        summary=OUT_SUMMARY,
-        std_network=OUT_NETWORK_STD,
+        network=str(OUT_NETWORK),
+        summary=str(OUT_SUMMARY),
+        std_network=str(OUT_NETWORK_STD),
     params:
-        # IMPORTANT: params must be fully determined without wildcards -> use lambdas
         cutouts=lambda wc: " ".join(CUTOUTS),
         prepared_template=lambda wc: PREPARED_TEMPLATE,
         initial=lambda wc: " ".join(INITIAL),
@@ -140,50 +197,56 @@ rule solve_aro:
         mkdir -p "$(dirname {output.network})"
         mkdir -p "$(dirname {output.summary})"
 
-        python scripts/solve_aro.py \
+        {sys.executable} scripts/solve_aro.py \
           --cutouts {params.cutouts} \
           --scenario-network-template "{params.prepared_template}" \
           --initial-scenarios {params.initial} \
           --max-iter {params.max_iter} \
           --out-network {output.network} \
+          --out-std-network {output.std_network} \
           --out-summary-json {output.summary} \
           --solver-name {params.solver} \
           --solver-options-json '{params.solver_opts}' \
           --eps-ls {params.eps_ls}
         """
 
+# =============================================================================
+# ARO-only: Adapter + full postprocess targets
+# =============================================================================
+# =============================================================================
+# ARO-only: Adapter + full postprocess targets
+# =============================================================================
+MODE = (config.get("workflow", {}) or {}).get("mode", "plain").lower()
+if MODE not in {"plain", "robust", "aro"}:
+    raise ValueError(f"Invalid workflow.mode={MODE!r} (expected plain|robust|aro)")
 
-# =============================================================================
-# Adapter: expose ARO result under canonical filename expected by postprocess
-# =============================================================================
-rule aro_as_canonical_solved_network:
-    """
-    Expose the ARO robust solution under the canonical solved-network path so that
-    the standard PyPSA-Eur postprocessing rules are triggered unchanged.
-    """
-    input:
-        aro=OUT_NETWORK_STD
-    output:
-        canonical=CANONICAL_SOLVED
-    shell:
-        r"""
-        set -euo pipefail
-        # Ensure the output directory exists
-        mkdir -p "$(dirname {output.canonical})"
-        # Link the single-scenario adapter network (OUT_NETWORK_STD) to the
-        # canonical solved network path expected by the postprocessing rules.
-        ln -sf "$(realpath {input.aro})" "{output.canonical}"
+if MODE == "aro":
+
+    rule aro_as_canonical_solved_network:
         """
+        Expose OUT_NETWORK_STD under the canonical solved-network path so that
+        the existing postprocess rules can be triggered unchanged.
 
+        Snakemake-8 note:
+        Use ln -sf directly (avoid tmp+mv atomic swap) to prevent mtime race during DAG build.
+        """
+        input:
+            aro=str(OUT_NETWORK_STD)
+        output:
+            canonical=str(CANONICAL_SOLVED)
+        shell:
+            r"""
+            set -euo pipefail
+            mkdir -p "$(dirname {output.canonical})"
+            ln -sf "$(realpath {input.aro})" "{output.canonical}"
+            """
 
-# =============================================================================
-# Target: run ARO + classical postprocess outputs (NO WILDCARDS!)
-# =============================================================================
-rule aro_postprocess:
-    input:
-        CANONICAL_SOLVED,
-        CANONICAL_METRICS,
-        RESULTS_DIR + "csvs/costs.csv",
-        RESULTS_DIR + "graphs/costs.svg",
-        RESULTS_DIR + "graphs/energy.svg",
-        RESULTS_DIR + "graphs/balances-energy.svg",
+    rule aro_full_postprocess:
+        input:
+            canonical=str(CANONICAL_SOLVED),
+            targets=[str(p) for p in ARO_POSTPROCESS_TARGETS],
+        output:
+            done=str(ARO_POSTPROCESS_DONE)
+        run:
+            Path(output.done).parent.mkdir(parents=True, exist_ok=True)
+            Path(output.done).write_text("ok\n")

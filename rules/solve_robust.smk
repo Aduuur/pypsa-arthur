@@ -45,6 +45,7 @@ OUT_SUMMARY = ROB.get("out_summary", RESULTS_DIR + "results/robust_summary.json"
 # Scenario singleton contract (robust pipeline expects one "scenario" combination)
 SC = config.get("scenario", {})
 
+
 def _require_singleton(name: str, xs):
     if not isinstance(xs, list) or len(xs) != 1:
         raise ValueError(
@@ -53,10 +54,12 @@ def _require_singleton(name: str, xs):
         )
     return xs[0]
 
+
 CLUSTERS = _require_singleton("clusters", SC.get("clusters", []))
 OPTS = _require_singleton("opts", SC.get("opts", []))
 SECTOR_OPTS = _require_singleton("sector_opts", SC.get("sector_opts", []))
 PLANNING_HORIZON = _require_singleton("planning_horizons", SC.get("planning_horizons", []))
+
 
 def _normalise_wildcard_token(x) -> str:
     """Map config sentinel values to filename wildcard tokens."""
@@ -67,8 +70,19 @@ def _normalise_wildcard_token(x) -> str:
         return ""
     return token
 
+
 OPTS_TOKEN = _normalise_wildcard_token(OPTS)
 SECTOR_OPTS_TOKEN = _normalise_wildcard_token(SECTOR_OPTS)
+
+
+def _is_sector_run() -> bool:
+    """
+    Decide whether we are in a sector-coupled run based on the *actual config value*.
+    Treat "", None, "none" (case-insensitive) as "no sector coupling".
+    """
+    v = str(SECTOR_OPTS).strip()
+    return bool(v) and v.lower() != "none"
+
 
 # =============================================================================
 # Solver settings (match config: solving.solver.name + solving.solver.options)
@@ -86,6 +100,7 @@ else:
 
 SOLVER_OPTIONS_JSON = json.dumps(SOLVER_OPTIONS)
 
+
 # =============================================================================
 # Helpers
 # =============================================================================
@@ -93,48 +108,64 @@ def _sanitize_for_run_name(s: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9._-]+", "-", s)
     return s.strip("-")
 
+
 def _parent_run_name() -> str:
     run = config.get("run", {})
     name = run.get("name", "run")
     prefix = run.get("prefix", "")
     return f"{prefix}{name}" if prefix else name
 
+
 PARENT_RUN = _parent_run_name()
+
 
 def _subrun_name_for_cutout(parent_run: str, cutout: str) -> str:
     h = hashlib.sha1(cutout.encode("utf-8")).hexdigest()[:8]
     return f"{parent_run}__cutout__{_sanitize_for_run_name(cutout)}__{h}"
 
-def _base_network_candidates_for_cutout(cutout: str) -> list[str]:
+
+def _canonical_solved_network_path(wc) -> str:
     """
-    Candidate file names to locate the produced base network after nested run.
-    We prefer resources/<subrun>/networks/ (unsolved artefacts),
-    and fall back to results/<subrun>/networks/ if needed.
+    Canonical solved-network path used by standard postprocess rules.
+
+    - sector run: base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.nc
+    - elec only : base_s_{clusters}_elec_{opts}.nc  (and if opts empty: base_s_{clusters}_elec.nc)
     """
-    subrun = _subrun_name_for_cutout(PARENT_RUN, cutout)
-    opts_tok = OPTS_TOKEN or str(OPTS).strip()
-    sect_tok = SECTOR_OPTS_TOKEN
-    ph = str(PLANNING_HORIZON).strip()
+    clusters = wc.clusters
+    opts = wc.opts
+    sector_opts = wc.sector_opts
+    ph = wc.planning_horizons
 
-    cands: list[str] = []
+    # sector-coupled
+    if sector_opts and str(sector_opts).strip() and str(sector_opts).strip().lower() != "none":
+        return RESULTS_DIR + f"networks/base_s_{clusters}_{opts}_{sector_opts}_{ph}.nc"
 
-    # --- Prefer sector-coupled network artefacts (as expected by rules/collect.smk) ---
-    # IMPORTANT: the sector network filename ALWAYS contains the sector_opts placeholder,
-    # even if sector_opts is an empty token. Therefore we MUST include it unconditionally.
-    cands.append(f"resources/{subrun}/networks/base_s_{CLUSTERS}_{opts_tok}_{sect_tok}_{ph}.nc")
-    cands.append(f"results/{subrun}/networks/base_s_{CLUSTERS}_{opts_tok}_{sect_tok}_{ph}.nc")
+    # electricity-only
+    if opts and str(opts).strip() and str(opts).strip().lower() != "none":
+        return RESULTS_DIR + f"networks/base_s_{clusters}_elec_{opts}.nc"
+    return RESULTS_DIR + f"networks/base_s_{clusters}_elec.nc"
 
-    # Optional fallback for variants that might omit sector token in the filename (older branches)
-    cands.append(f"resources/{subrun}/networks/base_s_{CLUSTERS}_{opts_tok}_{ph}.nc")
-    cands.append(f"results/{subrun}/networks/base_s_{CLUSTERS}_{opts_tok}_{ph}.nc")
 
-    # --- Last resort: electricity-only naming ---
-    cands.append(f"resources/{subrun}/networks/base_s_{CLUSTERS}_elec.nc")
-    cands.append(f"resources/{subrun}/networks/base_s_{CLUSTERS}_elec_{opts_tok}.nc")
-    if sect_tok:
-        cands.append(f"resources/{subrun}/networks/base_s_{CLUSTERS}_elec_{opts_tok}_{sect_tok}.nc")
+def _nested_anchor_path(subrun: str) -> Path:
+    """
+    The wildcard-free anchor produced by the nested run.
 
-    return list(dict.fromkeys(cands))
+    This file must be produced by a rule in the *root* Snakefile, e.g.
+        rule robust_nested_anchor:
+            output: results/<run>/networks/__robust_nested_anchor__.nc
+    """
+    return Path(f"results/{subrun}/networks/__robust_nested_anchor__.nc")
+
+
+def _validate_network_is_nonempty(nc_path: Path) -> None:
+    """Fail early if the produced/staged network is empty or invalid."""
+    import pypsa  # type: ignore
+
+    n = pypsa.Network(str(nc_path))
+    if len(n.buses) == 0 or len(n.snapshots) == 0:
+        raise ValueError(
+            f"staged network looks empty: buses={len(n.buses)}, snapshots={len(n.snapshots)}"
+        )
 
 
 # =============================================================================
@@ -156,37 +187,25 @@ rule build_base_network_per_cutout:
         base=RESULTS_DIR + "robust_scenarios/{cutout}/base.nc",
     params:
         cutout=lambda wc: wc.cutout,
-        subrun=lambda wc: _subrun_name_for_cutout(PARENT_RUN,wc.cutout),
-        nested_target_rule="prepare_elec_networks",
+        subrun=lambda wc: _subrun_name_for_cutout(PARENT_RUN, wc.cutout),
     threads: 1
     resources:
         mem_mb=2000
     run:
         cutout = params.cutout
         subrun = params.subrun
-        nested_target_rule = params.nested_target_rule
 
-        # Construct overlay for nested run.  In addition to overriding
-        # ``atlite.default_cutout`` we also update the paths to the
-        # renewable capacity-factor files (wind/solar techfiles).  These
-        # techfiles depend on the chosen cutout and must be varied to match
-        # the climate model, scenario and year encoded in the cutout name.
+        # Construct overlay for nested run: override cutout + techfiles
         overlay = {
             "run": {"name": subrun},
             "atlite": {"default_cutout": cutout},
         }
 
         # ------------------------------------------------------------------
-        # Dynamic renewable techfile override
+        # Dynamic renewable techfile override (cutout-specific techfiles)
         # ------------------------------------------------------------------
-        # Extract token from the cutout name.  The default naming scheme
-        # follows ``cutout_{model}_{scenario}_{year}``.  We drop the
-        # ``cutout_`` prefix to get the middle part, e.g. ``mCNRM-CERFACS-CM5_rcp45_2010``.
         token = cutout[7:] if cutout.startswith("cutout_") else cutout
 
-        # Build a mapping from renewable technologies to their file prefix and
-        # resource key.  Onwind uses ``wind_``, all offshore variants use
-        # ``wind_offshore_``, and PV technologies use ``pv_``.
         techs = {
             "onwind": ("turbine", "wind"),
             "offwind-ac": ("turbine", "wind_offshore"),
@@ -197,97 +216,102 @@ rule build_base_network_per_cutout:
         }
 
         renewable_overlay = {}
+        missing = []
         for tech, (res_key, prefix) in techs.items():
             try:
-                # Retrieve the original path from the top-level config to
-                # preserve the correct base directory (including case).
                 orig_path = config["renewable"][tech]["resource"][res_key]
             except Exception:
-                # If the technology is missing in the config, skip it.
                 continue
-            # Determine base directory of techfiles and construct new filename.
+
             base_dir = os.path.dirname(orig_path)
             new_file = f"{prefix}_{token}_notAgg_pypsa.nc"
-            new_path = os.path.join(base_dir,new_file)
+            new_path = os.path.join(base_dir, new_file)
 
             if not os.path.exists(new_path):
-                raise FileNotFoundError(
-                    f"[robust] Missing techfile for cutout={cutout!r}: "
-                    f"expected {new_path} (derived from renewable.{tech}.resource.{res_key})"
-                )
+                missing.append((tech, res_key, orig_path, new_path))
+                continue
 
-            # Populate the overlay for this technology.
-            renewable_overlay.setdefault(tech,{}).setdefault("resource",{})[res_key] = new_path
+            renewable_overlay.setdefault(tech, {}).setdefault("resource", {})[res_key] = new_path
 
-        # Only add the renewable section if any overrides were computed.  This
-        # merges with the existing config and overrides the turbine/panel
-        # entries for the selected cutout.
+        if missing:
+            print("\n[robust] WARNING: Missing per-cutout techfiles; keeping original paths for those:")
+            for tech, res_key, orig_path, new_path in missing:
+                print(f"         - {tech}.{res_key}: expected {new_path}  (kept {orig_path})")
+
         if renewable_overlay:
             overlay["renewable"] = renewable_overlay
 
-        # Write overlay to disk and invoke nested snakemake as before.
         overlay_dir = Path("resources") / "robust_overlays"
-        overlay_dir.mkdir(parents=True,exist_ok=True)
+        overlay_dir.mkdir(parents=True, exist_ok=True)
         overlay_path = overlay_dir / f"overlay__{subrun}.yaml"
-        with open(overlay_path,"w") as f:
-            yaml.safe_dump(overlay,f,sort_keys=False)
+        with open(overlay_path, "w") as f:
+            yaml.safe_dump(overlay, f, sort_keys=False)
+
+        # ------------------------------------------------------------------
+        # Nested snakemake invocation
+        # ------------------------------------------------------------------
+        # We target a wildcard-free anchor file to avoid:
+        # - "Target rules may not contain wildcards"
+        # - guessing filenames
+        # - mtime/globbing roulette
+        nested_target_file = _nested_anchor_path(subrun)
 
         cmd = [
-            sys.executable, "-m", "snakemake",
-            "-s", "Snakefile",
-            "--cores", "8",
-            "--scheduler", "greedy",
+            sys.executable,
+            "-m",
+            "snakemake",
+            "-s",
+            "Snakefile",
+            "--cores",
+            "8",
+            "--scheduler",
+            "greedy",
             "--nolock",
             "--rerun-incomplete",
             "--keep-going",
-            "--configfile", "config/config.yaml",
-            "--configfile", str(overlay_path),
-            "--until", nested_target_rule,
+            "--configfile",
+            "config/config.yaml",
+            "--configfile",
+            str(overlay_path),
+            "--",
+            str(nested_target_file),
         ]
 
         print("\n[robust] Building per-cutout base network via nested snakemake:")
-        print("         cutout    :",cutout)
-        print("         subrun    :",subrun)
-        print("         target    :",nested_target_rule)
-        print("         cmd       :"," ".join(cmd))
+        print("         cutout      :", cutout)
+        print("         subrun      :", subrun)
+        print("         sector_run  :", _is_sector_run())
+        print("         target_file :", str(nested_target_file))
+        print("         cmd         :", " ".join(cmd))
 
-        subprocess.run(cmd,check=True)
+        subprocess.run(cmd, check=True)
 
-        candidate_paths = [Path(p) for p in _base_network_candidates_for_cutout(cutout)]
-        existing = [p for p in candidate_paths if p.exists()]
-
-        if not existing:
-            cand_dirs = [
-                Path("resources") / subrun / "networks",
-                Path("results") / subrun / "networks",
-            ]
-            globbed = []
-            for d in cand_dirs:
-                if d.exists():
-                    globbed += sorted(d.glob("base_s_*.nc"))
-                    globbed += sorted(d.glob("base*_elec*.nc"))
-                    globbed += sorted(d.glob("base*.nc"))
-            existing = globbed
-
-        if not existing:
-            looked = "\n  - " + "\n  - ".join(_base_network_candidates_for_cutout(cutout))
+        if not nested_target_file.exists():
             raise FileNotFoundError(
-                f"[robust] Nested run produced no base network artefact.\n"
-                f"Looked for candidates:{looked}\n"
-                f"Also tried globbing in:\n"
-                f"  - resources/{subrun}/networks/\n"
-                f"  - results/{subrun}/networks/\n"
+                f"[robust] Nested run did not produce anchor file:\n"
+                f"  expected: {nested_target_file}\n"
+                f"  hint    : ensure root Snakefile provides rule that outputs "
+                f"'results/<run>/networks/__robust_nested_anchor__.nc'\n"
             )
 
-        final_base = max(existing,key=lambda p: p.stat().st_mtime)
+        # Validate (hard fail) to avoid silent "empty" networks
+        try:
+            _validate_network_is_nonempty(nested_target_file)
+        except Exception as e:
+            raise RuntimeError(
+                f"[robust] Produced nested anchor network is invalid/empty.\n"
+                f"  subrun: {subrun}\n"
+                f"  file : {nested_target_file}\n"
+                f"  error: {e}\n"
+            )
 
-        Path(os.path.dirname(output.base)).mkdir(parents=True,exist_ok=True)
+        Path(os.path.dirname(output.base)).mkdir(parents=True, exist_ok=True)
 
         print("\n[robust] Staging base network for robust DAG:")
-        print("         src :",str(final_base))
-        print("         dst :",output.base)
+        print("         src :", str(nested_target_file))
+        print("         dst :", output.base)
 
-        shutil.copyfile(final_base,output.base)
+        shutil.copyfile(nested_target_file, output.base)
 
 
 # =============================================================================
@@ -324,7 +348,7 @@ rule solve_robust:
         solver_opts=SOLVER_OPTIONS_JSON,
         eps_ls=EPS_LS,
         cutouts=" ".join(CUTOUTS),
-        template=lambda wc: PREPARED_TEMPLATE
+        template=lambda wc: PREPARED_TEMPLATE,
     shell:
         r"""
         set -euo pipefail
@@ -350,37 +374,82 @@ rule solve_robust:
 
 
 # =============================================================================
-# Adapter: expose robust result under canonical filename expected by postprocess
+# Then wrap your existing robust adapter + robust_postprocess block like this:
+# (i.e. indent the whole block under if MODE == "robust":)
 # =============================================================================
-rule robust_as_canonical_solved_network:
-    """
-    Methodical note:
-    - Postprocessing is unchanged and reads a "solved network" from the canonical path.
-    - We expose the robust solution under that name (symlink preferred).
-    """
-    input:
-        robust=OUT_NETWORK
-    output:
-        canonical=RESULTS_DIR + "networks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.nc"
-    shell:
-        r"""
-        set -euo pipefail
-        mkdir -p "$(dirname {output.canonical})"
-        # Symlink (preferred). If your FS disallows it, replace with: cp -f
-        ln -sf "$(realpath {input.robust})" "{output.canonical}"
+
+if MODE == "robust":
+
+    # =============================================================================
+    # Adapter: expose robust result under canonical filenames expected by postprocess
+    # =============================================================================
+
+    rule robust_as_canonical_elec_noopts:
         """
+        For electricity-only runs with empty opts token:
+        results/<run>/networks/base_s_<clusters>_elec.nc
+        """
+        input:
+            robust=OUT_NETWORK
+        output:
+            canonical=RESULTS_DIR + "networks/base_s_{clusters}_elec.nc"
+        shell:
+            r"""
+            set -euo pipefail
+            mkdir -p "$(dirname {output.canonical})"
+            ln -sf "$(realpath {input.robust})" "{output.canonical}"
+            """
 
+    rule robust_as_canonical_elec_withopts:
+        """
+        For electricity-only runs with non-empty opts token:
+        results/<run>/networks/base_s_<clusters>_elec_<opts>.nc
+        """
+        input:
+            robust=OUT_NETWORK
+        output:
+            canonical=RESULTS_DIR + "networks/base_s_{clusters}_elec_{opts}.nc"
+        shell:
+            r"""
+            set -euo pipefail
+            mkdir -p "$(dirname {output.canonical})"
+            ln -sf "$(realpath {input.robust})" "{output.canonical}"
+            """
 
-# =============================================================================
-# Target: run robust + classical postprocess outputs
-# =============================================================================
-rule robust_postprocess:
-    input:
-        # canonical solved network
-        RESULTS_DIR + "networks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.nc",
-        # key classical artifacts to force the standard pipeline
-        RESULTS_DIR + "csvs/individual/metrics_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.csv",
-        RESULTS_DIR + "csvs/costs.csv",
-        RESULTS_DIR + "graphs/costs.svg",
-        RESULTS_DIR + "graphs/energy.svg",
-        RESULTS_DIR + "graphs/balances-energy.svg",
+    rule robust_as_canonical_sector:
+        """
+        For sector-coupled runs:
+        results/<run>/networks/base_s_<clusters>_<opts>_<sector_opts>_<planning_horizons>.nc
+        """
+        input:
+            robust=OUT_NETWORK
+        output:
+            canonical=RESULTS_DIR + "networks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.nc"
+        shell:
+            r"""
+            set -euo pipefail
+            mkdir -p "$(dirname {output.canonical})"
+            ln -sf "$(realpath {input.robust})" "{output.canonical}"
+            """
+
+    # =============================================================================
+    # Target: robust + classical postprocess outputs (as pinned artefacts)
+    # =============================================================================
+    def _canonical_inputs_for_postprocess(wc):
+        if _is_sector_run():
+            return [
+                RESULTS_DIR
+                + f"networks/base_s_{wc.clusters}_{wc.opts}_{wc.sector_opts}_{wc.planning_horizons}.nc"
+            ]
+        if wc.opts and str(wc.opts).strip() and str(wc.opts).strip().lower() != "none":
+            return [RESULTS_DIR + f"networks/base_s_{wc.clusters}_elec_{wc.opts}.nc"]
+        return [RESULTS_DIR + f"networks/base_s_{wc.clusters}_elec.nc"]
+
+    rule robust_postprocess:
+        input:
+            _canonical_inputs_for_postprocess
+        output:
+            done=RESULTS_DIR + "postprocess/robust_postprocess.done"
+        run:
+            Path(os.path.dirname(output.done)).mkdir(parents=True, exist_ok=True)
+            Path(output.done).write_text("ok\n")

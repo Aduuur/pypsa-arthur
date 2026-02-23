@@ -27,11 +27,22 @@ if Path("config/config.yaml").exists():
 
     configfile: "config/config.yaml"
 
+MODE = (config.get("workflow", {}) or {}).get("mode", "plain").lower()
+if MODE not in {"plain", "robust", "aro"}:
+    raise ValueError(f"Invalid workflow.mode={MODE!r} (expected plain|robust|aro)")
+
+
 
 run = config["run"]
 scenarios = get_scenarios(run)
 RDIR = get_rdir(run)
 shadow_config = get_shadow(run)
+
+# IMPORTANT: define RESULTS before using it (used by *_DONE below)
+RESULTS = "results/" + RDIR + "/"
+# (optional) normalize double slashes
+RESULTS = RESULTS.replace("//", "/")
+
 
 shared_resources = run["shared_resources"]["policy"]
 exclude_from_shared = run["shared_resources"]["exclude"]
@@ -40,6 +51,10 @@ benchmarks = path_provider("benchmarks/", RDIR, shared_resources, exclude_from_s
 resources = path_provider("resources/", RDIR, shared_resources, exclude_from_shared)
 
 RESULTS = "results/" + RDIR
+
+PLAIN_DONE = RESULTS + "postprocess/__plain_workflow.done"
+ROBUST_DONE = RESULTS + "postprocess/__robust_workflow.done"
+ARO_DONE = RESULTS + "postprocess/__aro_workflow.done"
 
 
 localrules:
@@ -79,8 +94,130 @@ if config["foresight"] == "perfect":
 
     include: "rules/solve_perfect.smk"
 
+# Disambiguate canonical solved-network outputs in robust/aro mode.
+# Otherwise, classical solve_* rules (myopic/perfect) compete with adapter rules for the same filename.
+if MODE == "aro":
+    ruleorder:
+        aro_as_canonical_solved_network > solve_sector_network_myopic
 
-rule all:
+if MODE == "robust":
+    ruleorder:
+        robust_as_canonical_sector > solve_sector_network_myopic
+
+# -----------------------------------------------------------------------------
+# Robust nested anchor (wildcard-free target file)
+# -----------------------------------------------------------------------------
+from pathlib import Path
+
+def _norm(x) -> str:
+    if x is None:
+        return ""
+    s = str(x).strip()
+    return "" if s.lower() == "none" else s
+
+def _get_singleton_or_none(name: str):
+    sc = config.get("scenario", {})
+    xs = sc.get(name, None)
+    if xs is None:
+        return None
+    if not isinstance(xs, list):
+        return xs
+    if len(xs) == 1:
+        return xs[0]
+    # multi-scenario → cannot derive deterministic wildcard-free paths
+    return None
+
+def _results_dir() -> Path:
+    # Use RDIR as computed by get_rdir(run). Protect against trailing slashes.
+    return Path("results") / Path(RDIR)
+
+def _anchor_path() -> str:
+    return str(_results_dir() / "networks" / "__robust_nested_anchor__.nc")
+
+def _candidate_sources() -> list[Path]:
+    clusters = _get_singleton_or_none("clusters")
+    opts = _norm(_get_singleton_or_none("opts"))
+    sector_opts = _norm(_get_singleton_or_none("sector_opts"))
+    ph = _norm(_get_singleton_or_none("planning_horizons"))
+
+    if clusters is None or ph == "":
+        return []
+
+    base = _results_dir() / "networks"
+    cands: list[Path] = []
+
+    # --- Your repo seems to produce this even in electricity-only:
+    # base_s_<clusters>_<opts>_<sector_opts>_<planning_horizons>.nc
+    # When opts="" and sector_opts="" → base_s_24___2050.nc
+    cands.append(base / f"base_s_{clusters}_{opts}_{sector_opts}_{ph}.nc")
+
+    # --- Other common variants (keep as fallback)
+    cands.append(base / "prepared.nc")
+    cands.append(base / f"prepared_{run['name']}.nc")  # harmless fallback
+
+    # Electricity naming variants (some forks)
+    if opts:
+        cands.append(base / f"base_s_{clusters}_elec_{opts}.nc")
+        cands.append(base / f"elec_s_{clusters}_{opts}.nc")
+    cands.append(base / f"base_s_{clusters}_elec.nc")
+    cands.append(base / f"elec_s_{clusters}.nc")
+
+    # Sector naming variants (some forks)
+    if sector_opts:
+        cands.append(base / f"sector_s_{clusters}_{opts}_{sector_opts}_{ph}.nc")
+
+    # de-dup preserve order
+    seen = set()
+    uniq = []
+    for p in cands:
+        ps = str(p)
+        if ps in seen:
+            continue
+        seen.add(ps)
+        uniq.append(p)
+    return uniq
+
+rule robust_nested_anchor:
+    """
+    Wildcard-free target for nested snakemake calls.
+    Creates: results/<RDIR>/networks/__robust_nested_anchor__.nc
+    """
+    output:
+        anchor=_anchor_path()
+    run:
+        anchor = Path(output.anchor)
+        anchor.parent.mkdir(parents=True, exist_ok=True)
+
+        cands = _candidate_sources()
+        if not cands:
+            raise ValueError(
+                "robust_nested_anchor requires singleton scenario lists "
+                "(clusters/opts/sector_opts/planning_horizons). "
+                "Your config['scenario'] appears to have multiple values, "
+                "so a wildcard-free anchor cannot be derived."
+            )
+
+        src = next((p for p in cands if p.exists()), None)
+        if src is None:
+            msg = "\n".join(f"  - {p}" for p in cands)
+            raise FileNotFoundError(
+                "Could not find a prepared network artefact to anchor.\n"
+                "Tried these candidates:\n"
+                f"{msg}\n"
+                "Fix: adapt _candidate_sources() to your repo's actual output name."
+            )
+
+        # Prefer symlink; fall back to copy
+        try:
+            if anchor.exists() or anchor.is_symlink():
+                anchor.unlink()
+            anchor.symlink_to(src.resolve())
+        except Exception:
+            import shutil
+            shutil.copyfile(src, anchor)
+
+
+rule plain_all:
     input:
         expand(RESULTS + "graphs/costs.svg", run=config["run"]["name"]),
         expand(resources("maps/power-network.pdf"), run=config["run"]["name"]),
@@ -372,3 +509,48 @@ rule sync_dry:
         rsync -uvarh --no-g {params.cluster}/results . -n || echo "No results directory, skipping rsync"
         rsync -uvarh --no-g {params.cluster}/logs . -n || echo "No logs directory, skipping rsync"
         """
+
+
+# =============================================================================
+# default target
+# =============================================================================
+rule all:
+    input:
+        PLAIN_DONE if MODE == "plain" else ROBUST_DONE if MODE == "robust" else ARO_DONE
+    default_target: True
+
+
+if MODE == "plain":
+
+    rule plain_done:
+        input:
+            rules.plain_all.input
+        output:
+            PLAIN_DONE
+        run:
+            Path(output[0]).parent.mkdir(parents=True, exist_ok=True)
+            Path(output[0]).write_text("ok\n")
+
+
+elif MODE == "robust":
+
+    rule robust_done:
+        input:
+            "robust_full_postprocess"
+        output:
+            ROBUST_DONE
+        run:
+            Path(output[0]).parent.mkdir(parents=True, exist_ok=True)
+            Path(output[0]).write_text("ok\n")
+
+
+elif MODE == "aro":
+
+    rule aro_done:
+        input:
+            "aro_full_postprocess"
+        output:
+            ARO_DONE
+        run:
+            Path(output[0]).parent.mkdir(parents=True, exist_ok=True)
+            Path(output[0]).write_text("ok\n")

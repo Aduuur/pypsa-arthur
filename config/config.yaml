@@ -38,7 +38,8 @@ run:
     exclude: []
   use_shadow_directory: false
 
-
+workflow:
+  mode: "aro" #must be aro or robust or plain
 
 robust:
   # diskrete Szenarien = manipulierten Cutouts

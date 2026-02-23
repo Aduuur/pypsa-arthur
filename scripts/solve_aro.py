@@ -90,6 +90,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 import pypsa
+import uuid
+import os
+import shutil
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +124,24 @@ def run_subprocess(cmd: List[str]) -> None:
     if result.returncode != 0:
         raise RuntimeError(f"Command failed with code {result.returncode}: {' '.join(cmd)}")
 
+def atomic_copy(src: str, dst: str) -> None:
+    src_p = Path(src)
+    dst_p = Path(dst)
+    dst_p.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp = dst_p.with_name(dst_p.name + f".tmp.{uuid.uuid4().hex}")
+    shutil.copyfile(str(src_p), str(tmp))
+    os.replace(str(tmp), str(dst_p))
+
+def export_netcdf_atomic(n: pypsa.Network, out_path: str) -> None:
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp = out.with_name(out.name + f".tmp.{uuid.uuid4().hex}")
+    # write
+    n.export_to_netcdf(str(tmp))
+    # atomic replace
+    os.replace(str(tmp), str(out))
 
 # =============================================================================
 # CLI
@@ -176,6 +197,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1e-6,
         help="Toleranz für z_ls in solve_robust (Stage 2), wird als --eps-ls-abs weitergereicht",
+    )
+    p.add_argument(
+        "--out-std-network",
+        default=None,
+        help="Optional: Datei für ein 'standard' Netz (.nc), z.B. single-scenario Adapter für Postprocess.",
     )
     return p.parse_args()
 
@@ -542,6 +568,11 @@ def main() -> None:
         "--eps-ls-abs", str(args.eps_ls),
     ]
     run_subprocess(final_cmd)
+
+    if args.out_std_network:
+        # Minimaler, stabiler Adapter: std = Kopie des final robust network
+        atomic_copy(args.out_network, args.out_std_network)
+        logger.info("Wrote std network (atomic copy): %s", args.out_std_network)
 
     # Append ARO history to summary JSON (non-destructive)
     try:
