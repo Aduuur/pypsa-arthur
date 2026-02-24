@@ -257,11 +257,14 @@ rule build_base_network_per_cutout:
         # - "Target rules may not contain wildcards"
         # - guessing filenames
         # - mtime/globbing roulette
-        nested_target_file = _nested_anchor_path(subrun)
+        nested_target_file = Path(f"results/{subrun}/networks/base_s_{CLUSTERS}_{OPTS_TOKEN}_{SECTOR_OPTS_TOKEN}_{PLANNING_HORIZON}.nc")
+
+
 
         cmd = [
             sys.executable, "-m", "snakemake",
             "-s", "Snakefile",
+            "--directory", ".",  # Expliziter Working Directory
             "--cores", "8",
             "--scheduler", "greedy",
             "--nolock",
@@ -285,18 +288,23 @@ rule build_base_network_per_cutout:
         nested_env["PYPSA_ROBUST_NESTED"] = "1"
 
         for key in list(nested_env.keys()):
-            if key.startswith("SNAKEMAKE_"):
+            if any(key.startswith(prefix) for prefix in [
+                "SNAKEMAKE_", "__PYVENV_", "CONDA_", "MAMBA_"
+            ]):
                 del nested_env[key]
 
         subprocess.run(cmd, check=True, env=nested_env)
 
         if not nested_target_file.exists():
             raise FileNotFoundError(
-                f"[robust] Nested run did not produce anchor file:\n"
+                f"[robust] Nested run did not produce network:\n"
                 f"  expected: {nested_target_file}\n"
-                f"  hint    : ensure root Snakefile provides rule that outputs "
-                f"'results/<run>/networks/__robust_nested_anchor__.nc'\n"
             )
+
+        _validate_network_is_nonempty(nested_target_file)
+
+        Path(os.path.dirname(output.base)).mkdir(parents=True,exist_ok=True)
+        shutil.copyfile(nested_target_file,output.base)
 
         # Validate (hard fail) to avoid silent "empty" networks
         try:
@@ -336,13 +344,7 @@ rule prepared_network_for_robust:
 
         shutil.copyfile(input.staged, output.prepared)
 
-        sentinel = Path("resources/robust_overlays/.current_nested_run")
-        sentinel.parent.mkdir(parents=True,exist_ok=True)
-        sentinel.write_text(subrun)
-        try:
-            subprocess.run(cmd,check=True,env=nested_env)
-        finally:
-            sentinel.unlink(missing_ok=True)
+
 
 
 # =============================================================================

@@ -211,35 +211,26 @@ rule robust_nested_anchor:
     Wildcard-free target for nested snakemake calls.
     Creates: results/<RDIR>/networks/__robust_nested_anchor__.nc
     """
+
+    input:
+        source=_anchor_path_input()
     output:
         anchor=_anchor_path()
     run:
         from pathlib import Path
 
         anchor = Path(output.anchor)
+        src = Path(input.source)
+
+        if not src.exists():
+            raise FileNotFoundError(f"Source network not found: {src}")
+
         anchor.parent.mkdir(parents=True,exist_ok=True)
+        if anchor.exists() or anchor.is_symlink():
+            anchor.unlink()
 
-        cands = _candidate_sources()
-        if not cands:
-            raise ValueError("robust_nested_anchor: keine Kandidaten gefunden")
-
-        # Warte bis eine Kandidatendatei existiert (solve_sector_network_myopic muss fertig sein)
-        import time
-
-        src = None
-        for _ in range(60):  # max 5 min warten
-            src = next((p for p in cands if p.exists()),None)
-            if src:
-                break
-            time.sleep(5)
-
-        if src is None:
-            raise FileNotFoundError(f"Kein Netzwerk-Artefakt gefunden. Kandidaten:\n" + "\n".join(
-                str(p) for p in cands))
-
+        # Symlink oder copy
         try:
-            if anchor.exists() or anchor.is_symlink():
-                anchor.unlink()
             anchor.symlink_to(src.resolve())
         except Exception:
             import shutil
