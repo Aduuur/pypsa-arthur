@@ -1,459 +1,418 @@
 #!/usr/bin/env python3
 # solve_aro.py
-
-#!/usr/bin/env python3
 """
 solve_aro.py — Iterativer ARO-Workflow (Adaptive Robust Optimization via Szenario-Generierung)
 
-Ziel
-----
-Dieses Skript implementiert einen iterativen ARO-Loop über eine endliche Menge von
-Wetter-/Demand-Szenarien ("cutouts"). In jeder Iteration:
+Überblick
+---------
+Iterativer ARO-Loop über eine endliche Menge von Wetter-/Demand-Szenarien ("cutouts").
+In jeder Iteration:
 
-  (1) Löse ein robustes Portfolio-Problem (Investitionsentscheidung) auf dem aktuellen Szenarioset
-      mittels scripts/solve_robust.py (lexikographisch: erst Worst-Case-LS, dann Worst-Case-Kosten).
-  (2) Fixiere die resultierenden Investitionskapazitäten und evaluiere dieses Portfolio via
-      Dispatch-only auf ALLEN Cutouts (jeweils getrennt, single-scenario).
-      Die Dispatch-Kosten werden dabei mit der PyPSA-internen Zielfunktion berechnet.
-  (3) Füge das Worst-Case-Cutout (höchste Gesamtkosten) zum Szenarioset hinzu.
-  (4) Wiederhole bis Konvergenz oder max-iter.
+  (1) ROBUST-SOLVE:      Robuste Investitionsentscheidung über das aktuelle Szenarioset
+                         via solve_robust.py (lexikographisch: LS dann Kosten).
+  (2) DISPATCH-EVAL:     Dispatch-only-Solve auf ALLEN Cutouts unter fixiertem Portfolio
+                         (parallelisiert via ProcessPoolExecutor).          [NEU-1]
+  (3) SZENARIO-AUSWAHL:  Worst-Case-Cutout wird anhand zweier Kriterien gewählt:
+                         (a) "worst in set" (klassisches ARO-Kriterium)
+                         (b) Gap-basierte Terminierung: Stop wenn
+                             (worst_total - current_set_worst) / worst_total < tol  [NEU-2]
+  (4) KONVERGENZ:        Stop wenn Worst-Case bereits im Set ODER Gap < --convergence-tol.
+  (5) FINAL-SOLVE:       Letzter Robust-Solve + finale Evaluation → Worst-Case-Dispatch Export.
 
-Wichtig: Für die Dispatch-Evaluation nutzen wir explizit PyPSA's interne Kosten/Objective,
-und addieren eine scenario-unabhängige Investitionskosten-Komponente aus dem Portfolio.
+Outputs
+-------
+  --out-network           Finales robustes Portfolio-Netz (flat-snapshot NetCDF).
+  --out-dispatch-network  Worst-Case-Dispatch-Netz (flat-snapshot NetCDF).
+  --out-dispatch-std      Worst-Case-Dispatch-Netz (DatetimeIndex NetCDF).
+  --out-std-network       Standard-Adapter des Portfolio-Netzes (DatetimeIndex).
+  --out-summary-json      ARO-History + Summary als JSON.
 
-----------------------------------------------------------------------
-Methodische Annahmen (explizit dokumentiert)
-----------------------------------------------------------------------
+Bugfixes und Änderungen
+-----------------------
+[FIX-1]  Worst-Case-Dispatch wird gespeichert
+[FIX-2]  Kostenkonsistenz Robust-Solve ↔ Dispatch-Evaluation
+[FIX-3]  --out-std-network nutzt den von solve_robust auto-erzeugten Adapter
+[FIX-4]  Finale Evaluation nach dem letzten Robust-Solve
+[FIX-CO2] CO2-Kostenmodus vollständig durchgereicht
 
-A1) Two-stage Setup / "ARO via Szenario-Generierung"
-    - Investitionsentscheidungen werden robust über ein Szenarioset bestimmt (solve_robust).
-    - Robustheit gegen alle Cutouts wird iterativ durch Hinzufügen des Worst-Case-Szenarios erzwungen.
+[NEU-1]  Parallelisierung der Dispatch-Evaluation
+    evaluate_all_cutouts verwendet concurrent.futures.ProcessPoolExecutor.
+    Alle Cutouts werden gleichzeitig in separaten Prozessen evaluiert.
+    Der Worker-Einstiegspunkt ist _dispatch_worker_fn (top-level, picklable).
+    Anzahl paralleler Prozesse konfigurierbar via --dispatch-workers
+    (Default: min(len(cutouts), cpu_count)).
+    Fallback auf sequenzielle Ausführung bei workers=1 oder auf Plattformen
+    ohne Multiprocessing-Support (z.B. Windows mit spawn-Context-Problemen).
 
-A2) "Fixed portfolio" Dispatch Evaluation
-    - Die Investitionsentscheidung wird aus dem Portfolio-Netz (solve_robust Output) übernommen
-      und im Dispatch-Netz fixiert:
-        * Alle extendable-Flags werden auf False gesetzt.
-        * Nennkapazitäten werden auf die optimierten Werte p_nom_opt / s_nom_opt / e_nom_opt gesetzt.
-        * Falls p_nom_opt NaN oder Asset nicht in Portfolio: Kapazität = 0 (nicht gebaut).
-      Dadurch gibt es im Dispatch keine Investitionsvariablen.
+[NEU-2]  Gap-basierte Konvergenzterminierung
+    Terminierungskriterium: ARO konvergiert wenn
+        gap = (worst_all - worst_in_set) / max(1, |worst_all|) < --convergence-tol
+    Dieses Gap misst wie viel teurer der schlechteste noch-nicht-im-Set-Cutout
+    gegenüber dem schlechtesten bereits-im-Set-Cutout ist.
+    Default: 1e-4 (0.01 % relative Kostenlücke).
+    Auf 0.0 setzen um nur das klassische "worst in set"-Kriterium zu verwenden.
 
-A3) Objective für Dispatch-only Evaluation
-    - Es wird die PyPSA-interne Objective verwendet (n.optimize() ohne objective override).
-    - Voraussetzung dafür: KEINE extendable Assets (A2) und damit keine Investitionsvariablen.
-      Dann reduziert sich die Objective auf (gewichtete) variable Kosten + ggf. last shedding.
-    - Zusätzlich wird die annualisierte Investitionskosten-Summe aus dem Portfolio
-      (capital_cost * p_nom_opt / e_nom_opt / s_nom_opt) als konstante Komponente addiert.
-      Diese Investitionskosten sind scenario-unabhängig und gehören zur Gesamtbewertung,
-      wenn man Worst-Case Gesamtkosten über Cutouts vergleichen will.
-
-A4) Multi-snapshot / Stacked Snapshots
-    - Für einzelne Cutouts verwenden wir dennoch die solve_robust.stack_scenarios_to_multisnapshot_network
-      Infrastruktur, um exakt dieselben Hilfsfunktionen für:
-        * scenario boundary constraints (cyclic SOC je Szenario)
-        * ramp constraints "within scenario"
-      zu nutzen und Cross-Scenario-Artefakte zu vermeiden.
-
-A5) Storage cyclic constraints
-    - PyPSA's globale cyclic SOC wird deaktiviert, da sie bei stacked snapshots
-      physikalisch falsche Kopplungen zwischen Szenarien erzeugt.
-    - Stattdessen fügen wir per-scenario boundary constraints (solve_robust helper) hinzu.
-
-A6) Feasibility / Load shedding
-    - Für Dispatch-Evaluation fügen wir load-shedding Generatoren hinzu (idempotent),
-      um Infeasibility zu vermeiden. Das stellt sicher, dass wir immer eine Lösung bekommen,
-      und die Kosten (inkl. LS-Penalty) sind dann aussagekräftig.
-
-A7) Kostenkonsistenz zwischen solve_robust und Dispatch
-    - Wir verwenden in Dispatch die PyPSA-interne Objective.
-    - Wenn solve_robust zusätzliche Kostenmodi (z.B. CO2) ein-/ausschaltet, müssen die
-      zugrundeliegenden Netzwerkspezifikationen konsistent sein (carrier costs, marginal_cost etc.).
-      Dieses Skript verändert keine Kostendaten, es übernimmt die Netzwerke "as is".
-
-A8) Solver Objective Value Extraction
-    - Je nach PyPSA/Linopy-Version ist die Objective-Zahl an unterschiedlichen Attributen verfügbar.
-      Wir extrahieren robust aus:
-        * model.objective_value
-        * model.objective.value
-        * model.solver_model.ObjVal (Gurobi)
-      Falls nichts verfügbar: Fehler.
-
-----------------------------------------------------------------------
+[NEU-3]  --ls-penalty weitergereicht
+    Das in solve_robust neu eingeführte --ls-penalty (PATCH-5) wird als CLI-Parameter
+    in solve_aro exposiert und an beide Subprocess-Aufrufe sowie evaluate_all_cutouts
+    weitergegeben, damit LS-Penalty in Robust-Solve und Dispatch-Evaluation identisch sind.
 """
 
+from __future__ import annotations
+
 import argparse
+import concurrent.futures
 import json
 import logging
-import subprocess
-import sys
-from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
-
-import pandas as pd
-import pypsa
-import uuid
 import os
 import shutil
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import pypsa
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------
-# Import solve_robust helpers
-# ---------------------------------------------------------------------
+
+# =============================================================================
+# Import solve_robust
+# =============================================================================
+
 try:
     import scripts.solve_robust as solve_robust  # type: ignore
 except ImportError:
     try:
         import solve_robust as solve_robust  # type: ignore  # noqa
-    except ImportError as e:
+    except ImportError as exc:
         raise ImportError(
-            "Could not import solve_robust. Make sure solve_robust.py is either in "
-            "the 'scripts/' subdirectory or in the same directory as solve_aro.py."
-        ) from e
+            "Could not import solve_robust. Ensure solve_robust.py is in 'scripts/' "
+            "or the same directory as solve_aro.py."
+        ) from exc
+
 
 # =============================================================================
-# Subprocess helper
+# I/O helpers
 # =============================================================================
 
-def run_subprocess(cmd: List[str]) -> None:
-    """
-    Run a subprocess, stream output for transparency, and error out on non-zero return code.
-    """
-    logger.info("Running command: %s", " ".join(cmd))
-    # Stream stdout/stderr to console. This is much better for debugging solver logs.
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
-        raise RuntimeError(f"Command failed with code {result.returncode}: {' '.join(cmd)}")
-
-def atomic_copy(src: str, dst: str) -> None:
-    src_p = Path(src)
+def _atomic_copy(src: str, dst: str) -> None:
     dst_p = Path(dst)
     dst_p.parent.mkdir(parents=True, exist_ok=True)
-
     tmp = dst_p.with_name(dst_p.name + f".tmp.{uuid.uuid4().hex}")
-    shutil.copyfile(str(src_p), str(tmp))
+    shutil.copyfile(str(src), str(tmp))
     os.replace(str(tmp), str(dst_p))
 
-def export_netcdf_atomic(n: pypsa.Network, out_path: str) -> None:
-    out = Path(out_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
 
-    tmp = out.with_name(out.name + f".tmp.{uuid.uuid4().hex}")
-    # write
-    n.export_to_netcdf(str(tmp))
-    # atomic replace
-    os.replace(str(tmp), str(out))
+def _run_subprocess(cmd: List[str]) -> None:
+    logger.info("Running: %s", " ".join(cmd))
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        raise RuntimeError(f"Command failed (code {result.returncode}): {' '.join(cmd)}")
+
+
+def _solver_options_arg(solver_options: Optional[Dict]) -> str:
+    return json.dumps(solver_options) if solver_options is not None else "null"
+
+
+def _resolve_std_network_path(robust_out_network: str) -> str:
+    """Return the path of the standard-adapter auto-generated by solve_robust.run_robust."""
+    return str(Path(robust_out_network).with_suffix("")) + "__std.nc"
+
+
+# =============================================================================
+# [NEU-1] Dispatch worker — top-level function, must be picklable
+# =============================================================================
+
+def _dispatch_worker_fn(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Top-level worker function for ProcessPoolExecutor.
+
+    Must be a module-level function (not a lambda or closure) to be picklable
+    on all platforms (especially 'spawn' start method on macOS/Windows).
+
+    Delegates directly to solve_robust.evaluate_single_cutout_dispatch which
+    contains all the actual logic — no solve_aro import needed in the worker.
+
+    Parameters
+    ----------
+    kwargs : dict passed through to evaluate_single_cutout_dispatch.
+
+    Returns
+    -------
+    Result dict from evaluate_single_cutout_dispatch.
+    """
+    # Re-configure logging in the worker process (spawned processes don't
+    # inherit the parent's logging handlers on all platforms).
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [worker] %(name)s: %(message)s",
+    )
+    cutout = kwargs.get("cutout", "?")
+    logger.info("Worker starting for cutout '%s'.", cutout)
+    try:
+        result = solve_robust.evaluate_single_cutout_dispatch(**kwargs)
+        logger.info("Worker finished for cutout '%s' (total_cost=%.6g).",
+                    cutout, result.get("total_cost", float("nan")))
+        return result
+    except Exception as exc:
+        logger.error("Worker FAILED for cutout '%s': %s", cutout, exc, exc_info=True)
+        raise
+
+
+# =============================================================================
+# [NEU-1] Parallelised dispatch evaluation
+# =============================================================================
+
+def evaluate_all_cutouts(
+        portfolio_path: str,
+        cutouts: Sequence[str],
+        scenario_template: str,
+        solver_name: str,
+        solver_options: Optional[Dict],
+        dispatch_tmp_dir: str,
+        *,
+        cost_consistency_tol: float = 0.01,
+        co2_cost_mode: str = "off",
+        ls_penalty: float = 1e4,
+        workers: int = 0,
+) -> Tuple[Dict[str, float], Dict[str, str], Dict[str, str]]:
+    """
+    Evaluate a fixed portfolio on each cutout in parallel.
+
+    Total cost per cutout:
+        total_cost(c) = investment_cost(portfolio) + dispatch_cost(c | fixed portfolio)
+
+    [NEU-1] Parallelisation:
+        Each cutout is dispatched as an independent task to a ProcessPoolExecutor.
+        The worker function (_dispatch_worker_fn) is a top-level function and
+        therefore picklable on all platforms.
+        workers=0 (default) → min(len(cutouts), os.cpu_count() or 1).
+        workers=1 → sequential execution (no subprocess overhead, good for debugging).
+
+    [NEU-3] ls_penalty forwarded to each worker.
+
+    Parameters
+    ----------
+    workers : int
+        Number of parallel worker processes. 0 = auto (one per cutout, up to cpu_count).
+
+    Returns
+    -------
+    costs              : Dict[str, float] — total cost per cutout.
+    dispatch_paths     : Dict[str, str]  — flat-snapshot NetCDF per cutout.
+    dispatch_std_paths : Dict[str, str]  — DatetimeIndex NetCDF per cutout.
+    """
+    if not cutouts:
+        raise ValueError("evaluate_all_cutouts: empty cutouts list.")
+
+    Path(dispatch_tmp_dir).mkdir(parents=True, exist_ok=True)
+
+    # Investment cost is scenario-independent — compute once before parallelism
+    port_net = pypsa.Network(str(Path(portfolio_path)))
+    investment_cost = solve_robust._compute_portfolio_investment_cost(port_net)
+    logger.info("Fixed portfolio investment cost: %.6g €/a", investment_cost)
+    del port_net  # free memory before spawning workers
+
+    n_workers = workers if workers > 0 else min(len(cutouts), os.cpu_count() or 1)
+    logger.info(
+        "Dispatch evaluation: %d cutout(s) with %d worker(s).",
+        len(cutouts), n_workers,
+    )
+
+    # Build per-cutout kwargs dicts for the worker
+    job_kwargs = [
+        {
+            "cutout": c,
+            "portfolio_path": portfolio_path,
+            "scen_net_path": scenario_template.format(cutout=c),
+            "solver_name": solver_name,
+            "solver_options": solver_options,
+            "dispatch_tmp_dir": dispatch_tmp_dir,
+            "investment_cost": investment_cost,
+            "cost_consistency_tol": cost_consistency_tol,
+            "co2_cost_mode": co2_cost_mode,
+            "ls_penalty": ls_penalty,
+        }
+        for c in cutouts
+    ]
+
+    results: List[Dict[str, Any]] = []
+
+    if n_workers == 1:
+        # Sequential path — avoids ProcessPoolExecutor overhead for single workers
+        # and is easier to debug (stack traces are direct, not wrapped in Future).
+        logger.info("Running dispatch evaluation sequentially (workers=1).")
+        for kw in job_kwargs:
+            results.append(_dispatch_worker_fn(kw))
+    else:
+        # Parallel path
+        futures_map: Dict[concurrent.futures.Future, str] = {}
+        with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as pool:
+            for kw in job_kwargs:
+                fut = pool.submit(_dispatch_worker_fn, kw)
+                futures_map[fut] = kw["cutout"]
+
+            for fut in concurrent.futures.as_completed(futures_map):
+                c = futures_map[fut]
+                try:
+                    results.append(fut.result())
+                except Exception as exc:
+                    # Propagate with context so the outer loop knows which cutout failed
+                    raise RuntimeError(
+                        f"Dispatch evaluation FAILED for cutout '{c}'."
+                    ) from exc
+
+    # Aggregate results
+    costs: Dict[str, float] = {}
+    dispatch_paths: Dict[str, str] = {}
+    dispatch_std_paths: Dict[str, str] = {}
+
+    for r in results:
+        c = r["cutout"]
+        costs[c] = r["total_cost"]
+        dispatch_paths[c] = r["flat_path"]
+        dispatch_std_paths[c] = r["std_path"]
+
+        if not r["consistency"].get("consistent"):
+            logger.warning(
+                "Cutout '%s': cost-consistency check FAILED "
+                "(dispatch=%.6g manual=%.6g rel_diff=%.3f%%).",
+                c,
+                r["consistency"].get("pypsa_objective", float("nan")),
+                r["consistency"].get("manual_cost", float("nan")),
+                (r["consistency"].get("rel_diff") or 0.0) * 100,
+            )
+
+    return costs, dispatch_paths, dispatch_std_paths
+
 
 # =============================================================================
 # CLI
 # =============================================================================
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Iterativer ARO-Workflow über Cutouts")
-    p.add_argument(
-        "--cutouts",
-        nargs="+",
-        required=True,
-        help="Liste aller verfügbaren Cutouts (z.B. cutout_X cutout_Y ...)",
+    p = argparse.ArgumentParser(
+        description="Iterativer ARO-Workflow über Cutouts",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    p.add_argument("--cutouts", nargs="+", required=True,
+                   help="Liste aller verfügbaren Cutouts.")
+    p.add_argument("--scenario-network-template", required=True,
+                   help="Pfadvorlage, z.B. networks/prepared_{cutout}.nc")
+    p.add_argument("--initial-scenarios", nargs="+", required=True,
+                   help="Anfangsszenarien (Subset von --cutouts).")
+    p.add_argument("--max-iter", type=int, default=5,
+                   help="Maximale Anzahl ARO-Iterationen.")
+    p.add_argument("--out-network", required=True,
+                   help="Finales robustes Portfolio-Netz (.nc).")
+    p.add_argument("--out-summary-json", required=True,
+                   help="ARO-Zusammenfassung (.json).")
+    p.add_argument("--solver-name", default="gurobi")
+    p.add_argument("--solver-options-json", default=None,
+                   help="JSON-String mit Solver-Optionen.")
+    p.add_argument("--eps-ls", type=float, default=1e-6,
+                   help="LS-Toleranz für solve_robust (--eps-ls-abs).")
+
+    # Outputs
+    p.add_argument("--out-std-network", default=None,
+                   help="[FIX-3] Standard-Adapter des Portfolios (DatetimeIndex NetCDF).")
+    p.add_argument("--out-dispatch-network", default=None,
+                   help="[FIX-1] Worst-Case-Dispatch (flat-snapshot NetCDF).")
+    p.add_argument("--out-dispatch-std", default=None,
+                   help="[FIX-1] Worst-Case-Dispatch (DatetimeIndex NetCDF).")
+    p.add_argument("--dispatch-tmp-dir", default=None,
+                   help="Verzeichnis für temporäre Dispatch-Netze.")
+
+    # Cost consistency
+    p.add_argument("--cost-consistency-tol", type=float, default=0.01,
+                   help="[FIX-2] Relative Toleranz für Kostenkonsistenz-Prüfung (Default: 1%%).")
+
+    # CO2 mode
     p.add_argument(
-        "--scenario-network-template",
-        required=True,
-        help="Pfadvorlage für vorbereitete Netzwerke, z.B. networks/prepared_{cutout}.nc",
+        "--co2-cost-mode",
+        choices=["off", "global_constraint_constant_cost"],
+        default="off",
+        help=(
+            "[FIX-CO2] CO2-Kostenmodus, identisch zu solve_robust --co2-cost-mode. "
+            "Wird an Subprocess-Aufrufe UND Dispatch-Evaluation weitergereicht."
+        ),
     )
+
+    # [NEU-3] LS penalty — forwarded to both solve_robust subprocess and dispatch eval
     p.add_argument(
-        "--initial-scenarios",
-        nargs="+",
-        required=True,
-        help="Liste der Anfangsszenarien für den ARO-Loop (Subset von --cutouts).",
+        "--ls-penalty", type=float, default=1e4,
+        help=(
+            "[NEU-3] Load-shedding Strafkosten in €/MWh (Default: 1e4). "
+            "Muss höher sein als alle echten Generator-Grenzkosten. "
+            "Wird identisch an solve_robust (--ls-penalty) und Dispatch-Evaluation "
+            "weitergegeben, damit beide Phasen konsistente Preissignale haben."
+        ),
     )
+
+    # [NEU-1] Parallelisation
     p.add_argument(
-        "--max-iter",
-        type=int,
-        default=5,
-        help="Maximale Anzahl an Iterationen im ARO-Loop",
+        "--dispatch-workers", type=int, default=0,
+        help=(
+            "[NEU-1] Parallele Worker-Prozesse für Dispatch-Evaluation. "
+            "0 = automatisch (min(cutouts, cpu_count)). "
+            "1 = sequenziell (kein Multiprocessing, gut für Debugging)."
+        ),
     )
+
+    # [NEU-2] Gap-based convergence
     p.add_argument(
-        "--out-network",
-        required=True,
-        help="Datei für das finale robuste Netz (.nc)",
+        "--convergence-tol", type=float, default=1e-4,
+        help=(
+            "[NEU-2] Relative Gap-Toleranz für Konvergenz. "
+            "ARO terminiert wenn "
+            "(worst_all_cutouts - worst_in_set) / |worst_all| < tol. "
+            "Misst wie viel teurer der schlimmste noch-nicht-im-Set-Cutout "
+            "gegenüber dem schlimmsten im-Set-Cutout ist. "
+            "Default: 1e-4 (0.01%%). Auf 0.0 setzen für reines 'worst-in-set'-Kriterium."
+        ),
     )
-    p.add_argument(
-        "--out-summary-json",
-        required=True,
-        help="Datei für die Zusammenfassung des ARO-Workflows (.json)",
-    )
-    p.add_argument(
-        "--solver-name",
-        default="gurobi",
-        help="Name des LP/MILP-Solvers (z. B. gurobi, highs, cbc)",
-    )
-    p.add_argument(
-        "--solver-options-json",
-        default=None,
-        help="JSON-String mit Solver-Optionen für PyPSA/Linopy (z.B. '{\"threads\":8}')",
-    )
-    p.add_argument(
-        "--eps-ls",
-        type=float,
-        default=1e-6,
-        help="Toleranz für z_ls in solve_robust (Stage 2), wird als --eps-ls-abs weitergereicht",
-    )
-    p.add_argument(
-        "--out-std-network",
-        default=None,
-        help="Optional: Datei für ein 'standard' Netz (.nc), z.B. single-scenario Adapter für Postprocess.",
-    )
+
     return p.parse_args()
 
 
-def load_network(network_path: str) -> pypsa.Network:
-    p = Path(network_path)
-    if not p.exists():
-        raise FileNotFoundError(f"Network file not found: {network_path}")
-    return pypsa.Network(str(p))
-
-
 # =============================================================================
-# Dispatch-only evaluation helpers
+# [NEU-2] Gap computation
 # =============================================================================
 
-# Mapping: (component, opt capacity column, nominal capacity column, extendable flag column)
-_CAPACITY_MAP: List[Tuple[str, str, str, str]] = [
-    ("generators",    "p_nom_opt", "p_nom",  "p_nom_extendable"),
-    ("links",         "p_nom_opt", "p_nom",  "p_nom_extendable"),
-    ("storage_units", "p_nom_opt", "p_nom",  "p_nom_extendable"),
-    ("stores",        "e_nom_opt", "e_nom",  "e_nom_extendable"),
-    ("lines",         "s_nom_opt", "s_nom",  "s_nom_extendable"),
-    ("transformers",  "s_nom_opt", "s_nom",  "s_nom_extendable"),
-]
-
-
-def _fix_portfolio_capacities(n: pypsa.Network, port_net: pypsa.Network) -> None:
+def _compute_aro_gap(
+        all_costs: Dict[str, float],
+        current_set: List[str],
+) -> Tuple[float, float, float]:
     """
-    Transfer optimized capacities from the portfolio network to a dispatch network and
-    force all assets to non-extendable.
+    Compute the relative optimality gap for ARO convergence.
 
-    - Assets present in both: set capacity = opt (NaN -> 0)
-    - Assets only in dispatch network: capacity = 0
-    - If portfolio lacks this component / opt column: capacity = 0 for all
-    - Force extendable flags to False for all covered components
+    Gap = (worst_total - worst_in_set) / max(1, |worst_total|)
+
+    Where:
+      worst_total    = max cost across ALL cutouts (outer adversarial problem)
+      worst_in_set   = max cost across cutouts ALREADY in the scenario set
+                       (= the cost the current robust portfolio was designed for)
+
+    Interpretation:
+      gap ≈ 0  →  the worst cutout overall is already well-represented in the set.
+      gap ≈ 1  →  there is a cutout ~100% more expensive than anything in the set.
+
+    Returns
+    -------
+    (gap, worst_total, worst_in_set)
     """
-    for comp, attr_opt, attr_cap, attr_ext in _CAPACITY_MAP:
-        df_new = getattr(n, comp, None)
-        df_old = getattr(port_net, comp, None)
-        if df_new is None or len(df_new) == 0:
-            continue
+    if not all_costs:
+        return float("nan"), float("nan"), float("nan")
 
-        # Force non-extendable if possible
-        if attr_ext in df_new.columns:
-            df_new[attr_ext] = False
+    worst_total = max(all_costs.values())
 
-        if df_old is None or attr_opt not in getattr(df_old, "columns", []):
-            # No portfolio info -> zero out all
-            if attr_cap in df_new.columns:
-                df_new[attr_cap] = 0.0
-            continue
+    in_set_costs = {c: v for c, v in all_costs.items() if c in set(current_set)}
+    worst_in_set = max(in_set_costs.values()) if in_set_costs else float("-inf")
 
-        common = df_new.index.intersection(df_old.index)
-        only_in_new = df_new.index.difference(df_old.index)
-
-        if attr_cap in df_new.columns and len(only_in_new) > 0:
-            df_new.loc[only_in_new, attr_cap] = 0.0
-
-        if attr_cap in df_new.columns and len(common) > 0:
-            opt_vals = df_old.loc[common, attr_opt].fillna(0.0).astype(float)
-            df_new.loc[common, attr_cap] = opt_vals
-
-
-def _assert_no_extendables(n: pypsa.Network) -> None:
-    """
-    Defensive check: ensure there are no extendable flags left True in the components we manage.
-    If this fails, PyPSA may add investment variables/costs, and dispatch objective isn't "pure dispatch".
-    """
-    for comp, _attr_opt, _attr_cap, attr_ext in _CAPACITY_MAP:
-        df = getattr(n, comp, None)
-        if df is None or len(df) == 0:
-            continue
-        if attr_ext not in df.columns:
-            continue
-        mask = df[attr_ext].fillna(False).astype(bool)
-        if mask.any():
-            bad = df.index[mask].tolist()[:10]
-            raise RuntimeError(f"{comp}: still extendable assets detected (e.g. {bad}).")
-
-
-def _compute_portfolio_investment_cost(port_net: pypsa.Network) -> float:
-    """
-    Compute scenario-independent annualized investment cost of the optimized portfolio:
-    sum(capital_cost * capacity_opt) over all assets with capacity_opt > 0.
-    """
-    total = 0.0
-    for comp, attr_opt, _attr_cap, _attr_ext in _CAPACITY_MAP:
-        df = getattr(port_net, comp, None)
-        if df is None or len(df) == 0:
-            continue
-        if "capital_cost" not in df.columns or attr_opt not in df.columns:
-            continue
-
-        cap = df[attr_opt].fillna(0.0).astype(float)
-        invested = cap > 0.0
-        if not invested.any():
-            continue
-
-        cc = df.loc[invested, "capital_cost"].fillna(0.0).astype(float)
-        total += float((cc * cap[invested]).sum())
-
-    return float(total)
-
-
-def _extract_objective_value(n: pypsa.Network) -> float:
-    """
-    Robustly extract objective value from PyPSA/Linopy model after n.optimize().
-    Supports multiple versions/backends.
-    """
-    model = getattr(n, "model", None)
-    if model is None:
-        raise RuntimeError("n.model is None after optimize().")
-
-    # 1) linopy model: objective_value (some versions)
-    obj = getattr(model, "objective_value", None)
-    if obj is not None:
-        return float(obj)
-
-    # 2) linopy model: objective.value (other versions)
-    try:
-        return float(model.objective.value)  # type: ignore[attr-defined]
-    except Exception:
-        pass
-
-    # 3) solver backend (e.g. gurobi)
-    sm = getattr(model, "solver_model", None)
-    if sm is not None:
-        try:
-            return float(sm.ObjVal)
-        except Exception:
-            pass
-
-    raise RuntimeError("Could not extract objective value from model (unknown PyPSA/Linopy API).")
-
-
-def _dispatch_solve(
-    n: pypsa.Network,
-    solver_name: str,
-    solver_options: Optional[Dict],
-    ramp_data: pd.DataFrame,
-    scenarios: List[str],
-    masks: Dict,
-) -> float:
-    """
-    Dispatch-only solve with:
-    - no investment variables (all assets fixed non-extendable)
-    - per-scenario cyclic SOC constraints
-    - within-scenario ramp constraints
-    - load-shedding for feasibility
-
-    Returns: PyPSA internal objective value (dispatch cost incl. LS penalties).
-    """
-    # (A5) Disable global cyclic constraints if present
-    for comp in ("storage_units", "stores"):
-        df = getattr(n, comp, None)
-        if df is not None and len(df) > 0:
-            for col in ("cyclic_state_of_charge", "cyclic_state_of_charge_per_period"):
-                if col in df.columns:
-                    df[col] = False
-
-    # (A6) Ensure load shedding generators
-    solve_robust._ensure_load_shedding_generators(n)
-
-    # extra_functionality: scenario boundary + within-scenario ramps
-    def extra_dispatch(network: pypsa.Network, snapshots: pd.Index) -> None:
-        solve_robust._add_scenario_boundary_constraints(network, scenarios, masks)
-        solve_robust._add_within_scenario_ramp_constraints(
-            network,
-            scenarios,
-            masks,
-            ramp_data,
-            fail_on_extendable=False,  # dispatch has no extendables (asserted)
-        )
-        # IMPORTANT: No objective override -> PyPSA internal objective is used.
-
-    n.optimize(
-        solver_name=solver_name,
-        solver_options=solver_options if solver_options is not None else {},
-        extra_functionality=extra_dispatch,
-    )
-
-    # Status check (soft: rely on objective extraction; hard fail if clearly bad)
-    model = getattr(n, "model", None)
-    if model is None:
-        raise RuntimeError("n.model is None after optimize().")
-
-    status = str(getattr(model, "status", "unknown")).lower()
-    if any(t in status for t in ("infeasible", "unbounded", "error", "failed")):
-        raise RuntimeError(f"Dispatch solve failed with status '{status}'.")
-
-    return _extract_objective_value(n)
-
-
-def evaluate_all_cutouts(
-    portfolio_path: str,
-    cutouts: Sequence[str],
-    scenario_template: str,
-    solver_name: str,
-    solver_options: Optional[Dict],
-) -> Dict[str, float]:
-    """
-    Evaluate a fixed portfolio (from portfolio_path) on each cutout:
-      total_cost(c) = investment_cost(portfolio) + dispatch_cost(c | fixed portfolio)
-
-    Dispatch cost uses PyPSA internal objective (A3).
-    """
-    if not cutouts:
-        raise ValueError("evaluate_all_cutouts received an empty cutouts list.")
-
-    port_net = load_network(portfolio_path)
-    investment_cost = _compute_portfolio_investment_cost(port_net)
-    logger.info("Fixed portfolio investment cost: %.6g €/a", investment_cost)
-
-    costs: Dict[str, float] = {}
-
-    for c in cutouts:
-        logger.info("--- Evaluating cutout '%s' under fixed portfolio ---", c)
-        scen_net_path = scenario_template.format(cutout=c)
-        if not Path(scen_net_path).exists():
-            raise FileNotFoundError(f"Scenario network missing for cutout '{c}': {scen_net_path}")
-
-        # Build stacked network (single scenario) for consistent helpers (A4)
-        n, _ = solve_robust.stack_scenarios_to_multisnapshot_network([scen_net_path], [c])
-
-        # Fix capacities and ensure no extendables (A2, A3)
-        _fix_portfolio_capacities(n, port_net)
-        _assert_no_extendables(n)
-
-        # Prepare ramp data and scenario masks (A4)
-        ramp_data = solve_robust._save_and_clear_ramp_limits(n)
-        masks = solve_robust._scenario_masks_from_snapshots(n.snapshots)
-        scenarios = list(masks.keys())
-
-        op_cost = _dispatch_solve(n, solver_name, solver_options, ramp_data, scenarios, masks)
-        total_cost = float(investment_cost) + float(op_cost)
-
-        logger.info(
-            "Cutout '%s': op_cost=%.6g  inv_cost=%.6g  total=%.6g",
-            c, op_cost, investment_cost, total_cost,
-        )
-        costs[c] = float(total_cost)
-
-    return costs
-
-
-def _solver_options_arg(solver_options: Optional[Dict]) -> str:
-    """
-    Serialize solver options for passing to solve_robust.py via CLI JSON string.
-    - If solver_options is None -> "null" (so downstream can parse JSON)
-    - If solver_options is {} -> "{}" (forward empty dict explicitly)
-    """
-    return json.dumps(solver_options) if solver_options is not None else "null"
+    gap = (worst_total - worst_in_set) / max(1.0, abs(worst_total))
+    return float(gap), float(worst_total), float(worst_in_set)
 
 
 # =============================================================================
@@ -461,53 +420,71 @@ def _solver_options_arg(solver_options: Optional[Dict]) -> str:
 # =============================================================================
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     args = parse_args()
 
-    cutouts = list(args.cutouts)
+    cutouts = list(dict.fromkeys(args.cutouts))  # dedup, preserve order
     scenario_template = args.scenario_network_template
+    co2_cost_mode: str = args.co2_cost_mode
+    ls_penalty: float = args.ls_penalty
 
-    robust_solver_script = Path(__file__).with_name("solve_robust.py")
-    if not robust_solver_script.exists():
-        # also allow scripts/solve_robust.py next to repo root
+    # Locate solve_robust.py script (for subprocess calls)
+    robust_script = Path(__file__).with_name("solve_robust.py")
+    if not robust_script.exists():
         alt = Path(__file__).resolve().parent / "solve_robust.py"
         if alt.exists():
-            robust_solver_script = alt
+            robust_script = alt
         else:
-            raise FileNotFoundError(f"Could not locate robust solver script at {robust_solver_script}")
+            raise FileNotFoundError(f"Could not locate solve_robust.py near {__file__}.")
 
     solver_name = args.solver_name
     solver_options: Optional[Dict] = None
     if args.solver_options_json:
         solver_options = json.loads(args.solver_options_json)
 
-    initial = list(args.initial_scenarios)
-    if any(x not in cutouts for x in initial):
-        missing = [x for x in initial if x not in cutouts]
-        raise ValueError(f"Initial scenarios not among cutouts: {missing}")
+    initial = list(dict.fromkeys(args.initial_scenarios))
+    unknown = [x for x in initial if x not in set(cutouts)]
+    if unknown:
+        raise ValueError(f"Initial scenarios not in --cutouts: {unknown}")
 
-    # Deduplicate while preserving order
-    initial_set = list(dict.fromkeys(initial))
-    current_set = initial_set.copy()
+    current_set = initial.copy()
+    remaining = [c for c in cutouts if c not in set(current_set)]
 
-    # remaining = all cutouts not in current_set (dedup preserve)
-    remaining = [c for c in dict.fromkeys(cutouts) if c not in set(current_set)]
+    dispatch_tmp_base = (
+        args.dispatch_tmp_dir
+        or str(Path(args.out_network).parent / "_dispatch_tmp")
+    )
 
     iteration = 0
     history: List[Dict] = []
+    convergence_reason: Optional[str] = None
+
+    # =========================================================================
+    # ARO iteration loop
+    # =========================================================================
 
     while iteration < args.max_iter and remaining:
         iteration += 1
-        logger.info("=== ARO Iteration %d ===", iteration)
-        logger.info("Current scenario set: %s", current_set)
+        logger.info(
+            "=== ARO Iteration %d / %d  |  scenarios=%d  co2_mode=%s  ls_penalty=%.4g ===",
+            iteration, args.max_iter, len(current_set), co2_cost_mode, ls_penalty,
+        )
+        logger.info("Active scenario set: %s", current_set)
 
         tmp_net = str(Path(args.out_network).with_suffix("")) + f"_iter{iteration}.nc"
         tmp_sum = str(Path(args.out_summary_json).with_suffix("")) + f"_iter{iteration}.json"
+        dispatch_tmp_iter = str(Path(dispatch_tmp_base) / f"iter{iteration}")
 
-        # (1) Robust portfolio solve for current_set
+        # ------------------------------------------------------------------
+        # Step 1: Robust-Solve
+        # ------------------------------------------------------------------
+        logger.info("[Iter %d] Step 1: Robust-Solve over %s", iteration, current_set)
+        # [NEU-3] --ls-penalty forwarded | [FIX-CO2] --co2-cost-mode forwarded
         cmd = [
-            sys.executable,
-            str(robust_solver_script),
+            sys.executable, str(robust_script),
             "--cutouts", *current_set,
             "--scenario-network-template", scenario_template,
             "--out-network", tmp_net,
@@ -515,50 +492,109 @@ def main() -> None:
             "--solver-name", solver_name,
             "--solver-options-json", _solver_options_arg(solver_options),
             "--eps-ls-abs", str(args.eps_ls),
+            "--co2-cost-mode", co2_cost_mode,
+            "--ls-penalty", str(ls_penalty),
         ]
-        run_subprocess(cmd)
+        _run_subprocess(cmd)
 
         if not Path(tmp_net).exists():
-            raise RuntimeError(
-                f"Robust solver subprocess exited successfully but did not produce network file: {tmp_net}"
-            )
+            raise RuntimeError(f"Robust solver did not produce: {tmp_net}")
 
-        # (2) Evaluate fixed portfolio on all cutouts
-        all_costs = evaluate_all_cutouts(
+        # ------------------------------------------------------------------
+        # Step 2: Dispatch-Evaluation (parallelised)
+        # ------------------------------------------------------------------
+        logger.info(
+            "[Iter %d] Step 2: Dispatch-Evaluation over %d cutouts (workers=%d)",
+            iteration, len(cutouts), args.dispatch_workers,
+        )
+        # [NEU-1] parallel  |  [NEU-3] ls_penalty  |  [FIX-CO2] co2_cost_mode
+        all_costs, iter_dispatch_paths, iter_dispatch_std_paths = evaluate_all_cutouts(
             portfolio_path=tmp_net,
             cutouts=cutouts,
             scenario_template=scenario_template,
             solver_name=solver_name,
             solver_options=solver_options,
+            dispatch_tmp_dir=dispatch_tmp_iter,
+            cost_consistency_tol=args.cost_consistency_tol,
+            co2_cost_mode=co2_cost_mode,
+            ls_penalty=ls_penalty,
+            workers=args.dispatch_workers,
         )
 
         if not all_costs:
-            raise RuntimeError("evaluate_all_cutouts returned empty costs dict unexpectedly.")
+            raise RuntimeError("evaluate_all_cutouts returned empty costs dict.")
 
-        worst_cutout = max(all_costs, key=all_costs.get)
-        history.append(
-            {
-                "iteration": int(iteration),
-                "current_set": list(current_set),
-                "all_costs": {k: float(v) for k, v in all_costs.items()},
-                "worst_cutout": str(worst_cutout),
-            }
+        worst_cutout = max(all_costs, key=all_costs.__getitem__)
+        worst_cost = all_costs[worst_cutout]
+
+        # [NEU-2] Gap computation
+        gap, worst_total, worst_in_set = _compute_aro_gap(all_costs, current_set)
+
+        logger.info(
+            "[Iter %d] Costs: %s",
+            iteration,
+            "  ".join(f"{c}={v:.3e}" for c, v in sorted(all_costs.items())),
+        )
+        logger.info(
+            "[Iter %d] worst_all='%s' (%.6g)  worst_in_set=%.6g  gap=%.4f%%",
+            iteration, worst_cutout, worst_total, worst_in_set, gap * 100,
         )
 
+        history.append({
+            "iteration": int(iteration),
+            "current_set": list(current_set),
+            "all_costs": {k: float(v) for k, v in all_costs.items()},
+            "worst_cutout": str(worst_cutout),
+            "worst_cost": float(worst_cost),
+            "worst_in_set": float(worst_in_set),
+            "aro_gap": float(gap),
+            "convergence_tol": float(args.convergence_tol),
+            "robust_network": str(tmp_net),
+            "co2_cost_mode": co2_cost_mode,
+            "ls_penalty": ls_penalty,
+        })
+
+        # ------------------------------------------------------------------
+        # Step 3: Convergence check
+        # ------------------------------------------------------------------
+
+        # Criterion A: worst-case already in scenario set
         if worst_cutout in current_set:
-            logger.info("Worst-case cutout '%s' already in scenario set; converged.", worst_cutout)
+            convergence_reason = f"worst_cutout='{worst_cutout}' already in scenario set"
+            logger.info("[Iter %d] CONVERGED (A): %s.", iteration, convergence_reason)
             break
 
-        logger.info("Adding worst-case cutout '%s' to scenario set.", worst_cutout)
+        # [NEU-2] Criterion B: gap below tolerance
+        if args.convergence_tol > 0 and gap < args.convergence_tol:
+            convergence_reason = (
+                f"gap={gap:.6f} < convergence_tol={args.convergence_tol} "
+                f"(worst_all='{worst_cutout}' cost={worst_total:.6g}, "
+                f"worst_in_set={worst_in_set:.6g})"
+            )
+            logger.info("[Iter %d] CONVERGED (B): %s.", iteration, convergence_reason)
+            break
+
+        logger.info("[Iter %d] Adding '%s' to scenario set.", iteration, worst_cutout)
         current_set.append(worst_cutout)
         if worst_cutout in remaining:
             remaining.remove(worst_cutout)
 
-    # Final robust solve on converged set
-    logger.info("=== Final robust optimisation with scenarios: %s ===", current_set)
+    else:
+        if not remaining:
+            convergence_reason = "all cutouts exhausted — full robustness achieved"
+            logger.info("All cutouts in scenario set.")
+        else:
+            convergence_reason = f"max_iter={args.max_iter} reached without convergence"
+            logger.warning("ARO reached max_iter=%d without convergence.", args.max_iter)
+
+    # =========================================================================
+    # Final robust solve
+    # =========================================================================
+
+    logger.info("=== Final robust solve (scenarios: %s) ===", current_set)
+    # [NEU-3] --ls-penalty  |  [FIX-CO2] --co2-cost-mode
     final_cmd = [
-        sys.executable,
-        str(robust_solver_script),
+        sys.executable, str(robust_script),
         "--cutouts", *current_set,
         "--scenario-network-template", scenario_template,
         "--out-network", args.out_network,
@@ -566,15 +602,83 @@ def main() -> None:
         "--solver-name", solver_name,
         "--solver-options-json", _solver_options_arg(solver_options),
         "--eps-ls-abs", str(args.eps_ls),
+        "--co2-cost-mode", co2_cost_mode,
+        "--ls-penalty", str(ls_penalty),
     ]
-    run_subprocess(final_cmd)
+    _run_subprocess(final_cmd)
+
+    if not Path(args.out_network).exists():
+        raise RuntimeError(f"Final robust solver did not produce: {args.out_network}")
+
+    # =========================================================================
+    # [FIX-4] Final evaluation: true worst-case under final portfolio
+    # =========================================================================
+
+    logger.info("=== Final evaluation: %d cutouts under final portfolio ===", len(cutouts))
+    dispatch_tmp_final = str(Path(dispatch_tmp_base) / "final")
+
+    # [NEU-1] parallel  |  [NEU-3] ls_penalty  |  [FIX-CO2] co2_cost_mode
+    final_costs, final_dispatch_paths, final_dispatch_std_paths = evaluate_all_cutouts(
+        portfolio_path=args.out_network,
+        cutouts=cutouts,
+        scenario_template=scenario_template,
+        solver_name=solver_name,
+        solver_options=solver_options,
+        dispatch_tmp_dir=dispatch_tmp_final,
+        cost_consistency_tol=args.cost_consistency_tol,
+        co2_cost_mode=co2_cost_mode,
+        ls_penalty=ls_penalty,
+        workers=args.dispatch_workers,
+    )
+
+    worst_final = max(final_costs, key=final_costs.__getitem__)
+    worst_final_cost = final_costs[worst_final]
+    final_gap, final_worst_total, final_worst_in_set = _compute_aro_gap(final_costs, current_set)
+
+    logger.info(
+        "Final worst-case: '%s' (total cost = %.6g)  gap=%.4f%%",
+        worst_final, worst_final_cost, final_gap * 100,
+    )
+
+    # =========================================================================
+    # [FIX-1] Export worst-case dispatch networks
+    # =========================================================================
+
+    if args.out_dispatch_network:
+        src = final_dispatch_paths.get(worst_final)
+        if src and Path(src).exists():
+            _atomic_copy(src, args.out_dispatch_network)
+            logger.info("Worst-case dispatch (flat): → %s", args.out_dispatch_network)
+        else:
+            logger.error("Flat dispatch for '%s' not found at '%s'.", worst_final, src)
+
+    if args.out_dispatch_std:
+        src = final_dispatch_std_paths.get(worst_final)
+        if src and Path(src).exists():
+            _atomic_copy(src, args.out_dispatch_std)
+            logger.info("Worst-case dispatch (std): → %s", args.out_dispatch_std)
+        else:
+            logger.error("Std dispatch for '%s' not found at '%s'.", worst_final, src)
+
+    # =========================================================================
+    # [FIX-3] Standard-adapter for robust portfolio network
+    # =========================================================================
 
     if args.out_std_network:
-        # Minimaler, stabiler Adapter: std = Kopie des final robust network
-        atomic_copy(args.out_network, args.out_std_network)
-        logger.info("Wrote std network (atomic copy): %s", args.out_std_network)
+        auto_std = _resolve_std_network_path(args.out_network)
+        if Path(auto_std).exists():
+            _atomic_copy(auto_std, args.out_std_network)
+            logger.info("Portfolio std adapter: → %s", args.out_std_network)
+        else:
+            logger.error(
+                "[FIX-3] Expected std adapter not found: %s. "
+                "Check that solve_robust.py is the patched version.", auto_std,
+            )
 
-    # Append ARO history to summary JSON (non-destructive)
+    # =========================================================================
+    # Summary JSON
+    # =========================================================================
+
     try:
         with open(args.out_summary_json, "r") as f:
             summary = json.load(f)
@@ -583,12 +687,52 @@ def main() -> None:
 
     summary["aro_history"] = history
     summary["aro_final_scenarios"] = current_set
+    summary["aro_convergence"] = {
+        "reason": convergence_reason,
+        "iterations_run": iteration,
+        "max_iter": args.max_iter,
+        "convergence_tol": args.convergence_tol,
+    }
+    summary["aro_config"] = {
+        "co2_cost_mode": co2_cost_mode,
+        "ls_penalty": ls_penalty,
+        "dispatch_workers": args.dispatch_workers,
+    }
+    summary["aro_final_evaluation"] = {
+        "all_costs": {k: float(v) for k, v in final_costs.items()},
+        "worst_case_cutout": str(worst_final),
+        "worst_case_total_cost": float(worst_final_cost),
+        "aro_gap": float(final_gap),
+        "worst_in_set": float(final_worst_in_set),
+        "co2_cost_mode": co2_cost_mode,
+    }
+    summary["aro_outputs"] = {
+        "robust_portfolio_network": str(args.out_network),
+        "robust_portfolio_std_network": str(args.out_std_network) if args.out_std_network else None,
+        "worst_case_dispatch_network": str(args.out_dispatch_network) if args.out_dispatch_network else None,
+        "worst_case_dispatch_std_network": str(args.out_dispatch_std) if args.out_dispatch_std else None,
+    }
 
     with open(args.out_summary_json, "w") as f:
         json.dump(summary, f, indent=2)
 
-    logger.info("ARO completed. Final scenarios: %s", current_set)
+    logger.info("=== ARO completed ===")
+    logger.info("  Final scenario set:  %s", current_set)
+    logger.info("  Convergence:         %s", convergence_reason)
+    logger.info("  Iterations run:      %d / %d", iteration, args.max_iter)
+    logger.info("  Final gap:           %.4f%%", final_gap * 100)
+    logger.info("  Worst-case cutout:   %s (%.6g €/a)", worst_final, worst_final_cost)
+    logger.info("  CO2 cost mode:       %s", co2_cost_mode)
+    logger.info("  LS penalty:          %.4g €/MWh", ls_penalty)
+    logger.info("  Portfolio network:   %s", args.out_network)
+    if args.out_dispatch_network:
+        logger.info("  Dispatch network:    %s", args.out_dispatch_network)
+    logger.info("  Summary JSON:        %s", args.out_summary_json)
 
+
+# =============================================================================
+# Entry point guard — required for ProcessPoolExecutor on Windows/macOS (spawn)
+# =============================================================================
 
 if __name__ == "__main__":
     main()

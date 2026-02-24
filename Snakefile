@@ -27,9 +27,26 @@ if Path("config/config.yaml").exists():
 
     configfile: "config/config.yaml"
 
-MODE = (config.get("workflow", {}) or {}).get("mode", "plain").lower()
+# Auto-load overlay for nested subruns — ensures ALL sub-job levels get it via configfile: propagation
+_current_nested_file = Path("resources/robust_overlays/.current_nested_run")
+if _current_nested_file.exists():
+    try:
+        _nested_run_name = _current_nested_file.read_text().strip()
+        _nested_overlay_path = (Path("resources/robust_overlays") / f"overlay__{_nested_run_name}.yaml").resolve()
+        if _nested_overlay_path.exists():
+            configfile: str(_nested_overlay_path)
+    except Exception:
+        pass
+
+import sys
+import os
+_IS_NESTED_SUBRUN = "__cutout__" in config.get("run", {}).get("name", "")
+MODE = "plain" if _IS_NESTED_SUBRUN else (config.get("workflow", {}) or {}).get("mode", "plain").lower()
+
 if MODE not in {"plain", "robust", "aro"}:
     raise ValueError(f"Invalid workflow.mode={MODE!r} (expected plain|robust|aro)")
+
+
 
 
 
@@ -133,6 +150,18 @@ def _results_dir() -> Path:
 def _anchor_path() -> str:
     return str(_results_dir() / "networks" / "__robust_nested_anchor__.nc")
 
+def _anchor_path_input() -> str:
+    """
+    Return the first candidate source path — used as input dependency
+    so Snakemake waits for the solved network before running robust_nested_anchor.
+    """
+    clusters = _get_singleton_or_none("clusters")
+    opts = _norm(_get_singleton_or_none("opts"))
+    sector_opts = _norm(_get_singleton_or_none("sector_opts"))
+    ph = _norm(_get_singleton_or_none("planning_horizons"))
+    # Primary candidate — matches your repo's actual output name
+    return str(_results_dir() / "networks" / f"base_s_{clusters}_{opts}_{sector_opts}_{ph}.nc")
+
 def _candidate_sources() -> list[Path]:
     clusters = _get_singleton_or_none("clusters")
     opts = _norm(_get_singleton_or_none("opts"))
@@ -165,6 +194,7 @@ def _candidate_sources() -> list[Path]:
     if sector_opts:
         cands.append(base / f"sector_s_{clusters}_{opts}_{sector_opts}_{ph}.nc")
 
+
     # de-dup preserve order
     seen = set()
     uniq = []
@@ -184,36 +214,37 @@ rule robust_nested_anchor:
     output:
         anchor=_anchor_path()
     run:
+        from pathlib import Path
+
         anchor = Path(output.anchor)
-        anchor.parent.mkdir(parents=True, exist_ok=True)
+        anchor.parent.mkdir(parents=True,exist_ok=True)
 
         cands = _candidate_sources()
         if not cands:
-            raise ValueError(
-                "robust_nested_anchor requires singleton scenario lists "
-                "(clusters/opts/sector_opts/planning_horizons). "
-                "Your config['scenario'] appears to have multiple values, "
-                "so a wildcard-free anchor cannot be derived."
-            )
+            raise ValueError("robust_nested_anchor: keine Kandidaten gefunden")
 
-        src = next((p for p in cands if p.exists()), None)
+        # Warte bis eine Kandidatendatei existiert (solve_sector_network_myopic muss fertig sein)
+        import time
+
+        src = None
+        for _ in range(60):  # max 5 min warten
+            src = next((p for p in cands if p.exists()),None)
+            if src:
+                break
+            time.sleep(5)
+
         if src is None:
-            msg = "\n".join(f"  - {p}" for p in cands)
-            raise FileNotFoundError(
-                "Could not find a prepared network artefact to anchor.\n"
-                "Tried these candidates:\n"
-                f"{msg}\n"
-                "Fix: adapt _candidate_sources() to your repo's actual output name."
-            )
+            raise FileNotFoundError(f"Kein Netzwerk-Artefakt gefunden. Kandidaten:\n" + "\n".join(
+                str(p) for p in cands))
 
-        # Prefer symlink; fall back to copy
         try:
             if anchor.exists() or anchor.is_symlink():
                 anchor.unlink()
             anchor.symlink_to(src.resolve())
         except Exception:
             import shutil
-            shutil.copyfile(src, anchor)
+
+            shutil.copyfile(src,anchor)
 
 
 rule plain_all:
@@ -543,11 +574,74 @@ elif MODE == "robust":
             Path(output[0]).write_text("ok\n")
 
 
+
+
+# Snakefile
+# Replace ONLY the aro_full_postprocess rule with this version.
+# (Problem: rules.plain_all.input contains callables (lambda w: ...), which are not valid
+# as input entries for another rule. We must materialize them via expand(), like plain_done does.)
+
+# Snakefile
+# Replace ONLY the aro_full_postprocess rule with this corrected version.
+# Reason for your SyntaxError:
+# In Snakemake/Python you cannot mix "named input entries" (aro_std=...)
+# with positional entries afterwards. So we name everything (or nothing).
+# Here: we name everything.
+
 elif MODE == "aro":
+
+    rule aro_full_postprocess:
+        """
+        Trigger the standard postprocess stack for the ARO result.
+
+        NOTE:
+        - We cannot reuse rules.plain_all.input directly because it contains input functions (lambda w: ...).
+        - So we materialize a minimal set of standard postprocess targets here (strings only).
+        """
+        input:
+            aro_std=RESULTS + "networks/aro_robust__std.nc",
+
+            costs_svg=expand(RESULTS + "graphs/costs.svg", run=config["run"]["name"]),
+            power_network=expand(resources("maps/power-network.pdf"), run=config["run"]["name"]),
+            power_network_clustered=expand(
+                resources("maps/power-network-s-{clusters}.pdf"),
+                run=config["run"]["name"],
+                **config["scenario"],
+            ),
+            costs_all_map=expand(
+                RESULTS + "maps/base_s_{clusters}_{opts}_{sector_opts}-costs-all_{planning_horizons}.pdf",
+                run=config["run"]["name"],
+                **config["scenario"],
+            ),
+            cop_profiles=expand(
+                RESULTS + "graphs/cop_profiles_s_{clusters}_{planning_horizons}.html",
+                run=config["run"]["name"],
+                **config["scenario"],
+            ),
+            balance_timeseries=expand(
+                RESULTS + "graphics/balance_timeseries/s_{clusters}_{opts}_{sector_opts}_{planning_horizons}",
+                run=config["run"]["name"],
+                **config["scenario"],
+            ),
+            heatmap_timeseries=expand(
+                RESULTS + "graphics/heatmap_timeseries/s_{clusters}_{opts}_{sector_opts}_{planning_horizons}",
+                run=config["run"]["name"],
+                **config["scenario"],
+            ),
+            interactive_bus_balance=expand(
+                RESULTS + "graphics/interactive_bus_balance/s_{clusters}_{opts}_{sector_opts}_{planning_horizons}",
+                run=config["run"]["name"],
+                **config["scenario"],
+            ),
+        output:
+            done=RESULTS + "postprocess/aro_postprocess.done"
+        run:
+            Path(output.done).parent.mkdir(parents=True, exist_ok=True)
+            Path(output.done).write_text("ok\n")
 
     rule aro_done:
         input:
-             rules.aro_full_postprocess.output.done
+            rules.aro_full_postprocess.output.done
         output:
             ARO_DONE
         run:

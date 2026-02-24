@@ -199,6 +199,9 @@ rule build_base_network_per_cutout:
         overlay = {
             "run": {"name": subrun},
             "atlite": {"default_cutout": cutout},
+            "workflow": {"mode": "plain"},
+            "scenario": config.get("scenario",{}),
+            "renewable": {...},
         }
 
         # ------------------------------------------------------------------
@@ -257,22 +260,16 @@ rule build_base_network_per_cutout:
         nested_target_file = _nested_anchor_path(subrun)
 
         cmd = [
-            sys.executable,
-            "-m",
-            "snakemake",
-            "-s",
-            "Snakefile",
-            "--cores",
-            "8",
-            "--scheduler",
-            "greedy",
+            sys.executable, "-m", "snakemake",
+            "-s", "Snakefile",
+            "--cores", "8",
+            "--scheduler", "greedy",
             "--nolock",
             "--rerun-incomplete",
             "--keep-going",
-            "--configfile",
-            "config/config.yaml",
-            "--configfile",
-            str(overlay_path),
+            "--configfile", "config/config.yaml",
+            "--configfile", str(overlay_path),
+            "--config", "workflow={mode: plain} pypsa_nested=1",
             "--",
             str(nested_target_file),
         ]
@@ -284,7 +281,14 @@ rule build_base_network_per_cutout:
         print("         target_file :", str(nested_target_file))
         print("         cmd         :", " ".join(cmd))
 
-        subprocess.run(cmd, check=True)
+        nested_env = os.environ.copy()
+        nested_env["PYPSA_ROBUST_NESTED"] = "1"
+
+        for key in list(nested_env.keys()):
+            if key.startswith("SNAKEMAKE_"):
+                del nested_env[key]
+
+        subprocess.run(cmd, check=True, env=nested_env)
 
         if not nested_target_file.exists():
             raise FileNotFoundError(
@@ -332,6 +336,14 @@ rule prepared_network_for_robust:
 
         shutil.copyfile(input.staged, output.prepared)
 
+        sentinel = Path("resources/robust_overlays/.current_nested_run")
+        sentinel.parent.mkdir(parents=True,exist_ok=True)
+        sentinel.write_text(subrun)
+        try:
+            subprocess.run(cmd,check=True,env=nested_env)
+        finally:
+            sentinel.unlink(missing_ok=True)
+
 
 # =============================================================================
 # Rule 3: robust solve using prepared scenario networks
@@ -349,6 +361,10 @@ rule solve_robust:
         eps_ls=EPS_LS,
         cutouts=" ".join(CUTOUTS),
         template=lambda wc: PREPARED_TEMPLATE,
+        co2_cost_mode= lambda wc: config.get("aro",{}).get("co2_cost_mode","off"),
+        ls_penalty=lambda wc: config.get("aro",{}).get("ls_penalty",1e4),
+        convergence_tol=lambda wc: config.get("aro",{}).get("convergence_tol",1e-4),
+        dispatch_workers=lambda wc: config.get("aro",{}).get("dispatch_workers",0),
     shell:
         r"""
         set -euo pipefail
@@ -369,7 +385,11 @@ rule solve_robust:
           --out-summary-json {output.summary} \
           --solver-name {params.solver} \
           --solver-options-json '{params.solver_opts}' \
-          --eps-ls-abs {params.eps_ls}
+          --eps-ls {params.eps_ls} \
+          --co2-cost-mode {params.co2_cost_mode} \
+          --ls-penalty {params.ls_penalty} \
+          --convergence-tol {params.convergence_tol} \
+          --dispatch-workers {params.dispatch_workers}
         """
 
 
@@ -385,10 +405,6 @@ if MODE == "robust":
     # =============================================================================
 
     rule robust_as_canonical_elec_noopts:
-        """
-        For electricity-only runs with empty opts token:
-        results/<run>/networks/base_s_<clusters>_elec.nc
-        """
         input:
             robust=OUT_NETWORK
         output:
@@ -397,14 +413,11 @@ if MODE == "robust":
             r"""
             set -euo pipefail
             mkdir -p "$(dirname {output.canonical})"
-            ln -sf "$(realpath {input.robust})" "{output.canonical}"
+            cp -f "$(realpath {input.robust})" "{output.canonical}"
             """
 
+    # Gleiche Anpassungen für robust_as_canonical_elec_withopts und robust_as_canonical_sector:
     rule robust_as_canonical_elec_withopts:
-        """
-        For electricity-only runs with non-empty opts token:
-        results/<run>/networks/base_s_<clusters>_elec_<opts>.nc
-        """
         input:
             robust=OUT_NETWORK
         output:
@@ -413,14 +426,10 @@ if MODE == "robust":
             r"""
             set -euo pipefail
             mkdir -p "$(dirname {output.canonical})"
-            ln -sf "$(realpath {input.robust})" "{output.canonical}"
+            cp -f "$(realpath {input.robust})" "{output.canonical}"
             """
 
     rule robust_as_canonical_sector:
-        """
-        For sector-coupled runs:
-        results/<run>/networks/base_s_<clusters>_<opts>_<sector_opts>_<planning_horizons>.nc
-        """
         input:
             robust=OUT_NETWORK
         output:
@@ -429,7 +438,7 @@ if MODE == "robust":
             r"""
             set -euo pipefail
             mkdir -p "$(dirname {output.canonical})"
-            ln -sf "$(realpath {input.robust})" "{output.canonical}"
+            cp -f "$(realpath {input.robust})" "{output.canonical}"
             """
 
     # =============================================================================

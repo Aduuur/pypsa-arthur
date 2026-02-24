@@ -59,6 +59,11 @@ robust:
   # Lexicographic tolerance
   eps_ls: 1e-6
   aro:
+    co2_cost_mode: "off"      # "off" | "global_constraint_constant_cost"
+    ls_penalty: 10000          # €/MWh — muss > max(marginal_cost) aller Generatoren
+    convergence_tol: 0.0001    # rel. Gap-Toleranz — 0.01%, auf 0.0 für klassisches ARO
+    dispatch_workers: 0
+
     initial_cutouts:
       - cutout_mCNRM-CERFACS-CM5_rcp45_2010
     max_iter: 5

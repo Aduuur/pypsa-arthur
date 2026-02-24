@@ -1,3 +1,4 @@
+# rules/solve_aro.smk
 # SPDX-FileCopyrightText: Contributors to PyPSA-Eur
 # SPDX-License-Identifier: MIT
 
@@ -16,9 +17,8 @@ run = config["run"]
 RDIR = str(get_rdir(run)).strip("/")  # IMPORTANT: same as Snakefile uses (and avoid trailing '/')
 
 RESULTS_DIR = Path("results") / RDIR
-RESOURCES_DIR = Path("resources") / RDIR
 
-ARO = config.get("aro", {})  # optional: dedicated aro block
+ARO = config.get("aro", {})   # optional: dedicated aro block
 ROB = config.get("robust", {})  # fallback: reuse robust block
 
 CUTOUTS = list(ARO.get("cutouts", ROB.get("cutouts", [])))
@@ -34,15 +34,23 @@ PREPARED_TEMPLATE = ARO.get(
 
 # Where ARO writes its final artefacts (inside classic run folder)
 OUT_NETWORK = Path(ARO.get("out_network", str(RESULTS_DIR / "networks" / "aro_robust.nc")))
-OUT_NETWORK_STD = Path(
-    ARO.get("out_network_std", str(OUT_NETWORK).replace(".nc", "__std.nc"))
-)
+
+# IMPORTANT: keep the exact filename used in rules/postprocess.smk
+# (there, _select_postprocess_network prefers RESULTS + "networks/aro_robust__std.nc")
+OUT_NETWORK_STD = Path(ARO.get("out_network_std", str(RESULTS_DIR / "networks" / "aro_robust__std.nc")))
+
 OUT_SUMMARY = Path(ARO.get("out_summary", str(RESULTS_DIR / "results" / "aro_summary.json")))
 
 # ARO loop controls
 INITIAL = list(ARO.get("initial_scenarios", [CUTOUTS[0]]))
 MAX_ITER = int(ARO.get("max_iter", 5))
 EPS_LS = float(ARO.get("eps_ls", 1e-6))
+
+ARO_CO2_COST_MODE = str(ARO.get("co2_cost_mode", "off"))
+ARO_LS_PENALTY = float(ARO.get("ls_penalty", 1e4))
+ARO_CONVERGENCE_TOL = float(ARO.get("convergence_tol", 1e-4))
+ARO_DISPATCH_WORKERS = int(ARO.get("dispatch_workers", 0))
+
 
 # Solver passthrough (use same block as robust)
 SOLVING = config.get("solving", {})
@@ -90,7 +98,7 @@ SECTOR_OPTS_TOKEN = _tok(SECTOR_OPTS)
 PH_TOKEN = _tok(PLANNING_HORIZON)
 
 # -----------------------------------------------------------------------------
-# Canonical solved network naming (GENERIC: supports elec-only and sector-coupled)
+# Canonical solved network naming (for compatibility with existing postprocess rules)
 # -----------------------------------------------------------------------------
 # You can override the canonical solved network path via:
 #   aro:
@@ -100,61 +108,33 @@ CANONICAL_SOLVED_OVERRIDE = ARO.get("canonical_solved", None)
 if CANONICAL_SOLVED_OVERRIDE is not None:
     CANONICAL_SOLVED = Path(str(CANONICAL_SOLVED_OVERRIDE))
 else:
-    # Heuristic: if sector_opts token is non-empty -> sector-coupled naming
     IS_SECTOR_RUN = bool(SECTOR_OPTS_TOKEN)
 
     if IS_SECTOR_RUN:
-        # Sector-coupled canonical solved network (PyPSA-Eur style: allow empty tokens -> double underscores)
         CANONICAL_SOLVED = (
             RESULTS_DIR
             / "networks"
             / f"base_s_{CLUSTERS}_{OPTS_TOKEN}_{SECTOR_OPTS_TOKEN}_{PH_TOKEN}.nc"
         )
     else:
-        # Elec-only canonical solved network (upstream style)
         if OPTS_TOKEN:
             CANONICAL_SOLVED = RESULTS_DIR / "networks" / f"base_s_{CLUSTERS}_elec_{OPTS_TOKEN}.nc"
         else:
             CANONICAL_SOLVED = RESULTS_DIR / "networks" / f"base_s_{CLUSTERS}_elec.nc"
 
-ARO_POSTPROCESS_DONE = RESULTS_DIR / "postprocess" / "aro_postprocess.done"
 
 # =============================================================================
-# Postprocess targets (NO nested snakemake; pure file dependencies)
+# Helper: remove broken symlink (prevents Snakemake mtime errors during DAG build)
 # =============================================================================
-def _default_postprocess_targets() -> list[Path]:
-    """
-    Minimal, robust set of concrete outputs to force standard postprocess/plots.
-    Keep it generic (works for elec-only and sector-coupled), and avoid targets that
-    may not exist in some configs/forks.
-
-    Extend via config['aro']['postprocess_targets'] (list[str]).
-    """
-    targets: list[Path] = []
-
-    # Common, stable artefacts
-    targets.append(RESOURCES_DIR / "maps" / "power-network.pdf")
-    targets.append(RESOURCES_DIR / "maps" / f"power-network-s-{CLUSTERS}.pdf")
-
-    # Metrics are usually produced by postprocess
-    targets.append(
-        RESULTS_DIR
-        / "csvs"
-        / "individual"
-        / f"metrics_s_{CLUSTERS}_{OPTS_TOKEN}_{SECTOR_OPTS_TOKEN}_{PH_TOKEN}.csv"
-    )
-
-    return targets
+def _unlink_if_broken_symlink(p: Path) -> None:
+    try:
+        if p.is_symlink() and not p.exists():
+            p.unlink()
+    except Exception:
+        pass
 
 
-_EXTRA = ARO.get("postprocess_targets", None)
-if _EXTRA is not None:
-    if not isinstance(_EXTRA, list) or not all(isinstance(x, str) for x in _EXTRA):
-        raise ValueError("config['aro']['postprocess_targets'] must be a list of strings.")
-    # Interpret as repo-root-relative paths (same as CLI targets)
-    ARO_POSTPROCESS_TARGETS = [Path(x) for x in _EXTRA]
-else:
-    ARO_POSTPROCESS_TARGETS = _default_postprocess_targets()
+_unlink_if_broken_symlink(CANONICAL_SOLVED)
 
 # =============================================================================
 # Targets
@@ -165,7 +145,8 @@ rule aro:
         str(OUT_NETWORK),
         str(OUT_NETWORK_STD),
         str(OUT_SUMMARY),
-        str(ARO_POSTPROCESS_DONE)
+        str(CANONICAL_SOLVED)
+
 
 # =============================================================================
 # ARO solve rule
@@ -191,10 +172,15 @@ rule solve_aro:
         solver=lambda wc: SOLVER_NAME,
         solver_opts=lambda wc: SOLVER_OPTIONS_JSON,
         eps_ls=lambda wc: str(EPS_LS),
+        co2_cost_mode= lambda wc: ARO_CO2_COST_MODE,
+        ls_penalty=lambda wc: ARO_LS_PENALTY,
+        convergence_tol=lambda wc: ARO_CONVERGENCE_TOL,
+        dispatch_workers=lambda wc: ARO_DISPATCH_WORKERS,
     shell:
         r"""
         set -euo pipefail
         mkdir -p "$(dirname {output.network})"
+        mkdir -p "$(dirname {output.std_network})"
         mkdir -p "$(dirname {output.summary})"
 
         {sys.executable} scripts/solve_aro.py \
@@ -207,13 +193,18 @@ rule solve_aro:
           --out-summary-json {output.summary} \
           --solver-name {params.solver} \
           --solver-options-json '{params.solver_opts}' \
-          --eps-ls {params.eps_ls}
+          --eps-ls {params.eps_ls} \
+          --co2-cost-mode {params.co2_cost_mode} \
+          --ls-penalty {params.ls_penalty} \
+          --convergence-tol {params.convergence_tol} \
+          --dispatch-workers {params.dispatch_workers}
         """
 
+
 # =============================================================================
-# ARO-only: Adapter + full postprocess targets
+# ARO-only: Adapter rule for canonical postprocess filename
 # =============================================================================
-MODE = (config.get("workflow", {}) or {}).get("mode", "plain").lower()
+MODE = "plain" if _IS_NESTED_SUBRUN else (config.get("workflow", {}) or {}).get("mode", "plain").lower()
 if MODE not in {"plain", "robust", "aro"}:
     raise ValueError(f"Invalid workflow.mode={MODE!r} (expected plain|robust|aro)")
 
@@ -221,13 +212,10 @@ if MODE == "aro":
 
     rule aro_as_canonical_solved_network:
         """
-        Expose OUT_NETWORK_STD under the canonical solved-network path so that
-        the existing postprocess rules can be triggered unchanged.
+        Expose OUT_NETWORK_STD under the canonical solved-network path.
 
-         IMPORTANT (NFS/autofs + Snakemake mtime race fix):
-         Do NOT use symlinks here. On some shared filesystems Snakemake may fail to
-         stat() a symlink target during concurrent updates ("Unable to obtain modification time ...").
-         Instead create a real file at the canonical path via hardlink/copy.
+        Do NOT symlink: broken symlinks are the root cause of Snakemake mtime errors on NFS-like FS.
+        We copy to guarantee a real file exists at the canonical path.
         """
         input:
             aro=str(OUT_NETWORK_STD)
@@ -235,26 +223,13 @@ if MODE == "aro":
             canonical=str(CANONICAL_SOLVED)
         shell:
             r"""
-                    set -euo pipefail
-                    mkdir -p "$(dirname {output.canonical})"
+            set -euo pipefail
+            mkdir -p "$(dirname {output.canonical})"
 
-                    # If an old broken symlink exists, remove it (extra safety at runtime).
-                    if [ -L "{output.canonical}" ] && [ ! -e "{output.canonical}" ]; then
-                      rm -f "{output.canonical}"
-                    fi
+            # remove broken symlink if any (extra safety at runtime)
+            if [ -L "{output.canonical}" ] && [ ! -e "{output.canonical}" ]; then
+              rm -f "{output.canonical}"
+            fi
 
-                    tmp="{output.canonical}.tmp.$$"
-                    cp -f "{input.aro}" "$tmp"
-                    mv -f "$tmp" "{output.canonical}"
-                    """
-
-
-    rule aro_full_postprocess:
-        input:
-            canonical=str(CANONICAL_SOLVED),
-            targets=[str(p) for p in ARO_POSTPROCESS_TARGETS],
-        output:
-            done=str(ARO_POSTPROCESS_DONE)
-        run:
-            Path(output.done).parent.mkdir(parents=True, exist_ok=True)
-            Path(output.done).write_text("ok\n")
+            cp -f "{input.aro}" "{output.canonical}"
+            """

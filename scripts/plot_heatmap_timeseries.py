@@ -1,13 +1,21 @@
+# scripts/plot_heatmap_timeseries.py
 # SPDX-FileCopyrightText: Contributors to PyPSA-Eur <https://github.com/pypsa/pypsa-eur>
 #
 # SPDX-License-Identifier: MIT
 """
 Plot heatmap time series of marginal prices, utilisation rates, state of charge profiles.
+
+PATCH (ARO compatibility):
+- PyPSA statistics helpers sometimes return Series/DataFrames whose index is NOT a MultiIndex
+  with a 'carrier' level (e.g. only asset names). The upstream script assumes `.groupby("carrier")`
+  works and crashes with KeyError('carrier').
+- We fix this robustly by injecting a carrier level from the network component tables when needed.
 """
 
 import logging
 import os
 import sys
+from typing import Iterable
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -85,6 +93,101 @@ def plot_heatmap(
         plt.close()
 
 
+# =============================================================================
+# ARO compatibility helpers
+# =============================================================================
+def _ensure_series(x: pd.Series | pd.DataFrame) -> pd.Series:
+    if isinstance(x, pd.Series):
+        return x
+    if isinstance(x, pd.DataFrame):
+        if x.shape[1] != 1:
+            raise ValueError(
+                "Expected a single-column DataFrame when converting to Series for carrier injection."
+            )
+        return x.iloc[:, 0]
+    raise TypeError(f"Expected Series/DataFrame, got {type(x)}")
+
+
+def _inject_carrier_level_from_mapping(
+    s: pd.Series, carrier_by_name: pd.Series, level_name: str = "name"
+) -> pd.Series:
+    """
+    Transform Series indexed by asset name -> MultiIndex('carrier', level_name)
+    so that `.groupby('carrier')` works.
+    """
+    idx = pd.Index(s.index, dtype="object")
+    carriers = carrier_by_name.reindex(idx).fillna("unknown").astype(str)
+
+    s2 = s.copy()
+    s2.index = pd.MultiIndex.from_arrays(
+        [carriers.to_numpy(), idx.to_numpy()],
+        names=["carrier", level_name],
+    )
+    return s2
+
+
+def _groupby_carrier_sum(obj: pd.Series | pd.DataFrame, n: pypsa.Network) -> pd.Series:
+    """
+    Robust equivalent of: obj.groupby("carrier").sum()
+
+    Supports:
+    - Series/DataFrame with MultiIndex containing 'carrier'
+    - Series indexed by component names (generators/links/storage_units/stores/lines)
+    """
+    if isinstance(obj, pd.DataFrame):
+        # If it's a DataFrame (e.g. statistics returns df), sum over columns if needed later.
+        # For our use we expect a 1D vector of capacities; force Series.
+        obj = _ensure_series(obj)
+
+    s = _ensure_series(obj)
+
+    # If already has carrier level, just group
+    if isinstance(s.index, pd.MultiIndex) and "carrier" in s.index.names:
+        return s.groupby("carrier").sum()
+
+    # Otherwise, attempt to infer which component the index refers to.
+    idx = pd.Index(s.index, dtype="object")
+
+    try:
+        if idx.isin(n.generators.index).all() and "carrier" in n.generators.columns:
+            return _inject_carrier_level_from_mapping(s, n.generators["carrier"]).groupby("carrier").sum()
+    except Exception:
+        pass
+
+    try:
+        if idx.isin(n.links.index).all() and "carrier" in n.links.columns:
+            return _inject_carrier_level_from_mapping(s, n.links["carrier"]).groupby("carrier").sum()
+    except Exception:
+        pass
+
+    try:
+        if idx.isin(n.storage_units.index).all() and "carrier" in n.storage_units.columns:
+            return _inject_carrier_level_from_mapping(s, n.storage_units["carrier"]).groupby("carrier").sum()
+    except Exception:
+        pass
+
+    try:
+        if idx.isin(n.stores.index).all() and "carrier" in n.stores.columns:
+            return _inject_carrier_level_from_mapping(s, n.stores["carrier"]).groupby("carrier").sum()
+    except Exception:
+        pass
+
+    try:
+        if idx.isin(n.lines.index).all():
+            if "carrier" in n.lines.columns:
+                return _inject_carrier_level_from_mapping(s, n.lines["carrier"]).groupby("carrier").sum()
+            # fallback: one bucket
+            return pd.Series({"AC line": float(s.sum())})
+    except Exception:
+        pass
+
+    # Fallback: one bucket
+    return pd.Series({"unknown": float(s.sum())})
+
+
+# =============================================================================
+# Main
+# =============================================================================
 if __name__ == "__main__":
     if "snakemake" not in globals():
         from scripts._helpers import mock_snakemake
@@ -116,49 +219,83 @@ if __name__ == "__main__":
 
     diffs = snapshots.to_series().diff().dropna()
     if any(diffs > pd.Timedelta("30D")):
-        logger.warning(
-            "Snapshots contain a gap longer than 1 month. Skipping heatmaps."
-        )
+        logger.warning("Snapshots contain a gap longer than 1 month. Skipping heatmaps.")
         sys.exit(0)
 
-    # filter for build capacities
-    optimal_capacity = (
-        n.statistics.optimal_capacity(nice_names=False).groupby("carrier").sum()
-    )
+    # -------------------------------------------------------------------------
+    # filter for built capacities
+    # -------------------------------------------------------------------------
+    # BEFORE (breaks under ARO sometimes):
+    # optimal_capacity = n.statistics.optimal_capacity(nice_names=False).groupby("carrier").sum()
+    # AFTER:
+    optimal_capacity_raw = n.statistics.optimal_capacity(nice_names=False)
+    optimal_capacity = _groupby_carrier_sum(optimal_capacity_raw, n)
     built_idx = optimal_capacity.where(optimal_capacity > 100).dropna().index
 
+    # -------------------------------------------------------------------------
     # utilisation rates
+    # -------------------------------------------------------------------------
     cf = (
         n.statistics.capacity_factor(aggregate_time=False, nice_names=False)
         .dropna()
-        .groupby("carrier")
-        .sum()
-        .mul(100)
     )
-    idx = cf.index.intersection(config["utilisation_rate"]).intersection(built_idx)
-    cf = cf.loc[idx]
 
-    for carrier, s in cf.iterrows():
-        logger.info(f"Plotting utilisation rate heatmap time series for {carrier}")
-        df = unstack_day_hour(s, snapshots, drop_leap_day)
-        label = "utilisation rate [%]"
-        fn = (
-            output_dir
-            + "/ts-heatmap-utilisation_rate-"
-            + carrier.replace(" ", "_")
-            + ".pdf"
-        )
-        plot_heatmap(
-            df,
-            cmap="Greens",
-            label=label,
-            title=carrier,
-            vmin=0,
-            vmax=100,
-            fn=fn,
-        )
+    # In upstream, this expects a MultiIndex with 'carrier'. Make it robust:
+    # We want cf as DataFrame indexed by carrier, with columns being snapshots.
+    if isinstance(cf, pd.DataFrame):
+        # If cf index has carrier level -> group as expected
+        if isinstance(cf.index, pd.MultiIndex) and "carrier" in cf.index.names:
+            cf = cf.groupby("carrier").sum()
+        else:
+            # If indexed by asset name, we cannot faithfully reconstruct per-carrier time series
+            # for all possible components without deeper knowledge. We do a best-effort:
+            # - if index matches generators, map to generator carriers
+            idx = pd.Index(cf.index, dtype="object")
+            if idx.isin(n.generators.index).all() and "carrier" in n.generators.columns:
+                cf.index = pd.MultiIndex.from_arrays(
+                    [n.generators["carrier"].reindex(idx).fillna("unknown").astype(str).to_numpy(), idx.to_numpy()],
+                    names=["carrier", "name"],
+                )
+                cf = cf.groupby("carrier").sum()
+            elif idx.isin(n.links.index).all() and "carrier" in n.links.columns:
+                cf.index = pd.MultiIndex.from_arrays(
+                    [n.links["carrier"].reindex(idx).fillna("unknown").astype(str).to_numpy(), idx.to_numpy()],
+                    names=["carrier", "name"],
+                )
+                cf = cf.groupby("carrier").sum()
+            else:
+                logger.warning(
+                    "capacity_factor returned an unexpected index without 'carrier'; "
+                    "skipping utilisation rate heatmaps."
+                )
+                cf = pd.DataFrame()
+    else:
+        logger.warning("capacity_factor returned unexpected type; skipping utilisation rate heatmaps.")
+        cf = pd.DataFrame()
 
-    # marginal prices
+    if not cf.empty:
+        cf = cf.mul(100)
+        idx = pd.Index(cf.index).intersection(config["utilisation_rate"]).intersection(built_idx)
+        cf = cf.loc[idx]
+
+        for carrier, s in cf.iterrows():
+            logger.info(f"Plotting utilisation rate heatmap time series for {carrier}")
+            df = unstack_day_hour(s, snapshots, drop_leap_day)
+            label = "utilisation rate [%]"
+            fn = output_dir + "/ts-heatmap-utilisation_rate-" + carrier.replace(" ", "_") + ".pdf"
+            plot_heatmap(
+                df,
+                cmap="Greens",
+                label=label,
+                title=carrier,
+                vmin=0,
+                vmax=100,
+                fn=fn,
+            )
+
+    # -------------------------------------------------------------------------
+    # marginal prices (unchanged; already groups by n.buses.carrier)
+    # -------------------------------------------------------------------------
     prices = n.buses_t.marginal_price.T.groupby(n.buses.carrier).mean()
     prices = prices.loc[prices.index.intersection(config["marginal_price"])]
 
@@ -170,12 +307,7 @@ if __name__ == "__main__":
             if "co2" in carrier.lower()
             else "marginal price [€/MWh]"
         )
-        fn = (
-            output_dir
-            + "/ts-heatmap-marginal_price-"
-            + carrier.replace(" ", "_")
-            + ".pdf"
-        )
+        fn = output_dir + "/ts-heatmap-marginal_price-" + carrier.replace(" ", "_") + ".pdf"
         plot_heatmap(
             df,
             cmap="Spectral_r",
@@ -184,7 +316,16 @@ if __name__ == "__main__":
             fn=fn,
         )
 
-    # SOCs
+    # -------------------------------------------------------------------------
+    # SOCs (stores) (unchanged logic; but keep robust if carrier column missing)
+    # -------------------------------------------------------------------------
+    if len(n.stores.index) == 0:
+        sys.exit(0)
+
+    if "carrier" not in n.stores.columns:
+        logger.warning("n.stores has no 'carrier' column; skipping SOC heatmaps.")
+        sys.exit(0)
+
     e_nom_opt = n.stores.groupby("carrier").e_nom_opt.sum()
     socs = n.stores_t.e.T.groupby(n.stores.carrier).sum().div(e_nom_opt, axis=0) * 100
     socs = socs.loc[socs.index.intersection(config["soc"]).intersection(built_idx)]

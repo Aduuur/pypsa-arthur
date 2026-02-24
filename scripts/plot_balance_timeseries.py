@@ -1,14 +1,25 @@
+# scripts/plot_balance_timeseries.py
 # SPDX-FileCopyrightText: Contributors to PyPSA-Eur <https://github.com/pypsa/pypsa-eur>
 #
 # SPDX-License-Identifier: MIT
 """
 Plot balance time series.
+
+PATCH (ARO compatibility):
+- In ARO, snapshots are often NOT a plain DatetimeIndex (can be MultiIndex or other Index).
+  Pandas resample() then crashes: "Only valid with DatetimeIndex ... but got Index".
+- Fix: coerce the plotted dataframe index to a DatetimeIndex (best-effort) before resampling.
+- Also make monthly slicing robust (derive months from the coerced index, not from snakemake params).
+- Force non-interactive matplotlib backend (avoids Qt/wayland issues on headless nodes).
 """
 
 import logging
 import os
 from functools import partial
 from multiprocessing import Pool
+
+import matplotlib
+matplotlib.use("Agg")  # headless-safe backend (prevents Qt/wayland plugin issues)
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -17,11 +28,92 @@ import pandas as pd
 import pypsa
 from tqdm import tqdm
 
-from scripts._helpers import configure_logging, get_snapshots, set_scenario_config
+from scripts._helpers import configure_logging, set_scenario_config
 
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# Helpers: ARO snapshot index -> DatetimeIndex coercion
+# =============================================================================
+def _coerce_to_datetime_index(idx: pd.Index) -> pd.DatetimeIndex:
+    """
+    Best-effort conversion of an arbitrary Index into a DatetimeIndex.
+
+    Handles:
+    - DatetimeIndex: pass-through
+    - PeriodIndex: to_timestamp()
+    - MultiIndex: pick a level that is (or can be) datetime (prefer last levels)
+    - plain Index of tuples/strings: try to_datetime() directly
+
+    Raises ValueError if it cannot obtain a usable DatetimeIndex.
+    """
+    if isinstance(idx, pd.DatetimeIndex):
+        return idx
+
+    if isinstance(idx, pd.PeriodIndex):
+        return idx.to_timestamp()
+
+    if isinstance(idx, pd.MultiIndex):
+        # Prefer last level(s), since ARO often uses (scenario, datetime) or (period, timestep)
+        for i in reversed(range(idx.nlevels)):
+            v = idx.get_level_values(i)
+            # already datetime-like?
+            if pd.api.types.is_datetime64_any_dtype(v):
+                return pd.DatetimeIndex(v)
+            # try conversion
+            dt = pd.to_datetime(v, errors="coerce")
+            if dt.notna().mean() > 0.95:
+                return pd.DatetimeIndex(dt)
+        # last resort: try to_datetime on the tuple representation
+        dt = pd.to_datetime(idx.astype(str), errors="coerce")
+        if dt.notna().mean() > 0.95:
+            return pd.DatetimeIndex(dt)
+        raise ValueError("Could not coerce MultiIndex to DatetimeIndex.")
+
+    # plain Index
+    dt = pd.to_datetime(idx, errors="coerce")
+    if dt.notna().mean() > 0.95:
+        return pd.DatetimeIndex(dt)
+
+    # maybe objects like "(scenario, 2050-01-01 00:00:00)"
+    dt = pd.to_datetime(idx.astype(str), errors="coerce")
+    if dt.notna().mean() > 0.95:
+        return pd.DatetimeIndex(dt)
+
+    raise ValueError("Could not coerce Index to DatetimeIndex.")
+
+
+def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure df.index is a DatetimeIndex; sort it (resample expects monotonic increasing index).
+    If coercion fails, return df unchanged (and caller decides to skip plotting).
+    """
+    try:
+        dt = _coerce_to_datetime_index(df.index)
+    except Exception as e:
+        logger.warning(f"Could not convert balance dataframe index to DatetimeIndex: {e}")
+        return df
+
+    out = df.copy()
+    out.index = dt
+    out = out.sort_index()
+    return out
+
+
+def _month_slices(idx: pd.DatetimeIndex) -> list[pd.DatetimeIndex]:
+    """
+    Return a list of DatetimeIndex objects, one per calendar month contained in idx.
+    """
+    if len(idx) == 0:
+        return []
+    periods = idx.to_period("M").unique()
+    return [idx[idx.to_period("M") == p] for p in periods]
+
+
+# =============================================================================
+# Plotting
+# =============================================================================
 def plot_stacked_area_steplike(
     ax: plt.Axes, df: pd.DataFrame, colors: dict | pd.Series = {}
 ):
@@ -77,7 +169,12 @@ def plot_energy_balance_timeseries(
     directory="",
 ):
     """Create energy balance time series plot with positive/negative stacked areas."""
+
+    # Ensure datetime index for slicing/resampling
+    df = _ensure_datetime_index(df)
+
     if time is not None:
+        # time must be a DatetimeIndex (we enforce this upstream)
         df = df.loc[time]
 
     # Handle small values and renaming
@@ -86,21 +183,31 @@ def plot_energy_balance_timeseries(
     ].tolist()
     if techs_below_threshold:
         rename.update({tech: "other" for tech in techs_below_threshold})
-        colors["other"] = "grey"
+        if isinstance(colors, dict):
+            colors["other"] = "grey"
 
     if rename:
         df = df.T.groupby(df.columns.map(lambda a: rename.get(a, a))).sum().T
 
     # Upsample to hourly resolution to handle overlapping snapshots
     if resample is not None:
-        df = df.resample("1h").ffill().resample(resample).mean()
+        if not isinstance(df.index, pd.DatetimeIndex):
+            logger.warning(
+                f"Index is not DatetimeIndex after coercion; skipping resample for '{ylabel}'."
+            )
+        else:
+            df = df.resample("1h").ffill().resample(resample).mean()
+
+    if df.empty:
+        return
 
     # Sort columns by variance
-    order = (df / df.max()).var().sort_values().index
-    if preferred_order:
-        order = preferred_order.intersection(order).append(
-            order.difference(preferred_order)
-        )
+    denom = df.max().replace(0.0, np.nan)
+    order = (df / denom).var().sort_values().index
+    if preferred_order is not None and len(preferred_order) > 0:
+        if isinstance(preferred_order, list):
+            preferred_order = pd.Index(preferred_order)
+        order = preferred_order.intersection(order).append(order.difference(preferred_order))
     df = df.loc[:, order]
 
     # Split into positive and negative values
@@ -114,7 +221,8 @@ def plot_energy_balance_timeseries(
 
     # Set x and y limits
     plt.xlim((df.index[0], df.index[-1]))
-    setup_time_axis(ax, df.index[-1] - df.index[0])
+    if isinstance(df.index, pd.DatetimeIndex):
+        setup_time_axis(ax, df.index[-1] - df.index[0])
 
     # Configure y-axis and grid
     ax.grid(axis="y")
@@ -141,26 +249,34 @@ def plot_energy_balance_timeseries(
 
     # Save figures
     if resample is None:
-        resample = f"native-{time if time is not None else 'default'}"
+        resample = "native"
     fn = f"ts-balance-{ylabel.replace(' ', '_')}-{resample}.pdf"
     plt.savefig(f"{directory}/{fn}")
     plt.close()
 
 
-def process_carrier(group_item, balance, months, colors, config, output_dir):
+def process_carrier(group_item, balance, colors, config, output_dir):
     """Process carrier data and create plots for specific carrier group."""
 
     group, carriers = group_item
-
     if not isinstance(carriers, list):
         carriers = [carriers]
 
+    # balance: typically indexed by (bus_carrier, carrier, ...) and columns are snapshots
     mask = balance.index.get_level_values("bus_carrier").isin(carriers)
     df = balance[mask].groupby("carrier").sum().div(1e3).T
 
     if df.empty:
         logger.warning(
             f"No carriers of group '{group}' in energy balance. Skipping carrier group: '{group}'"
+        )
+        return
+
+    # Ensure datetime index early (needed for resample + monthly slicing)
+    df = _ensure_datetime_index(df)
+    if not isinstance(df.index, pd.DatetimeIndex):
+        logger.warning(
+            f"Balance timeseries index is not datetime-like for group '{group}'. Skipping plots."
         )
         return
 
@@ -172,17 +288,15 @@ def process_carrier(group_item, balance, months, colors, config, output_dir):
         directory=output_dir,
     )
 
-    # daily resolution for each carrier
-    if config["annual"]:
-        plot_energy_balance_timeseries(
-            df, resample=config["annual_resolution"], **kwargs
-        )
+    # annual plot (resampled)
+    if config.get("annual", False):
+        plot_energy_balance_timeseries(df, resample=config["annual_resolution"], **kwargs)
 
-    # native resolution for each month and carrier
-    if config["monthly"]:
-        for month in months:
+    # monthly plots (native slice + resample)
+    if config.get("monthly", False):
+        for month_idx in _month_slices(df.index):
             plot_energy_balance_timeseries(
-                df, resample=config["monthly_resolution"], time=month, **kwargs
+                df, resample=config["monthly_resolution"], time=month_idx, **kwargs
             )
 
 
@@ -209,13 +323,6 @@ if __name__ == "__main__":
     config = snakemake.params.plotting["balance_timeseries"]
     output_dir = snakemake.output[0]
     os.makedirs(output_dir, exist_ok=True)
-
-    # Get month ranges for plotting
-    sns = snakemake.params.snapshots
-    drop_leap_day = snakemake.params.drop_leap_day
-    months = get_snapshots(sns, drop_leap_day, freq="ME").map(
-        lambda x: x.strftime("%Y-%m")
-    )
 
     # Calculate energy balance
     balance = n.statistics.energy_balance(aggregate_time=False, nice_names=False)
@@ -244,7 +351,6 @@ if __name__ == "__main__":
     func = partial(
         process_carrier,
         balance=balance,
-        months=months,
         colors=colors,
         config=config,
         output_dir=output_dir,
