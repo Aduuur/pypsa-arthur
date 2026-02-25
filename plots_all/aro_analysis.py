@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 from pathlib import Path
-from config_aro import AROPlottingConfig
+from master_config import AROPlottingConfig
 
 # Matplotlib für Serverumgebung
 import matplotlib

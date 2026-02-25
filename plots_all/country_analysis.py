@@ -11,6 +11,8 @@ import numpy as np
 from pathlib import Path
 import warnings
 warnings.filterwarnings('ignore')
+from master_config import AROPlottingConfig
+
 
 # Matplotlib Backend für Server ohne Display setzen
 import matplotlib
@@ -162,6 +164,15 @@ class CountryAnalyzer:
     def plot_installed_capacity(self, save=True):
         """2. Installierte Leistung pro Brennstofftyp"""
         capacity_by_carrier = self.country_generators.groupby('carrier')['p_nom_opt'].sum()
+        if capacity_by_carrier.empty:
+            print("Keine installierten Kapazitäten gefunden.")
+            return
+
+        colors = [self.colors.get(c, self.default_color) for c in capacity_by_carrier.index]
+        if len(colors) == 0:
+            colors = None  # fallback: pandas default
+
+        capacity_by_carrier.plot(kind="bar", color=colors, ax=ax)
 
         fig, ax = plt.subplots(figsize=(12, 8))
         bars = capacity_by_carrier.plot(

@@ -183,6 +183,8 @@ rule robust:
 # Rule 1: build per-cutout base network (nested snakemake)
 # =============================================================================
 rule build_base_network_per_cutout:
+    input:
+        config="config/config.yaml",
     output:
         base=RESULTS_DIR + "robust_scenarios/{cutout}/base.nc",
     params:
@@ -317,14 +319,6 @@ rule build_base_network_per_cutout:
                 f"  error: {e}\n"
             )
 
-        Path(os.path.dirname(output.base)).mkdir(parents=True, exist_ok=True)
-
-        print("\n[robust] Staging base network for robust DAG:")
-        print("         src :", str(nested_target_file))
-        print("         dst :", output.base)
-
-        shutil.copyfile(nested_target_file, output.base)
-
 
 # =============================================================================
 # Rule 2: prepare scenario network for robust solver
@@ -332,17 +326,31 @@ rule build_base_network_per_cutout:
 rule prepared_network_for_robust:
     input:
         staged=RESULTS_DIR + "robust_scenarios/{cutout}/base.nc",
+        config="config/config.yaml",
     output:
         prepared=PREPARED_TEMPLATE,
     run:
-        Path(os.path.dirname(output.prepared)).mkdir(parents=True, exist_ok=True)
+        # Snapshot-Validierung
+        import pypsa
 
+        n_check = pypsa.Network(input.staged)
+        expected_start = config.get("snapshots",{}).get("start")
+        if expected_start:
+            actual_start = str(n_check.snapshots[0])[:10]
+            if actual_start != expected_start:
+                raise RuntimeError(
+                    f"[robust] Snapshot mismatch!\n"
+                    f"  config expects: {expected_start}\n"
+                    f"  network has:    {actual_start}\n"
+                    f"  Fix: rm -rf results/{RESULTS_DIR}robust_scenarios/ networks/prepared_*.nc"
+                )
+
+        Path(os.path.dirname(output.prepared)).mkdir(parents=True,exist_ok=True)
         print("\n[robust] Preparing scenario network for robust optimisation:")
-        print("         cutout :", wildcards.cutout)
-        print("         src    :", input.staged)
-        print("         dst    :", output.prepared)
-
-        shutil.copyfile(input.staged, output.prepared)
+        print("         cutout :",wildcards.cutout)
+        print("         src    :",input.staged)
+        print("         dst    :",output.prepared)
+        shutil.copyfile(input.staged,output.prepared)
 
 
 

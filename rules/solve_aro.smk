@@ -160,6 +160,7 @@ rule solve_aro:
     """
     input:
         scenario_networks=expand(PREPARED_TEMPLATE, cutout=CUTOUTS),
+        config="config/config.yaml",
     output:
         network=str(OUT_NETWORK),
         summary=str(OUT_SUMMARY),
