@@ -409,8 +409,15 @@ def _ensure_load_shedding_generators(
         *,
         carrier: str = "load_shedding",
         marginal_cost: float = 1e4,
-        p_nom: float = 1e9,
+        p_nom: float = None,  # ← None als Sentinel
 ) -> List[str]:
+    # Berechne p_nom dynamisch falls nicht angegeben
+    if p_nom is None:
+        try:
+            peak_load = n.loads_t.p_set.sum(axis=1).max()
+            p_nom = max(peak_load * 2, 1e6)
+        except Exception:
+            p_nom = 1e6  # Fallback falls loads_t leer
     """Ensure one non-extendable load-shedding Generator per bus (idempotent)."""
     existing: List[str] = []
     if hasattr(n, "generators") and "carrier" in n.generators.columns:
@@ -501,6 +508,7 @@ def _check_solver_status(n: pypsa.Network, stage: str, *, hard_fail_suboptimal: 
     if m is None:
         raise RuntimeError(f"[{stage}] n.model is None after optimize().")
 
+    # --- Status und Termination ermitteln ---
     status_str: Optional[str] = None
     for attr in ("status", "termination_condition", "termination"):
         val = getattr(m, attr, None)
@@ -508,23 +516,129 @@ def _check_solver_status(n: pypsa.Network, stage: str, *, hard_fail_suboptimal: 
             status_str = str(val).lower().strip()
             break
 
+    termination: Optional[str] = None
+    for attr in ("termination_condition", "termination"):
+        val = getattr(m, attr, None)
+        if val is not None:
+            termination = str(val).lower().strip()
+            break
+
     sol = getattr(m, "solution", None)
+
+    logger.info("[%s] Solver status: '%s'  termination: '%s'", stage, status_str, termination)
+
     if status_str is None:
         if sol is None:
             raise RuntimeError(f"[{stage}] No solution and no solver status available.")
         logger.warning("[%s] Solver status unavailable — solution exists, proceeding.", stage)
         return True
 
+    # --- Infeasibility erkennen ---
     fatal_terms = ("infeasible", "unbounded", "error", "failed", "invalid")
-    if any(t in status_str for t in fatal_terms):
-        raise RuntimeError(f"[{stage}] Fatal solver status '{status_str}'.")
 
-    if status_str == "ok" or status_str.startswith("optimal"):
-        if status_str not in ("ok", "optimal"):
-            logger.warning("[%s] Solver status '%s' — may be slightly suboptimal.", stage, status_str)
+    is_infeasible = (
+        any(t in status_str for t in fatal_terms)
+        or (termination is not None and any(t in termination for t in fatal_terms))
+    )
+
+    if is_infeasible:
+
+        # --- IIS über Gurobi berechnen ---
+        try:
+            gurobi_model = m.solver_model
+            if gurobi_model is not None:
+                logger.error("[%s] Computing IIS (Irreducible Infeasible Subsystem)...", stage)
+                gurobi_model.computeIIS()
+
+                import numpy as np
+                logger.error("[%s] Mapping IIS constraints to linopy names...", stage)
+                for target_idx in [2191024, 54283919]:
+                    found = False
+                    for cname, constr in m.constraints.items():
+                        try:
+                            flat = constr.labels.values.flatten()
+                            if target_idx in flat:
+                                pos = np.where(flat == target_idx)
+                                logger.error("  c%d → linopy constraint '%s' at pos %s",
+                                             target_idx, cname, pos)
+                                found = True
+                                break
+                        except Exception:
+                            continue
+                    if not found:
+                        logger.error("  c%d → NOT FOUND in linopy constraints", target_idx)
+
+                # Variable x2924968 mappen
+                for vname, var in m.variables.items():
+                    try:
+                        flat = var.labels.values.flatten()
+                        if 2924968 in flat:
+                            pos = np.where(flat == 2924968)
+                            logger.error("  x2924968 → linopy variable '%s' at pos %s", vname, pos)
+                            break
+                    except Exception:
+                        continue
+
+                ilp_path = f"/tmp/infeasible_{stage.replace(' ', '_').lower()}.ilp"
+                gurobi_model.write(ilp_path)
+                logger.error("[%s] IIS written to %s", stage, ilp_path)
+
+                iis_constrs = [c.ConstrName for c in gurobi_model.getConstrs() if c.IISConstr]
+                iis_lb      = [v.VarName for v in gurobi_model.getVars() if v.IISLB]
+                iis_ub      = [v.VarName for v in gurobi_model.getVars() if v.IISUB]
+
+                logger.error("[%s] IIS: %d conflicting constraints (first 30):", stage, len(iis_constrs))
+                for c in iis_constrs[:30]:
+                    logger.error("  CONSTR: %s", c)
+
+                if iis_lb:
+                    logger.error("[%s] IIS lower-bound violations (first 10):", stage)
+                    for v in iis_lb[:10]:
+                        logger.error("  LB: %s", v)
+
+                if iis_ub:
+                    logger.error("[%s] IIS upper-bound violations (first 10):", stage)
+                    for v in iis_ub[:10]:
+                        logger.error("  UB: %s", v)
+
+                if not iis_constrs and not iis_lb and not iis_ub:
+                    logger.error("[%s] IIS computed but empty — check %s", stage, ilp_path)
+            else:
+                logger.error("[%s] solver_model is None — cannot compute IIS.", stage)
+
+        except AttributeError:
+            logger.error("[%s] IIS not available (not Gurobi or model inaccessible).", stage)
+        except Exception as exc:
+            logger.error("[%s] IIS computation failed: %s", stage, exc, exc_info=True)
+
+        # --- Netzwerk-Diagnose ---
+        try:
+            logger.error("[%s] Network diagnostics:", stage)
+            logger.error("  Buses:         %d", len(n.buses))
+            logger.error("  Generators:    %d  (extendable: %d)",
+                         len(n.generators),
+                         int(n.generators.p_nom_extendable.sum()))
+            peak = n.loads_t.p_set.sum(axis=1).max() if len(n.loads_t.p_set) > 0 else float("nan")
+            logger.error("  Loads peak:    %.1f MW", peak)
+            ls = n.generators[n.generators.carrier == "load_shedding"]
+            logger.error("  LS generators: %d  total p_nom: %.1f MW", len(ls), float(ls.p_nom.sum()))
+            logger.error("  GlobalConstraints:")
+            for gc_name, row in n.global_constraints.iterrows():
+                logger.error("    %s  %s  %.3e", gc_name, row["sense"], row["constant"])
+        except Exception as exc:
+            logger.error("[%s] Network diagnostics failed: %s", stage, exc)
+
+        raise RuntimeError(
+            f"[{stage}] Infeasible (status='{status_str}', termination='{termination}'). "
+            f"See IIS above or /tmp/infeasible_{stage.replace(' ', '_').lower()}.ilp"
+        )
+
+    # --- Optimal ---
+    if status_str in ("ok", "optimal") or status_str.startswith("optimal"):
         return True
 
-    logger.warning("[%s] Non-optimal status: '%s'.", stage, status_str)
+    # --- Suboptimal / Warning ---
+    logger.warning("[%s] Non-optimal status: '%s'  termination: '%s'.", stage, status_str, termination)
     if hard_fail_suboptimal:
         raise RuntimeError(
             f"[{stage}] Aborting: non-optimal status '{status_str}'. "
@@ -544,33 +658,60 @@ def _add_scenario_boundary_constraints(
 ) -> None:
     m = network.model
 
+    # --- StorageUnits: nur cyclic_state_of_charge=True ---
     su_soc, su_name = _get_linopy_var(
         m, ["StorageUnit-state_of_charge", "StorageUnit-soc", "StorageUnit-energy"], strict=False,
     )
     if su_soc is not None:
         td = _get_time_dimension(su_soc)
+        cyclic_sus = network.storage_units.index[
+            network.storage_units.get("cyclic_state_of_charge", pd.Series(True, index=network.storage_units.index))
+        ].tolist()
+        # asset_dim ist der zweite Dim-Name (nicht Zeit)
+        asset_dim = [d for d in su_soc.dims if d != td][0]
         for s in scenarios:
             idx = _mask_to_isel_indices(masks[s])
             if len(idx) >= 2:
+                su_soc_cyclic = su_soc.sel({asset_dim: cyclic_sus})
                 m.add_constraints(
-                    su_soc.isel({td: int(idx[0])}) == su_soc.isel({td: int(idx[-1])}),
+                    su_soc_cyclic.isel({td: int(idx[0])}) == su_soc_cyclic.isel({td: int(idx[-1])}),
                     name=f"boundary::StorageUnit::cyclic::{s}",
                 )
-        logger.info("StorageUnit cyclic SOC constraints added (var=%s).", su_name)
+        logger.info(
+            "StorageUnit cyclic SOC constraints added (var=%s, %d/%d cyclic).",
+            su_name, len(cyclic_sus), len(network.storage_units),
+        )
 
+    # --- Stores: nur e_cyclic=True ---
     st_e, st_name = _get_linopy_var(
         m, ["Store-e", "Store-energy", "Store-state_of_charge"], strict=False,
     )
     if st_e is not None:
         td = _get_time_dimension(st_e)
+        cyclic_stores = network.stores.index[
+            network.stores.get("e_cyclic", pd.Series(True, index=network.stores.index))
+        ].tolist()
+        asset_dim = [d for d in st_e.dims if d != td][0]
+
+        skipped = [s_name for s_name in network.stores.index if s_name not in cyclic_stores]
+        if skipped:
+            logger.info(
+                "Store cyclic boundary skipped for %d non-cyclic stores: %s",
+                len(skipped), skipped[:5],
+            )
+
         for s in scenarios:
             idx = _mask_to_isel_indices(masks[s])
             if len(idx) >= 2:
+                st_e_cyclic = st_e.sel({asset_dim: cyclic_stores})
                 m.add_constraints(
-                    st_e.isel({td: int(idx[0])}) == st_e.isel({td: int(idx[-1])}),
+                    st_e_cyclic.isel({td: int(idx[0])}) == st_e_cyclic.isel({td: int(idx[-1])}),
                     name=f"boundary::Store::cyclic::{s}",
                 )
-        logger.info("Store cyclic energy constraints added (var=%s).", st_name)
+        logger.info(
+            "Store cyclic energy constraints added (var=%s, %d/%d cyclic).",
+            st_name, len(cyclic_stores), len(network.stores),
+        )
 
 
 # =============================================================================
@@ -1182,6 +1323,8 @@ def _dispatch_solve(
         solver_name=solver_name,
         solver_options=solver_options if solver_options is not None else {},
         extra_functionality=extra_dispatch,
+        io_api="mps"
+
     )
 
     model = getattr(n, "model", None)
@@ -1325,7 +1468,13 @@ def solve_robust_lexicographic(
     Two-stage lexicographic robust optimisation over stacked scenario network.
 
     Stage 1: min z_ls    s.t. z_ls >= LS_s  ∀s
+             CO2/budget GlobalConstraints are RELAXED in Stage 1 because load
+             shedding itself produces no CO2. Relaxing prevents infeasibility
+             when the CO2 budget is tight.
+
     Stage 2: min z_cost  s.t. z_cost >= Inv + Op_s  ∀s,  z_ls <= z_ls* + eps
+             CO2/budget GlobalConstraints are RESTORED for Stage 2 to guarantee
+             climate neutrality in the optimal investment portfolio.
 
     [PATCH-5] ls_penalty: configurable load-shedding marginal cost (default 1e4 €/MWh).
 
@@ -1349,12 +1498,34 @@ def solve_robust_lexicographic(
     if co2_cost_mode != "off":
         _detect_possible_co2_double_counting(n)
 
+
+
     for comp in ("storage_units", "stores"):
         df = getattr(n, comp, None)
         if df is not None and len(df) > 0:
-            for col in ("cyclic_state_of_charge", "cyclic_state_of_charge_per_period"):
+            for col in ("cyclic_state_of_charge", "cyclic_state_of_charge_per_period", "e_cyclic"):
                 if col in df.columns:
                     df[col] = False
+                    logger.info("Disabled '%s' for %s (%d components)", col, comp, len(df))
+
+    # ------------------------------------------------------------------
+    # CO2 / budget GlobalConstraints: relax for Stage 1, restore Stage 2
+    # Stage 1 only minimises load shedding — CO2 limits are irrelevant
+    # there and can make the problem infeasible when the budget is tight.
+    # ------------------------------------------------------------------
+    _CO2_KEYWORDS = ("co2", "CO2", "carbon", "Carbon", "emission", "Emission")
+
+    _gc_backup: Dict[str, float] = {}
+    for gc_name in list(n.global_constraints.index):
+        original = float(n.global_constraints.at[gc_name, "constant"])
+        sense = n.global_constraints.at[gc_name, "sense"]
+        relaxed = 1e12 if sense == "<=" else -1e12
+        _gc_backup[gc_name] = original
+        n.global_constraints.at[gc_name, "constant"] = relaxed
+        logger.info(
+            "Stage 1: relaxing GlobalConstraint '%s' (%s %.3e) → %.3e",
+            gc_name, sense, original, relaxed,
+        )
 
     def extra_stage1(network: pypsa.Network, snapshots: pd.Index) -> None:
         m = network.model
@@ -1369,7 +1540,7 @@ def solve_robust_lexicographic(
 
     logger.info("Stage 1: minimising worst-case load shedding ...")
     n.optimize(solver_name=solver_name, solver_options=solver_options,
-               extra_functionality=extra_stage1, assign_all_duals=True)
+               extra_functionality=extra_stage1, assign_all_duals=True,io_api="mps")
 
     _check_solver_status(n, "Stage 1", hard_fail_suboptimal=hard_fail_suboptimal)
     sol1 = _get_solution_dict(n)
@@ -1381,6 +1552,16 @@ def solve_robust_lexicographic(
         logger.warning("Clamping z_ls* = %.2e to 0 (numerical noise).", z_ls_star)
         z_ls_star = 0.0
     logger.info("Stage 1: z_ls* = %.6g", z_ls_star)
+
+    # ------------------------------------------------------------------
+    # Restore CO2 / budget GlobalConstraints for Stage 2
+    # ------------------------------------------------------------------
+    for gc_name, original in _gc_backup.items():
+        n.global_constraints.at[gc_name, "constant"] = original
+        logger.info(
+            "Stage 2: restoring GlobalConstraint '%s' → %.3e",
+            gc_name, original,
+        )
 
     try:
         if getattr(n, "model", None) is not None:
@@ -1411,7 +1592,7 @@ def solve_robust_lexicographic(
 
     logger.info("Stage 2: minimising worst-case total cost ...")
     n.optimize(solver_name=solver_name, solver_options=solver_options,
-               extra_functionality=extra_stage2, assign_all_duals=True)
+               extra_functionality=extra_stage2, assign_all_duals=True,io_api="mps")
 
     _check_solver_status(n, "Stage 2", hard_fail_suboptimal=hard_fail_suboptimal)
     sol2 = _get_solution_dict(n)
@@ -1435,6 +1616,10 @@ def solve_robust_lexicographic(
         "ls_penalty": float(ls_penalty),
         "fail_on_extendable_ramps": bool(fail_on_extendable_ramps),
         "co2_cost_mode": str(co2_cost_mode),
+        "relaxed_global_constraints": {
+            gc: {"original": orig}
+            for gc, orig in _gc_backup.items()
+        },
     }
 
     m2 = getattr(n, "model", None)
@@ -1461,7 +1646,6 @@ def solve_robust_lexicographic(
             logger.warning("Scenario-wise diagnostics failed (non-fatal): %s", exc)
 
     return diag
-
 
 # =============================================================================
 # Export helpers

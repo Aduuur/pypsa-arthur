@@ -1,0 +1,157 @@
+[1mdiff --cc Snakefile[m
+[1mindex 0c9d22a9,ccae9908..00000000[m
+[1m--- a/Snakefile[m
+[1m+++ b/Snakefile[m
+[36m@@@ -102,11 -112,7 +102,15 @@@[m [mrule build_natura_raster[m
+  [m
+  rule build_renewable_profiles:[m
+      input:[m
+[32m++<<<<<<< HEAD[m
+[32m +        base_network="networks/base.nc",[m
+[32m +        corine="data/bundle/corine/g250_clc06_V18_5.tif",[m
+[32m +        natura="resources/natura.tiff",[m
+[32m +        gebco="data/bundle/GEBCO_2014_2D.nc",[m
+[32m +        country_shapes='resources/country_shapes.geojson',[m
+[32m++=======[m
+[32m+         potentials="resources/potentials_{technology}.nc",[m
+[32m++>>>>>>> b30f4a2f (Update technology costs for wind)[m
+          regions=lambda wildcards: ("resources/regions_onshore.geojson"[m
+                                     if wildcards.technology in ('onwind', 'solar')[m
+                                     else "resources/regions_offshore.geojson"),[m
+[1mdiff --cc scripts/build_renewable_profiles.py[m
+[1mindex 7abd4202,b7e00cba..00000000[m
+[1m--- a/scripts/build_renewable_profiles.py[m
+[1m+++ b/scripts/build_renewable_profiles.py[m
+[36m@@@ -5,158 -5,65 +5,185 @@@[m [mimport atlit[m
+  import numpy as np[m
+  import xarray as xr[m
+  import pandas as pd[m
+[32m++<<<<<<< HEAD[m
+[32m +from multiprocessing import Pool[m
+[32m++=======[m
+[32m+ import geopandas as gpd[m
+[32m+ from pypsa.geo import haversine[m
+[32m+ from vresutils.array import spdiag[m
+[32m++>>>>>>> b30f4a2f (Update technology costs for wind)[m
+  [m
+[32m +import glaes as gl[m
+[32m +import geokit as gk[m
+[32m +from osgeo import gdal[m
+[32m +from scipy.sparse import csr_matrix, vstack[m
+[32m +[m
+[32m +from vresutils import landuse as vlanduse[m
+[32m +from vresutils.array import spdiag[m
+[32m +[m
+[32m +import progressbar as pgb[m
+  import logging[m
+  logger = logging.getLogger(__name__)[m
+[31m -logging.basicConfig(level=snakemake.config['logging_level'])[m
+  [m
+[31m -config = snakemake.config['renewable'][snakemake.wildcards.technology][m
+[32m +bounds = dx = dy = gebco = clc = natura = None[m
+[32m +def init_globals(n_bounds, n_dx, n_dy):[m
+[32m +    # global in each process of the multiprocessing.Pool[m
+[32m +    global bounds, dx, dy, gebco, clc, natura[m
+[32m +[m
+[32m +    bounds = n_bounds[m
+[32m +    dx = n_dx[m
+[32m +    dy = n_dy[m
+[32m +[m
+[32m +    gebco = gk.raster.loadRaster(snakemake.input.gebco)[m
+[32m +    gebco.SetProjection(gk.srs.loadSRS(4326).ExportToWkt())[m
+[32m +[m
+[32m +    clc = gk.raster.loadRaster(snakemake.input.corine)[m
+[32m +    clc.SetProjection(gk.srs.loadSRS(3035).ExportToWkt())[m
+[32m +[m
+[32m +    natura = gk.raster.loadRaster(snakemake.input.natura)[m
+[32m +[m
+[32m +def downsample_to_coarse_grid(bounds, dx, dy, mask, data):[m
+[32m +    # The GDAL warp function with the 'average' resample algorithm needs a band of zero values of at least[m
+[32m +    # the size of one coarse cell around the original raster or it produces erroneous results[m
+[32m +    orig = mask.createRaster(data=data)[m
+[32m +    padded_extent = mask.extent.castTo(bounds.srs).pad(max(dx, dy)).castTo(mask.srs)[m
+[32m +    padded = padded_extent.fit((mask.pixelWidth, mask.pixelHeight)).warp(orig, mask.pixelWidth, mask.pixelHeight)[m
+[32m +    orig = None # free original raster[m
+[32m +    average = bounds.createRaster(dx, dy, dtype=gdal.GDT_Float32)[m
+[32m +    assert gdal.Warp(average, padded, resampleAlg='average') == 1, "gdal warp failed: %s" % gdal.GetLastErrorMsg()[m
+[32m +    return average[m
+[32m +[m
+[32m +def calculate_potential(gid):[m
+[32m +    feature = gk.vector.extractFeature(snakemake.input.regions, where=gid)[m
+[32m +    ec = gl.ExclusionCalculator(feature.geom, srs=4326, pixelRes=1e-3) # about 100m in EU, it also works in LAEA 3035[m
+[32m +[m
+[32m +    corine = config.get("corine", {})[m
+[32m +    if isinstance(corine, list):[m
+[32m +        corine = {'grid_codes': corine}[m
+[32m +    if "grid_codes" in corine:[m
+[32m +        ec.excludeRasterType(clc, value=corine["grid_codes"], invert=True)[m
+[32m +    if corine.get("distance", 0.) > 0.:[m
+[32m +        ec.excludeRasterType(clc, value=corine["distance_grid_codes"], buffer=corine["distance"])[m
+[32m +[m
+[32m +    if config.get("natura", False):[m
+[32m +        ec.excludeRasterType(natura, value=1)[m
+[32m +    if "max_depth" in config:[m
+[32m +        ec.excludeRasterType(gebco, (None, -config["max_depth"]))[m
+[32m +[m
+[32m++<<<<<<< HEAD[m
+[32m +    # TODO compute a distance field as a raster beforehand[m
+[32m +    if 'max_shore_distance' in config:[m
+[32m +        ec.excludeVectorType(snakemake.input.country_shapes, buffer=config['max_shore_distance'], invert=True)[m
+[32m +    if 'min_shore_distance' in config:[m
+[32m +        ec.excludeVectorType(snakemake.input.country_shapes, buffer=config['min_shore_distance'])[m
+[32m +[m
+[32m +    availability = downsample_to_coarse_grid(bounds, dx, dy, ec.region, np.where(ec.region.mask, ec._availability, 0))[m
+[32m +[m
+[32m +    return csr_matrix(gk.raster.extractMatrix(availability).flatten() / 100.)[m
+[32m +[m
+[32m +[m
+[32m +if __name__ == '__main__':[m
+[32m +    pgb.streams.wrap_stderr()[m
+[32m +    logging.basicConfig(level=snakemake.config['logging_level'])[m
+[32m +[m
+[32m +    config = snakemake.config['renewable'][snakemake.wildcards.technology][m
+[32m +[m
+[32m +    time = pd.date_range(freq='m', **snakemake.config['snapshots'])[m
+[32m +    params = dict(years=slice(*time.year[[0, -1]]), months=slice(*time.month[[0, -1]]))[m
+[32m +[m
+[32m +    cutout = atlite.Cutout(config['cutout'],[m
+[32m +                        cutout_dir=os.path.dirname(snakemake.input.cutout),[m
+[32m +                        **params)[m
+[32m +[m
+[32m +    minx, maxx, miny, maxy = cutout.extent[m
+[32m +    dx = (maxx - minx) / (cutout.shape[1] - 1)[m
+[32m +    dy = (maxy - miny) / (cutout.shape[0] - 1)[m
+[32m +    bounds = gk.Extent.from_xXyY((minx - dx/2., maxx + dx/2.,[m
+[32m +                                  miny - dy/2., maxy + dy/2.))[m
+[32m +[m
+[32m +    # Use GLAES to compute available potentials and the transition matrix[m
+[32m +[m
+[32m +    with Pool(initializer=init_globals, initargs=(bounds, dx, dy),[m
+[32m +              maxtasksperchild=20, processes=snakemake.config['atlite'].get('nprocesses', 2)) as pool:[m
+[32m +        features = gk.vector.extractFeatures(snakemake.input.regions, onlyAttr=True) #.iloc[:10][m
+[32m +        buses = pd.Index(features['name'], name="bus")[m
+[32m +        widgets = [[m
+[32m +            pgb.widgets.Percentage(),[m
+[32m +            ' ', pgb.widgets.SimpleProgress(format='(%s)' % pgb.widgets.SimpleProgress.DEFAULT_FORMAT),[m
+[32m +            ' ', pgb.widgets.Bar(),[m
+[32m +            ' ', pgb.widgets.Timer(),[m
+[32m +            ' ', pgb.widgets.ETA()[m
+[32m +        ][m
+[32m +        progressbar = pgb.ProgressBar(prefix='Compute GIS potentials: ', widgets=widgets, max_value=len(features))[m
+[32m +        matrix = vstack(list(progressbar(pool.imap(calculate_potential, features.index))))[m
+  [m
+[31m -time = pd.date_range(freq='m', **snakemake.config['snapshots'])[m
+[31m -params = dict(years=slice(*time.year[[0, -1]]), months=slice(*time.month[[0, -1]]))[m
+[32m +    potentials = config['capacity_per_sqkm'] * vlanduse._cutout_cell_areas(cutout)[m
+[32m +    potmatrix = matrix * spdiag(potentials.ravel())[m
+[32m +    potmatrix.data[potmatrix.data < 1.] = 0 # ignore weather cells where only less than 1 MW can be installed[m
+[32m +    potmatrix.eliminate_zeros()[m
+  [m
+[31m -regions = gpd.read_file(snakemake.input.regions).set_index('name')[m
+[31m -regions.index.name = 'bus'[m
+[32m +    with pgb.ProgressBar(prefix='Compute capacity factors: ', max_value=1) as progressbar:[m
+[32m +        progressbar.update(0)[m
+[32m +        resource = config['resource'][m
+[32m +        func = getattr(cutout, resource.pop('method'))[m
+[32m +        correction_factor = config.get('correction_factor', 1.)[m
+[32m +        if correc

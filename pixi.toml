@@ -159,3 +159,6 @@ atlite = { path = "./atlite4cordex", editable = true }
 [environments]
 doc = { features = ["doc"], no-default-feature = true }
 test = ["test"]
+
+[activation]
+env = { GRPC_VERBOSITY = "NONE", GLOG_minloglevel = "3", ABSL_MIN_LOG_LEVEL = "3", TF_CPP_MIN_LOG_LEVEL = "3" }
