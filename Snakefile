@@ -638,3 +638,14 @@ elif MODE == "aro":
         run:
             Path(output[0]).parent.mkdir(parents=True, exist_ok=True)
             Path(output[0]).write_text("ok\n")
+
+
+rule analyze_aro_results:
+    input:
+        summary = "results/{run}/aro_summary.json",
+        network = "results/{run}/robust_portfolio.nc"
+    output:
+        convergence = "results/{run}/plots/aro_metrics/aro_convergence.png",
+        capacity = "results/{run}/plots/capacity/robust_capacity_breakdown.png"
+    script:
+        "plots_all/aro_analysis.py"
