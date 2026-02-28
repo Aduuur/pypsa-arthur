@@ -57,13 +57,14 @@ robust:
   out_network: "networks/robust.nc"
   out_summary: "results/robust_summary.json"
 
-  # Lexicographic tolerance
-  eps_ls: 1e-6
+
   aro:
     co2_cost_mode: "off"      # "off" | "global_constraint_constant_cost"
     ls_penalty: 10000          # €/MWh — muss > max(marginal_cost) aller Generatoren
     convergence_tol: 0.0001    # rel. Gap-Toleranz — 0.01%, auf 0.0 für klassisches ARO
-    dispatch_workers: 0
+    dispatch_workers: 1
+    # Lexicographic tolerance
+    eps_ls: 0.05
 
     initial_cutouts:
       - cutout_mCNRM-CERFACS-CM5_rcp45_2010
@@ -111,7 +112,7 @@ countries:
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#snapshots
 snapshots:
   start: "2010-01-01"
-  end: "2010-01-31"
+  end: "2010-12-31"
   inclusive: 'left'
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#enable

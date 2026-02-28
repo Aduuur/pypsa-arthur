@@ -41,6 +41,14 @@ def _mkdir(p: Union[str, Path]) -> Path:
 
 
 # -----------------------------------------------------------------------------
+# RUN NAME
+# -----------------------------------------------------------------------------
+# Define the run name once, and reuse it "wildcard-style" throughout the config.
+# You can override it via ENV: RUN_NAME="compare-robust-vol2"
+RUN_NAME: str = _env("RUN_NAME", "compare-robust-vol2")  # type: ignore[assignment]
+
+
+# -----------------------------------------------------------------------------
 # Master configuration block
 # -----------------------------------------------------------------------------
 MASTER_CONFIG: Dict[str, Any] = {
@@ -226,16 +234,16 @@ MASTER_CONFIG: Dict[str, Any] = {
     # You can reference these keys from scripts, and choose selection below.
     "scenarios": {
         # which scenario to load by default in "PlottingConfig"
-        # -> set to compare-robust-vol2 for now
-        "selection": _env("SCENARIO_SELECTION", "compare-robust-vol2"),  # or "both"
+        # -> set to RUN_NAME by default
+        "selection": _env("SCENARIO_SELECTION", RUN_NAME),  # or "both"
 
         # scenario registry: name -> list of network paths (or dict for multi)
         "registry": {
             # -------------------------------------------------------------------
-            # compare-robust-vol2
+            # RUN_NAME
             # -------------------------------------------------------------------
-            "compare-robust-vol2": [
-                "/home/endata/PycharmProjects/pypsa-ee/results/compare-robust-vol2/networks/base_s_24___2050.nc",
+            RUN_NAME: [
+                f"/home/endata/PycharmProjects/pypsa-ee/results/{RUN_NAME}/networks/base_s_24___2050.nc",
             ],
         },
 
@@ -272,7 +280,7 @@ MASTER_CONFIG: Dict[str, Any] = {
     # =======================================================================
     "aro": {
         # which ARO run is "active" (used by AROPlottingConfig wrapper)
-        "selected_run": _env("ARO_SELECTED_RUN", "compare-robust-vol2"),
+        "selected_run": _env("ARO_SELECTED_RUN", RUN_NAME),
 
         # countries to deep-dive for ARO worst-case / robust analyses
         "countries_to_analyze": ["ALL", "DE", "FR", "ES", "CH"],
@@ -288,15 +296,15 @@ MASTER_CONFIG: Dict[str, Any] = {
 
         # ARO runs (you can add unlimited runs)
         "runs": {
-        "compare-robust-vol2": {
-            "name": "compare-robust-vol2",
-            "summary_json": "{aro_results_base}/compare-robust-vol2/results/aro_summary.json",
-            "robust_network": "{aro_results_base}/compare-robust-vol2/networks/aro_robust.nc",
-            "robust_network_std": "{aro_results_base}/compare-robust-vol2/networks/aro_robust__std.nc",
-            "worst_case_dispatch": None,
-            "worst_case_dispatch_std": None,
-            "scenarios": [],
-        },
+            RUN_NAME: {
+                "name": RUN_NAME,
+                "summary_json": f"{{aro_results_base}}/{RUN_NAME}/results/aro_summary.json",
+                "robust_network": f"{{aro_results_base}}/{RUN_NAME}/networks/aro_robust.nc",
+                "robust_network_std": f"{{aro_results_base}}/{RUN_NAME}/networks/aro_robust__std.nc",
+                "worst_case_dispatch": None,
+                "worst_case_dispatch_std": None,
+                "scenarios": [],
+            },
         },
     },
 }

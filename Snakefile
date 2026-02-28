@@ -567,18 +567,6 @@ elif MODE == "robust":
 
 
 
-# Snakefile
-# Replace ONLY the aro_full_postprocess rule with this version.
-# (Problem: rules.plain_all.input contains callables (lambda w: ...), which are not valid
-# as input entries for another rule. We must materialize them via expand(), like plain_done does.)
-
-# Snakefile
-# Replace ONLY the aro_full_postprocess rule with this corrected version.
-# Reason for your SyntaxError:
-# In Snakemake/Python you cannot mix "named input entries" (aro_std=...)
-# with positional entries afterwards. So we name everything (or nothing).
-# Here: we name everything.
-
 elif MODE == "aro":
 
     rule aro_full_postprocess:
@@ -591,7 +579,7 @@ elif MODE == "aro":
         """
         input:
             aro_std=RESULTS + "networks/aro_robust__std.nc",
-
+            canonical=rules.aro_as_canonical_solved_network.output.canonical,
             costs_svg=expand(RESULTS + "graphs/costs.svg", run=config["run"]["name"]),
             power_network=expand(resources("maps/power-network.pdf"), run=config["run"]["name"]),
             power_network_clustered=expand(

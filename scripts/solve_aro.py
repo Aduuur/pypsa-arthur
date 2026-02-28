@@ -312,8 +312,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--solver-name", default="gurobi")
     p.add_argument("--solver-options-json", default=None,
                    help="JSON-String mit Solver-Optionen.")
-    p.add_argument("--eps-ls", type=float, default=1e-6,
-                   help="LS-Toleranz für solve_robust (--eps-ls-abs).")
+
 
     # Outputs
     p.add_argument("--out-std-network", default=None,
@@ -491,7 +490,6 @@ def main() -> None:
             "--out-summary-json", tmp_sum,
             "--solver-name", solver_name,
             "--solver-options-json", _solver_options_arg(solver_options),
-            "--eps-ls-abs", str(args.eps_ls),
             "--co2-cost-mode", co2_cost_mode,
             "--ls-penalty", str(ls_penalty),
         ]
@@ -601,7 +599,6 @@ def main() -> None:
         "--out-summary-json", args.out_summary_json,
         "--solver-name", solver_name,
         "--solver-options-json", _solver_options_arg(solver_options),
-        "--eps-ls-abs", str(args.eps_ls),
         "--co2-cost-mode", co2_cost_mode,
         "--ls-penalty", str(ls_penalty),
     ]

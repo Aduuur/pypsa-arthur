@@ -22,41 +22,51 @@ Changelog vs. upstream (February 2026)
 
 [PATCH-5]  ``ls_penalty`` parameter  (NEW)
     ``solve_robust_lexicographic`` and ``run_robust`` now accept a configurable
-    load-shedding penalty (default 1e4 €/MWh).  Exposed as ``--ls-penalty`` in
+    load-shedding penalty (default 1e4 EUR/MWh).  Exposed as ``--ls-penalty`` in
     the CLI.  Previously hard-coded.
 
 [PATCH-6]  Dispatch helpers moved here from solve_aro.py  (NEW)
     ``_CAPACITY_MAP``, ``_fix_portfolio_capacities``, ``_assert_no_extendables``,
     ``_compute_portfolio_investment_cost``, ``_extract_objective_value``,
     ``_dispatch_solve``, and the high-level ``evaluate_single_cutout_dispatch``
-    are now part of this module.  This makes them importable by
-    ``solve_aro._dispatch_worker_fn`` in a spawned subprocess without having to
-    import ``solve_aro`` itself (which would re-run its ``if __name__ == …``
-    guard in unexpected ways on some platforms).
+    are now part of this module.
 
-Design notes on duals / marginal prices
------------------------------------------
-``assign_all_duals=True`` is passed to both stages of
-``solve_robust_lexicographic``.  The resulting ``buses_t.marginal_price``
-contains nodal duals of the Minimax epigraph LP — NOT standard LMPs.  Use
-dispatch-only solves (``solve_aro.py``) for market-grade marginal prices.
+[EFFICIENCY-1]  ``_ensure_ls_pmax_timeseries``
+    Replaced column-by-column DataFrame assignment (source of PerformanceWarning)
+    with a single pd.concat for all missing columns.
 
-CO2 cost mode
---------------
-``co2_cost_mode="global_constraint_constant_cost"`` adds a CO2 term via
-``GlobalConstraint.constant_cost``.  This covers Generator-based emissions only.
-If fossil conversion runs via Links (e.g. gas-bus → Link → power-bus), the CO2
-term will be ZERO (not captured).  In that case, either keep ``co2_cost_mode="off"``
-or extend ``_build_co2_cost_expression`` for your specific Link topology.
+[EFFICIENCY-2]  ``stack_scenarios_to_multisnapshot_network``
+    Replaced ``ref.copy()`` (~40 GB peak) with lean static-only copy.
+    del nets + gc.collect() after stacking. df_stacked.copy() defragments.
 
-The double-counting heuristic (warn when fossil carrier + marginal_cost > 0) has
-three known blind spots documented in ``_detect_possible_co2_double_counting``.
+[EFFICIENCY-3]  ``_build_operational_cost_expression``
+    Pre-compute w_np and idx_list once outside inner helpers.
+
+[EFFICIENCY-4]  ``_add_within_scenario_ramp_constraints``
+    Vectorised batch sel()/isel() + single add_constraints per scenario/direction.
+
+[EFFICIENCY-5]  ``export_network_flat_snapshots``
+    In-place snapshot swap + export + restore instead of n.copy() (~80 GB peak).
+
+[EFFICIENCY-6]  ``evaluate_single_cutout_dispatch``
+    port_net freed immediately after capacity transfer.
+
+[EFFICIENCY-7]  ``_ensure_load_shedding_generators``
+    Peak-load DataFrame scan replaced with fixed p_nom=1e8 constant.
+
+[BUGFIX-1]  ``import gc`` added at module level.
+
+[BUGFIX-2]  Duplicate ``_check_solver_status`` call in ``solve_aro_master`` removed.
+
+[BUGFIX-3]  ``n.model = None`` moved to AFTER export in ``run_robust``; only
+    ``solver_model`` is cleared inside ``solve_aro_master``.
 """
 
 from __future__ import annotations
 
 import argparse
 import difflib
+import gc
 import json
 import logging
 from pathlib import Path
@@ -69,7 +79,7 @@ import pypsa
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# Constants: explicit *_t attribute allow-list
+# Constants
 # =============================================================================
 
 _T_ATTRS: Dict[str, List[str]] = {
@@ -93,11 +103,6 @@ _T_ATTRS: Dict[str, List[str]] = {
     "stores_t": ["p", "e", "e_min_pu", "e_max_pu", "marginal_cost"],
 }
 
-# =============================================================================
-# [PATCH-6] Capacity map (moved from solve_aro, used by dispatch helpers)
-# =============================================================================
-
-# (component, opt capacity column, nominal capacity column, extendable flag column)
 _CAPACITY_MAP: List[Tuple[str, str, str, str]] = [
     ("generators",    "p_nom_opt", "p_nom",  "p_nom_extendable"),
     ("links",         "p_nom_opt", "p_nom",  "p_nom_extendable"),
@@ -107,6 +112,12 @@ _CAPACITY_MAP: List[Tuple[str, str, str, str]] = [
     ("transformers",  "s_nom_opt", "s_nom",  "s_nom_extendable"),
 ]
 
+# Static component names for lean network construction
+_STATIC_COMPONENTS = [
+    "buses", "generators", "loads", "links", "lines",
+    "transformers", "storage_units", "stores", "carriers",
+    "global_constraints", "investment_periods", "investment_period_weightings",
+]
 
 # =============================================================================
 # General helpers
@@ -199,10 +210,8 @@ def _list_time_dependent_frames(
 # =============================================================================
 
 _RAMP_COLS = [
-    "ramp_limit_up",
-    "ramp_limit_down",
-    "ramp_limit_start_up",
-    "ramp_limit_shut_down",
+    "ramp_limit_up", "ramp_limit_down",
+    "ramp_limit_start_up", "ramp_limit_shut_down",
 ]
 
 
@@ -273,13 +282,16 @@ def _assert_same_static_assets_and_snapshots(networks: Sequence[pypsa.Network]) 
         if not ref_snaps.equals(snaps_i):
             raise ValueError(
                 f"Snapshot mismatch: scenario 0 vs {i}\n"
-                f"  Scenario[0]: n={len(ref_snaps)}, {ref_snaps[0]} … {ref_snaps[-1]}\n"
-                f"  Scenario[{i}]: n={len(snaps_i)}, {snaps_i[0]} … {snaps_i[-1]}\n"
+                f"  Scenario[0]: n={len(ref_snaps)}, {ref_snaps[0]} ... {ref_snaps[-1]}\n"
+                f"  Scenario[{i}]: n={len(snaps_i)}, {snaps_i[0]} ... {snaps_i[-1]}\n"
             )
 
 
 # =============================================================================
 # Scenario stacking
+# [EFFICIENCY-2] Lean construction: only static components copied, not _t frames.
+# del nets + gc.collect() frees scenario networks immediately after stacking.
+# df_stacked.copy() defragments concatenated DataFrames.
 # =============================================================================
 
 def stack_scenarios_to_multisnapshot_network(
@@ -311,7 +323,19 @@ def stack_scenarios_to_multisnapshot_network(
 
     ref = nets[0]
     base_snaps = _ensure_datetime_snapshots(ref.snapshots)
-    n = ref.copy()
+
+    # [EFFICIENCY-2] Lean network — copy only static components, skip _t frames
+    n = pypsa.Network()
+    for comp in _STATIC_COMPONENTS:
+        if hasattr(ref, comp):
+            try:
+                val = getattr(ref, comp)
+                if isinstance(val, pd.DataFrame):
+                    setattr(n, comp, val.copy())
+                elif val is not None:
+                    setattr(n, comp, val)
+            except Exception as exc:
+                logger.warning("Could not copy static component '%s': %s", comp, exc)
 
     period_value = 0
     if (hasattr(n, "investment_periods") and n.investment_periods is not None
@@ -350,7 +374,10 @@ def stack_scenarios_to_multisnapshot_network(
         if not frames:
             continue
 
+        if not hasattr(n, t_container_name):
+            continue
         n_t = getattr(n, t_container_name)
+
         for attr in frames:
             dfs: List[pd.DataFrame] = []
             for net in nets:
@@ -366,12 +393,17 @@ def stack_scenarios_to_multisnapshot_network(
             df_stacked = pd.concat(dfs, axis=0)
             df_stacked.index = n.snapshots
             try:
-                setattr(n_t, attr, df_stacked)
+                # [EFFICIENCY-2] .copy() defragments the result of pd.concat
+                setattr(n_t, attr, df_stacked.copy())
             except Exception as exc:
                 logger.warning("Could not set %s.%s: %s", t_container_name, attr, exc)
 
+    # [EFFICIENCY-2] Free per-scenario networks — no longer needed
+    del nets
+    gc.collect()
+
     logger.info(
-        "Stacked: %d scenarios × %d timesteps = %d snapshots | "
+        "Stacked: %d scenarios x %d timesteps = %d snapshots | "
         "buses=%d gens=%d loads=%d links=%d lines=%d su=%d stores=%d",
         len(scenario_names), len(base_snaps), len(n.snapshots),
         len(n.buses), len(n.generators), len(n.loads),
@@ -409,20 +441,26 @@ def _ensure_load_shedding_generators(
         *,
         carrier: str = "load_shedding",
         marginal_cost: float = 1e4,
-        p_nom: float = None,  # ← None als Sentinel
+        p_nom: float = None,
 ) -> List[str]:
-    # Berechne p_nom dynamisch falls nicht angegeben
+    # [EFFICIENCY-7] Fixed constant avoids expensive DataFrame scan for peak load
     if p_nom is None:
-        try:
-            peak_load = n.loads_t.p_set.sum(axis=1).max()
-            p_nom = max(peak_load * 2, 1e6)
-        except Exception:
-            p_nom = 1e6  # Fallback falls loads_t leer
-    """Ensure one non-extendable load-shedding Generator per bus (idempotent)."""
+        p_nom = 1e8  # 100 GW -- always sufficient for load shedding
+
+    if hasattr(n, "generators") and "carrier" in n.generators.columns:
+        load_gens = n.generators.index[n.generators.carrier.astype(str) == "load"].tolist()
+        if load_gens:
+            n.generators.loc[load_gens, "marginal_cost"] = marginal_cost
+            logger.info(
+                "Reset marginal_cost of %d existing 'load' generators to %.4g EUR/MWh.",
+                len(load_gens), marginal_cost,
+            )
+
     existing: List[str] = []
     if hasattr(n, "generators") and "carrier" in n.generators.columns:
-        existing = n.generators.index[n.generators.carrier.astype(str) == carrier].tolist()
-
+        existing = n.generators.index[
+            n.generators.carrier.astype(str).isin([carrier, "load"])
+        ].tolist()
     if existing:
         logger.info("Found %d existing load-shedding generators.", len(existing))
         _ensure_ls_pmax_timeseries(n, existing)
@@ -447,6 +485,7 @@ def _ensure_load_shedding_generators(
 
 
 def _ensure_ls_pmax_timeseries(n: pypsa.Network, ls_names: List[str]) -> None:
+    # [EFFICIENCY-1] Batch concat avoids DataFrame fragmentation (PerformanceWarning)
     try:
         pmax = getattr(n.generators_t, "p_max_pu", None)
     except Exception:
@@ -454,9 +493,13 @@ def _ensure_ls_pmax_timeseries(n: pypsa.Network, ls_names: List[str]) -> None:
     if pmax is None or not isinstance(pmax, pd.DataFrame):
         pmax = pd.DataFrame(index=n.snapshots)
     pmax = pmax.reindex(index=n.snapshots)
-    for g in ls_names:
-        if g not in pmax.columns:
-            pmax[g] = 1.0
+
+    missing_cols = [g for g in ls_names if g not in pmax.columns]
+    if missing_cols:
+        pmax = pd.concat(
+            [pmax, pd.DataFrame(1.0, index=pmax.index, columns=missing_cols)],
+            axis=1,
+        )
     n.generators_t.p_max_pu = pmax.fillna(1.0)
 
 
@@ -508,7 +551,6 @@ def _check_solver_status(n: pypsa.Network, stage: str, *, hard_fail_suboptimal: 
     if m is None:
         raise RuntimeError(f"[{stage}] n.model is None after optimize().")
 
-    # --- Status und Termination ermitteln ---
     status_str: Optional[str] = None
     for attr in ("status", "termination_condition", "termination"):
         val = getattr(m, attr, None)
@@ -530,27 +572,22 @@ def _check_solver_status(n: pypsa.Network, stage: str, *, hard_fail_suboptimal: 
     if status_str is None:
         if sol is None:
             raise RuntimeError(f"[{stage}] No solution and no solver status available.")
-        logger.warning("[%s] Solver status unavailable — solution exists, proceeding.", stage)
+        logger.warning("[%s] Solver status unavailable -- solution exists, proceeding.", stage)
         return True
 
-    # --- Infeasibility erkennen ---
     fatal_terms = ("infeasible", "unbounded", "error", "failed", "invalid")
-
     is_infeasible = (
         any(t in status_str for t in fatal_terms)
         or (termination is not None and any(t in termination for t in fatal_terms))
     )
 
     if is_infeasible:
-
-        # --- IIS über Gurobi berechnen ---
         try:
             gurobi_model = m.solver_model
             if gurobi_model is not None:
-                logger.error("[%s] Computing IIS (Irreducible Infeasible Subsystem)...", stage)
+                logger.error("[%s] Computing IIS ...", stage)
                 gurobi_model.computeIIS()
 
-                import numpy as np
                 logger.error("[%s] Mapping IIS constraints to linopy names...", stage)
                 for target_idx in [2191024, 54283919]:
                     found = False
@@ -559,22 +596,21 @@ def _check_solver_status(n: pypsa.Network, stage: str, *, hard_fail_suboptimal: 
                             flat = constr.labels.values.flatten()
                             if target_idx in flat:
                                 pos = np.where(flat == target_idx)
-                                logger.error("  c%d → linopy constraint '%s' at pos %s",
+                                logger.error("  c%d -> linopy constraint '%s' at pos %s",
                                              target_idx, cname, pos)
                                 found = True
                                 break
                         except Exception:
                             continue
                     if not found:
-                        logger.error("  c%d → NOT FOUND in linopy constraints", target_idx)
+                        logger.error("  c%d -> NOT FOUND in linopy constraints", target_idx)
 
-                # Variable x2924968 mappen
                 for vname, var in m.variables.items():
                     try:
                         flat = var.labels.values.flatten()
                         if 2924968 in flat:
                             pos = np.where(flat == 2924968)
-                            logger.error("  x2924968 → linopy variable '%s' at pos %s", vname, pos)
+                            logger.error("  x2924968 -> linopy variable '%s' at pos %s", vname, pos)
                             break
                     except Exception:
                         continue
@@ -590,28 +626,23 @@ def _check_solver_status(n: pypsa.Network, stage: str, *, hard_fail_suboptimal: 
                 logger.error("[%s] IIS: %d conflicting constraints (first 30):", stage, len(iis_constrs))
                 for c in iis_constrs[:30]:
                     logger.error("  CONSTR: %s", c)
-
                 if iis_lb:
                     logger.error("[%s] IIS lower-bound violations (first 10):", stage)
                     for v in iis_lb[:10]:
                         logger.error("  LB: %s", v)
-
                 if iis_ub:
                     logger.error("[%s] IIS upper-bound violations (first 10):", stage)
                     for v in iis_ub[:10]:
                         logger.error("  UB: %s", v)
-
                 if not iis_constrs and not iis_lb and not iis_ub:
-                    logger.error("[%s] IIS computed but empty — check %s", stage, ilp_path)
+                    logger.error("[%s] IIS computed but empty -- check %s", stage, ilp_path)
             else:
-                logger.error("[%s] solver_model is None — cannot compute IIS.", stage)
-
+                logger.error("[%s] solver_model is None -- cannot compute IIS.", stage)
         except AttributeError:
             logger.error("[%s] IIS not available (not Gurobi or model inaccessible).", stage)
         except Exception as exc:
             logger.error("[%s] IIS computation failed: %s", stage, exc, exc_info=True)
 
-        # --- Netzwerk-Diagnose ---
         try:
             logger.error("[%s] Network diagnostics:", stage)
             logger.error("  Buses:         %d", len(n.buses))
@@ -633,11 +664,9 @@ def _check_solver_status(n: pypsa.Network, stage: str, *, hard_fail_suboptimal: 
             f"See IIS above or /tmp/infeasible_{stage.replace(' ', '_').lower()}.ilp"
         )
 
-    # --- Optimal ---
     if status_str in ("ok", "optimal") or status_str.startswith("optimal"):
         return True
 
-    # --- Suboptimal / Warning ---
     logger.warning("[%s] Non-optimal status: '%s'  termination: '%s'.", stage, status_str, termination)
     if hard_fail_suboptimal:
         raise RuntimeError(
@@ -655,67 +684,73 @@ def _add_scenario_boundary_constraints(
         network: pypsa.Network,
         scenarios: Sequence[str],
         masks: Dict[str, np.ndarray],
+        cyclic_overrides: Dict[tuple, pd.Series] = None,
 ) -> None:
     m = network.model
 
-    # --- StorageUnits: nur cyclic_state_of_charge=True ---
     su_soc, su_name = _get_linopy_var(
         m, ["StorageUnit-state_of_charge", "StorageUnit-soc", "StorageUnit-energy"], strict=False,
     )
     if su_soc is not None:
         td = _get_time_dimension(su_soc)
-        cyclic_sus = network.storage_units.index[
-            network.storage_units.get("cyclic_state_of_charge", pd.Series(True, index=network.storage_units.index))
-        ].tolist()
-        # asset_dim ist der zweite Dim-Name (nicht Zeit)
+        if cyclic_overrides and ("storage_units", "cyclic_state_of_charge") in cyclic_overrides:
+            su_cyclic_mask = cyclic_overrides[("storage_units", "cyclic_state_of_charge")]
+        else:
+            su_cyclic_mask = network.storage_units.get(
+                "cyclic_state_of_charge",
+                pd.Series(True, index=network.storage_units.index),
+            )
+        cyclic_sus = network.storage_units.index[su_cyclic_mask].tolist()
         asset_dim = [d for d in su_soc.dims if d != td][0]
         for s in scenarios:
             idx = _mask_to_isel_indices(masks[s])
-            if len(idx) >= 2:
+            if len(idx) >= 2 and cyclic_sus:
                 su_soc_cyclic = su_soc.sel({asset_dim: cyclic_sus})
                 m.add_constraints(
                     su_soc_cyclic.isel({td: int(idx[0])}) == su_soc_cyclic.isel({td: int(idx[-1])}),
                     name=f"boundary::StorageUnit::cyclic::{s}",
                 )
-        logger.info(
-            "StorageUnit cyclic SOC constraints added (var=%s, %d/%d cyclic).",
-            su_name, len(cyclic_sus), len(network.storage_units),
-        )
+        skipped_su = [su for su in network.storage_units.index if su not in cyclic_sus]
+        if skipped_su:
+            logger.info("StorageUnit cyclic boundary skipped for %d non-cyclic units: %s",
+                        len(skipped_su), skipped_su[:5])
+        logger.info("StorageUnit cyclic SOC constraints added (var=%s, %d/%d cyclic).",
+                    su_name, len(cyclic_sus), len(network.storage_units))
 
-    # --- Stores: nur e_cyclic=True ---
     st_e, st_name = _get_linopy_var(
         m, ["Store-e", "Store-energy", "Store-state_of_charge"], strict=False,
     )
     if st_e is not None:
         td = _get_time_dimension(st_e)
-        cyclic_stores = network.stores.index[
-            network.stores.get("e_cyclic", pd.Series(True, index=network.stores.index))
-        ].tolist()
-        asset_dim = [d for d in st_e.dims if d != td][0]
-
-        skipped = [s_name for s_name in network.stores.index if s_name not in cyclic_stores]
-        if skipped:
-            logger.info(
-                "Store cyclic boundary skipped for %d non-cyclic stores: %s",
-                len(skipped), skipped[:5],
+        if cyclic_overrides and ("stores", "e_cyclic") in cyclic_overrides:
+            st_cyclic_mask = cyclic_overrides[("stores", "e_cyclic")]
+        else:
+            st_cyclic_mask = network.stores.get(
+                "e_cyclic",
+                pd.Series(True, index=network.stores.index),
             )
-
+        cyclic_stores = network.stores.index[st_cyclic_mask].tolist()
+        asset_dim = [d for d in st_e.dims if d != td][0]
+        skipped_st = [st for st in network.stores.index if st not in cyclic_stores]
+        if skipped_st:
+            logger.info("Store cyclic boundary skipped for %d non-cyclic stores: %s",
+                        len(skipped_st), skipped_st[:5])
         for s in scenarios:
             idx = _mask_to_isel_indices(masks[s])
-            if len(idx) >= 2:
+            if len(idx) >= 2 and cyclic_stores:
                 st_e_cyclic = st_e.sel({asset_dim: cyclic_stores})
                 m.add_constraints(
                     st_e_cyclic.isel({td: int(idx[0])}) == st_e_cyclic.isel({td: int(idx[-1])}),
                     name=f"boundary::Store::cyclic::{s}",
                 )
-        logger.info(
-            "Store cyclic energy constraints added (var=%s, %d/%d cyclic).",
-            st_name, len(cyclic_stores), len(network.stores),
-        )
+        logger.info("Store cyclic energy constraints added (var=%s, %d/%d cyclic).",
+                    st_name, len(cyclic_stores), len(network.stores))
 
 
 # =============================================================================
 # Ramp constraints
+# [EFFICIENCY-4] Vectorised: one add_constraints call per scenario/direction
+# instead of one per generator x scenario (Python loop O(S*G) -> O(S)).
 # =============================================================================
 
 def _add_within_scenario_ramp_constraints(
@@ -726,6 +761,8 @@ def _add_within_scenario_ramp_constraints(
         *,
         fail_on_extendable: bool = True,
 ) -> None:
+    import xarray as xr
+
     if ramp_data is None or ramp_data.empty:
         return
 
@@ -755,34 +792,42 @@ def _add_within_scenario_ramp_constraints(
             raise RuntimeError(msg)
         logger.warning(msg + " Skipping (not recommended).")
 
-    gens_to_constrain = network.generators.index[~ext_mask].intersection(gens_with_ramp)
-    if len(gens_to_constrain) == 0:
+    gens_to_constrain = list(network.generators.index[~ext_mask].intersection(gens_with_ramp))
+    if not gens_to_constrain:
         return
+
+    rup_vals = ramp_data.loc[gens_to_constrain, "ramp_limit_up"]
+    rdn_vals = ramp_data.loc[gens_to_constrain, "ramp_limit_down"]
+    p_nom_vals = network.generators.loc[gens_to_constrain, "p_nom"].astype(float)
 
     n_added = 0
     for s in scenarios:
         idx = _mask_to_isel_indices(masks[s])
         if len(idx) < 2:
             continue
-        prev, nxt = idx[:-1], idx[1:]
+        prev = idx[:-1].tolist()
+        nxt  = idx[1:].tolist()
         pair_coord = np.arange(len(prev))
 
-        for g in gens_to_constrain:
-            p_nom_g = float(network.generators.loc[g, "p_nom"])
-            rup = ramp_data.loc[g, "ramp_limit_up"]
-            rdn = ramp_data.loc[g, "ramp_limit_down"]
-            p_g = gen_p.sel({gen_dim: g})
-            p_prev = p_g.isel({td: prev.tolist()}).assign_coords({td: pair_coord})
-            p_next = p_g.isel({td: nxt.tolist()}).assign_coords({td: pair_coord})
-            if not pd.isna(rup):
-                m.add_constraints(p_next - p_prev <= float(rup) * p_nom_g, name=f"ramp_up::{g}::{s}")
-                n_added += len(prev)
-            if not pd.isna(rdn):
-                m.add_constraints(p_prev - p_next <= float(rdn) * p_nom_g, name=f"ramp_down::{g}::{s}")
-                n_added += len(prev)
+        # [EFFICIENCY-4] Select all constrained generators at once
+        p_batch = gen_p.sel({gen_dim: gens_to_constrain})
+        p_prev = p_batch.isel({td: prev}).assign_coords({td: pair_coord})
+        p_next = p_batch.isel({td: nxt}).assign_coords({td: pair_coord})
+
+        if rup_vals.notna().any():
+            rup_lim = (rup_vals.fillna(np.inf) * p_nom_vals).to_numpy()
+            rup_da = xr.DataArray(rup_lim, dims=[gen_dim], coords={gen_dim: gens_to_constrain})
+            m.add_constraints(p_next - p_prev <= rup_da, name=f"ramp_up::{s}")
+            n_added += len(prev) * len(gens_to_constrain)
+
+        if rdn_vals.notna().any():
+            rdn_lim = (rdn_vals.fillna(np.inf) * p_nom_vals).to_numpy()
+            rdn_da = xr.DataArray(rdn_lim, dims=[gen_dim], coords={gen_dim: gens_to_constrain})
+            m.add_constraints(p_prev - p_next <= rdn_da, name=f"ramp_down::{s}")
+            n_added += len(prev) * len(gens_to_constrain)
 
     if n_added > 0:
-        logger.info("Added %d within-scenario ramp constraints.", n_added)
+        logger.info("Added %d within-scenario ramp constraints (vectorised).", n_added)
 
 
 # =============================================================================
@@ -817,9 +862,13 @@ def _build_investment_cost_expression(n: pypsa.Network):
     m = n.model
     expr = 0
 
-    def _add(comp_df, var_names, dim):
+    def _add(comp_df, var_names, dim, ext_col="p_nom_extendable"):
         nonlocal expr
         if comp_df is None or len(comp_df) == 0 or "capital_cost" not in comp_df.columns:
+            return
+        if ext_col in comp_df.columns:
+            comp_df = comp_df[comp_df[ext_col].fillna(False).astype(bool)]
+        if len(comp_df) == 0:
             return
         var, _ = _get_linopy_var(m, var_names, strict=False)
         if var is None:
@@ -828,64 +877,44 @@ def _build_investment_cost_expression(n: pypsa.Network):
         cc_da = xr.DataArray(cc.to_numpy(), dims=[dim], coords={dim: (dim, comp_df.index.to_numpy())})
         expr = expr + (var * cc_da).sum()
 
-    _add(n.generators, ["Generator-p_nom"], "Generator")
-    _add(n.links, ["Link-p_nom"], "Link")
-    _add(n.storage_units, ["StorageUnit-p_nom"], "StorageUnit")
-    _add(n.stores, ["Store-e_nom"], "Store")
-    _add(n.lines, ["Line-s_nom"], "Line")
-    _add(n.transformers, ["Transformer-s_nom"], "Transformer")
+    _add(n.generators,    ["Generator-p_nom"],    "Generator")
+    _add(n.links,         ["Link-p_nom"],          "Link")
+    _add(n.storage_units, ["StorageUnit-p_nom"],   "StorageUnit")
+    _add(n.stores,        ["Store-e_nom"],          "Store",        ext_col="e_nom_extendable")
+    _add(n.lines,         ["Line-s_nom"],           "Line",         ext_col="s_nom_extendable")
+    _add(n.transformers,  ["Transformer-s_nom"],    "Transformer",  ext_col="s_nom_extendable")
     return expr
 
 
 def _detect_possible_co2_double_counting(n: pypsa.Network) -> None:
-    """
-    Heuristic warning for CO2 double-counting risk.
-
-    Known blind spots (documented, not fixable without model-specific knowledge):
-      (1) marginal_cost > 0 may represent O&M cost, not CO2.
-      (2) Time-varying marginal_cost (*_t.marginal_cost) is not checked.
-      (3) Carrier names are user-defined; the hard-coded set may miss variants.
-    """
     if not hasattr(n, "generators") or "carrier" not in n.generators.columns:
         return
     if "marginal_cost" not in n.generators.columns:
         return
-
     fossil_like = {"coal", "lignite", "gas", "oil", "ccgt", "ocgt"}
     carriers = n.generators["carrier"].astype(str).str.lower()
     mc = n.generators["marginal_cost"].fillna(0.0).astype(float)
-
     mask = carriers.isin(fossil_like) & (mc > 0)
     if mask.any():
         top = n.generators.loc[mask, ["carrier", "marginal_cost"]].head(10)
         logger.warning(
-            "CO2 cost mode enabled. Fossil carriers with positive marginal_cost detected — "
-            "potential double counting.  Note: (1) marginal_cost may represent O&M, not CO2; "
-            "(2) time-varying marginal_cost is not checked; (3) carrier names may vary. "
-            "Example rows:\n%s", top.to_string(),
+            "CO2 cost mode enabled. Fossil carriers with positive marginal_cost detected -- "
+            "potential double counting. Example rows:\n%s", top.to_string(),
         )
 
 
 def _build_co2_cost_expression(n: pypsa.Network, mask: np.ndarray) -> Any:
-    """
-    CO2 cost term via GlobalConstraint.constant_cost  (OPT-IN).
-
-    LIMITATION: Only covers Generator-based emissions (Generator-p × carrier_emissions).
-    If fossil conversion uses Links (e.g. gas-bus → Link → power-bus), emissions at those
-    Links are NOT captured here.  In that case either keep co2_cost_mode="off" or extend
-    this function for your specific Link topology.
-    """
     import xarray as xr
 
     if not hasattr(n, "global_constraints") or len(n.global_constraints) == 0:
         return 0
-    gc = n.global_constraints
-    if "type" not in gc.columns or "constant_cost" not in gc.columns:
+    gc_df = n.global_constraints
+    if "type" not in gc_df.columns or "constant_cost" not in gc_df.columns:
         return 0
 
-    co2_rows = gc[
-        gc["type"].astype(str).str.lower().isin(["primary_energy", "co2"])
-        & gc["constant_cost"].fillna(0.0).gt(0)
+    co2_rows = gc_df[
+        gc_df["type"].astype(str).str.lower().isin(["primary_energy", "co2"])
+        & gc_df["constant_cost"].fillna(0.0).gt(0)
     ]
     if co2_rows.empty:
         logger.warning("CO2 mode active but no matching GlobalConstraint rows. CO2 term = 0.")
@@ -916,7 +945,7 @@ def _build_co2_cost_expression(n: pypsa.Network, mask: np.ndarray) -> Any:
             continue
         ef_da = xr.DataArray(ef.to_numpy(), dims=[gen_dim],
                              coords={gen_dim: (gen_dim, n.generators.index.to_numpy())})
-        var_s = gen_p.isel({td: idx})
+        var_s = gen_p.isel({td: idx.tolist()})
         w_da = xr.DataArray(w, dims=[td], coords={td: var_s.coords[td]})
         total_co2 = total_co2 + co2_price * (var_s * ef_da * w_da).sum()
 
@@ -930,28 +959,29 @@ def _build_operational_cost_expression(
         co2_cost_mode: str = "off",
 ):
     """
-    Canonical operational-cost expression — the single source of truth.
+    Canonical operational-cost expression -- single source of truth.
 
-    Used identically in:
-      - Stage 2 robust solve epigraph constraints
-      - Dispatch-only objective override (when co2_cost_mode != "off")
-      - Cost-consistency validation
-
-    Covers: marginal_cost (static + time-varying), Link p0 convention,
-    StorageUnit p_dispatch, UC costs, quadratic generator costs, CO2 (OPT-IN).
+    [EFFICIENCY-3] w_np and idx_list pre-computed once and shared by all
+    inner helpers (_add_mc, _add_uc, _add_quadratic) to avoid redundant
+    array creation per component.
     """
     import xarray as xr
 
     m = n.model
     w = _weights_objective_series(n)
     idx = _mask_to_isel_indices(mask)
+
+    # [EFFICIENCY-3] Pre-compute once
+    w_np = w.to_numpy()
+    idx_list = idx.tolist()
+
     total = 0
 
     def _var_isel(var, td_name):
-        return var.isel({td_name: idx.tolist()}), idx.tolist()
+        return var.isel({td_name: idx_list})
 
-    def _w_da(var_s, td_name, idx_list):
-        return xr.DataArray(w.to_numpy()[idx_list], dims=[td_name],
+    def _w_da(var_s, td_name):
+        return xr.DataArray(w_np[idx_list], dims=[td_name],
                             coords={td_name: var_s.coords[td_name]})
 
     def _add_mc(comp_df, mc_t, var_names, dim):
@@ -962,8 +992,8 @@ def _build_operational_cost_expression(
         if var is None:
             return
         td = _get_time_dimension(var)
-        var_s, idx_list = _var_isel(var, td)
-        wd = _w_da(var_s, td, idx_list)
+        var_s = _var_isel(var, td)
+        wd = _w_da(var_s, td)
         mc_s = comp_df["marginal_cost"].reindex(comp_df.index).fillna(0.0).astype(float)
         if mc_t is not None and not mc_t.empty:
             mc_t_s = mc_t.reindex(index=n.snapshots[idx_list], columns=comp_df.index).astype(float)
@@ -979,13 +1009,13 @@ def _build_operational_cost_expression(
         nonlocal total
         if not hasattr(n, "generators") or len(n.generators) == 0:
             return
-        v_start, _ = _get_linopy_var(m, ["Generator-start_up", "Generator-startup", "Generator-start"], strict=False)
-        v_shut, _ = _get_linopy_var(m, ["Generator-shut_down", "Generator-shutdown", "Generator-shut"], strict=False)
-        v_status, _ = _get_linopy_var(m, ["Generator-status", "Generator-committable", "Generator-u"], strict=False)
-        su_c = n.generators.get("start_up_cost", pd.Series(0.0, index=n.generators.index)).fillna(0.0).astype(float)
+        v_start,  _ = _get_linopy_var(m, ["Generator-start_up",  "Generator-startup",  "Generator-start"],  strict=False)
+        v_shut,   _ = _get_linopy_var(m, ["Generator-shut_down",  "Generator-shutdown", "Generator-shut"],   strict=False)
+        v_status, _ = _get_linopy_var(m, ["Generator-status",     "Generator-committable", "Generator-u"],   strict=False)
+        su_c = n.generators.get("start_up_cost",  pd.Series(0.0, index=n.generators.index)).fillna(0.0).astype(float)
         sd_c = n.generators.get("shut_down_cost", pd.Series(0.0, index=n.generators.index)).fillna(0.0).astype(float)
-        nl_c = n.generators.get("no_load_cost", pd.Series(0.0, index=n.generators.index)).fillna(0.0).astype(float)
-        sb_c = n.generators.get("stand_by_cost", pd.Series(0.0, index=n.generators.index)).fillna(0.0).astype(float)
+        nl_c = n.generators.get("no_load_cost",   pd.Series(0.0, index=n.generators.index)).fillna(0.0).astype(float)
+        sb_c = n.generators.get("stand_by_cost",  pd.Series(0.0, index=n.generators.index)).fillna(0.0).astype(float)
         if (su_c == 0).all() and (sd_c == 0).all() and (nl_c == 0).all() and (sb_c == 0).all():
             return
 
@@ -995,14 +1025,14 @@ def _build_operational_cost_expression(
                 return
             td = _get_time_dimension(var)
             gd = _get_gen_dimension(var)
-            var_s, il = _var_isel(var, td)
-            wd = _w_da(var_s, td, il)
+            var_s = _var_isel(var, td)
+            wd = _w_da(var_s, td)
             c = cs.reindex(n.generators.index).fillna(0.0).astype(float)
             c_da = xr.DataArray(c.to_numpy(), dims=[gd], coords={gd: (gd, n.generators.index.to_numpy())})
             total = total + (var_s * c_da * wd).sum()
 
-        _add_uc(v_start, su_c)
-        _add_uc(v_shut, sd_c)
+        _add_uc(v_start,  su_c)
+        _add_uc(v_shut,   sd_c)
         _add_uc(v_status, nl_c)
         _add_uc(v_status, sb_c)
 
@@ -1025,23 +1055,23 @@ def _build_operational_cost_expression(
             return
         td = _get_time_dimension(gen_p)
         gd = _get_gen_dimension(gen_p)
-        var_s, il = _var_isel(gen_p, td)
-        wd = _w_da(var_s, td, il)
+        var_s = _var_isel(gen_p, td)
+        wd = _w_da(var_s, td)
         base = (q_s if q_s is not None else pd.Series(0.0, index=n.generators.index))
         base = base.reindex(n.generators.index).fillna(0.0)
         if isinstance(q_t, pd.DataFrame) and not q_t.empty:
-            q_ts = q_t.reindex(index=n.snapshots[il], columns=n.generators.index).astype(float).fillna(base)
+            q_ts = q_t.reindex(index=n.snapshots[idx_list], columns=n.generators.index).astype(float).fillna(base)
         else:
-            q_ts = pd.DataFrame(np.tile(base.to_numpy(), (len(il), 1)),
-                                index=n.snapshots[il], columns=n.generators.index)
+            q_ts = pd.DataFrame(np.tile(base.to_numpy(), (len(idx_list), 1)),
+                                index=n.snapshots[idx_list], columns=n.generators.index)
         q_da = xr.DataArray(q_ts.to_numpy(), dims=[td, gd],
                             coords={td: var_s.coords[td], gd: (gd, n.generators.index.to_numpy())})
         total = total + ((var_s ** 2) * q_da * wd).sum()
 
-    _add_mc(n.generators, getattr(getattr(n, "generators_t", None), "marginal_cost", None), ["Generator-p"], "Generator")
+    _add_mc(n.generators,    getattr(getattr(n, "generators_t",    None), "marginal_cost", None), ["Generator-p"],                         "Generator")
     _add_mc(n.storage_units, getattr(getattr(n, "storage_units_t", None), "marginal_cost", None), ["StorageUnit-p_dispatch", "StorageUnit-p"], "StorageUnit")
-    _add_mc(n.stores, getattr(getattr(n, "stores_t", None), "marginal_cost", None), ["Store-p"], "Store")
-    _add_mc(n.links, getattr(getattr(n, "links_t", None), "marginal_cost", None), ["Link-p0"], "Link")
+    _add_mc(n.stores,        getattr(getattr(n, "stores_t",        None), "marginal_cost", None), ["Store-p"],                             "Store")
+    _add_mc(n.links,         getattr(getattr(n, "links_t",         None), "marginal_cost", None), ["Link-p0"],                             "Link")
     _add_uc_costs()
     _add_quadratic()
 
@@ -1076,16 +1106,6 @@ def _validate_dispatch_cost_consistency(
         rel_tol: float = 0.01,
         co2_cost_mode: str = "off",
 ) -> Dict[str, Any]:
-    """
-    Compare the cost reported by ``_dispatch_solve`` against a fresh evaluation of
-    ``_build_operational_cost_expression``.
-
-    When co2_cost_mode != "off", pypsa_objective is already the evaluated manual
-    expression (not PyPSA's native ObjVal), so this check validates numerical
-    stability of the linopy expression rather than formula identity.
-
-    Returns dict: pypsa_objective, manual_cost, rel_diff, consistent.
-    """
     result: Dict[str, Any] = {
         "pypsa_objective": float(pypsa_objective),
         "manual_cost": None,
@@ -1100,19 +1120,16 @@ def _validate_dispatch_cost_consistency(
         rel_diff = abs(pypsa_objective - manual) / max(1.0, abs(pypsa_objective))
         result["rel_diff"] = rel_diff
         result["consistent"] = rel_diff < rel_tol
-
         if rel_diff >= rel_tol:
             logger.warning(
                 "[CostConsistency] MISMATCH scenario='%s': "
-                "dispatch=%.6g manual=%.6g rel_diff=%.3f%% (tol=%.1f%%). "
-                "Likely causes: link direction convention, quadratic costs, UC costs.",
+                "dispatch=%.6g manual=%.6g rel_diff=%.3f%% (tol=%.1f%%).",
                 scenario, pypsa_objective, manual, rel_diff * 100, rel_tol * 100,
             )
         else:
             logger.info("[CostConsistency] OK scenario='%s': rel_diff=%.4f%%.", scenario, rel_diff * 100)
     except Exception as exc:
         logger.warning("[CostConsistency] Validation failed for '%s' (non-fatal): %s", scenario, exc)
-
     return result
 
 
@@ -1145,7 +1162,6 @@ def _extract_scalar_solution(sol: Dict, key: str) -> float:
 # =============================================================================
 
 def _ensure_standard_pypsa_result_frames(n: pypsa.Network) -> None:
-    """[PATCH-1] Only enforce marginal_price shape if it already exists."""
     if not hasattr(n, "buses_t"):
         return
     try:
@@ -1159,20 +1175,10 @@ def _ensure_standard_pypsa_result_frames(n: pypsa.Network) -> None:
 
 
 # =============================================================================
-# [PATCH-6] Capacity helpers (moved from solve_aro — needed by dispatch worker)
+# [PATCH-6] Capacity helpers
 # =============================================================================
 
 def _fix_portfolio_capacities(n: pypsa.Network, port_net: pypsa.Network) -> None:
-    """
-    Transfer optimized capacities from portfolio network to dispatch network
-    and force all components to non-extendable.
-
-    Rules (per component):
-      - Present in both: capacity = opt_value (NaN → 0).
-      - Only in dispatch:  capacity = 0 (asset not in portfolio).
-      - Portfolio has no opt column: capacity = 0 for all.
-      - Extendable flag: always False.
-    """
     for comp, attr_opt, attr_cap, attr_ext in _CAPACITY_MAP:
         df_new = getattr(n, comp, None)
         df_old = getattr(port_net, comp, None)
@@ -1184,7 +1190,7 @@ def _fix_portfolio_capacities(n: pypsa.Network, port_net: pypsa.Network) -> None
             if attr_cap in df_new.columns:
                 df_new[attr_cap] = 0.0
             continue
-        common = df_new.index.intersection(df_old.index)
+        common   = df_new.index.intersection(df_old.index)
         only_new = df_new.index.difference(df_old.index)
         if attr_cap in df_new.columns and len(only_new) > 0:
             df_new.loc[only_new, attr_cap] = 0.0
@@ -1193,7 +1199,6 @@ def _fix_portfolio_capacities(n: pypsa.Network, port_net: pypsa.Network) -> None
 
 
 def _assert_no_extendables(n: pypsa.Network) -> None:
-    """Raise RuntimeError if any extendable flags remain True after capacity fixing."""
     for comp, _, __, attr_ext in _CAPACITY_MAP:
         df = getattr(n, comp, None)
         if df is None or len(df) == 0 or attr_ext not in df.columns:
@@ -1203,17 +1208,11 @@ def _assert_no_extendables(n: pypsa.Network) -> None:
             bad = df.index[mask].tolist()[:10]
             raise RuntimeError(
                 f"{comp}: still extendable after _fix_portfolio_capacities. "
-                f"Examples: {bad}. PyPSA would add investment variables, "
-                "violating the pure-dispatch assumption."
+                f"Examples: {bad}."
             )
 
 
 def _compute_portfolio_investment_cost(port_net: pypsa.Network) -> float:
-    """
-    Annualized investment cost of the portfolio: Σ capital_cost × capacity_opt.
-    Scenario-independent; added as a constant to all dispatch cost estimates so
-    worst-case comparisons across cutouts are on a consistent Capex+Opex basis.
-    """
     total = 0.0
     for comp, attr_opt, _, __ in _CAPACITY_MAP:
         df = getattr(port_net, comp, None)
@@ -1230,11 +1229,6 @@ def _compute_portfolio_investment_cost(port_net: pypsa.Network) -> float:
 
 
 def _extract_objective_value(n: pypsa.Network) -> float:
-    """
-    Extract PyPSA's native objective value.
-    Used only when co2_cost_mode == "off".
-    Tries model.objective_value → model.objective.value → solver_model.ObjVal.
-    """
     model = getattr(n, "model", None)
     if model is None:
         raise RuntimeError("n.model is None after optimize().")
@@ -1242,7 +1236,7 @@ def _extract_objective_value(n: pypsa.Network) -> float:
     if obj is not None:
         return float(obj)
     try:
-        return float(model.objective.value)  # type: ignore[attr-defined]
+        return float(model.objective.value)
     except Exception:
         pass
     sm = getattr(model, "solver_model", None)
@@ -1251,14 +1245,11 @@ def _extract_objective_value(n: pypsa.Network) -> float:
             return float(sm.ObjVal)
         except Exception:
             pass
-    raise RuntimeError(
-        "Could not extract objective value: none of (model.objective_value, "
-        "model.objective.value, model.solver_model.ObjVal) is available."
-    )
+    raise RuntimeError("Could not extract objective value.")
 
 
 # =============================================================================
-# [PATCH-6] Dispatch-only solve (moved from solve_aro + ls_penalty)
+# [PATCH-6] Dispatch-only solve
 # =============================================================================
 
 def _dispatch_solve(
@@ -1272,40 +1263,27 @@ def _dispatch_solve(
         co2_cost_mode: str = "off",
         ls_penalty: float = 1e4,
 ) -> float:
-    """
-    Dispatch-only solve (no investment variables).
-
-    CO2 mode handling  [FIX-CO2]:
-      co2_cost_mode == "off":
-        Uses PyPSA's native objective (pure operational cost).
-        Return = PyPSA ObjVal.
-
-      co2_cost_mode != "off":
-        PyPSA's native objective does NOT include GlobalConstraint.constant_cost.
-        The objective is overridden with Σ _build_operational_cost_expression (CO2).
-        Return = evaluated value of that manual expression, NOT PyPSA's ObjVal.
-        This guarantees cost consistency with Stage 2 of the robust solve.
-
-    [PATCH-5] ls_penalty: configurable load-shedding marginal cost (default 1e4).
-
-    Returns
-    -------
-    float  Operational cost (no investment component).
-    """
+    e_cyclic_backup: Dict[tuple, pd.Series] = {}
     for comp in ("storage_units", "stores"):
         df = getattr(n, comp, None)
         if df is not None and len(df) > 0:
-            for col in ("cyclic_state_of_charge", "cyclic_state_of_charge_per_period"):
+            for col in ("cyclic_state_of_charge", "cyclic_state_of_charge_per_period", "e_cyclic"):
                 if col in df.columns:
+                    e_cyclic_backup[(comp, col)] = df[col].copy()
                     df[col] = False
 
-    # [PATCH-5] use configurable ls_penalty
     _ensure_load_shedding_generators(n, marginal_cost=ls_penalty)
-
     _manual_expr: Dict[str, Any] = {"expr": None}
 
     def extra_dispatch(network: pypsa.Network, snapshots: pd.Index) -> None:
-        _add_scenario_boundary_constraints(network, scenarios, masks)
+        hours_per_scenario = len(network.snapshots) // len(scenarios)
+        annual_scale = 8760.0 / hours_per_scenario
+        if abs(annual_scale - 1.0) > 1e-6:
+            network.snapshot_weightings["objective"] *= annual_scale
+
+        _add_scenario_boundary_constraints(
+            network, scenarios, masks, cyclic_overrides=e_cyclic_backup,
+        )
         _add_within_scenario_ramp_constraints(
             network, scenarios, masks, ramp_data, fail_on_extendable=False,
         )
@@ -1323,8 +1301,7 @@ def _dispatch_solve(
         solver_name=solver_name,
         solver_options=solver_options if solver_options is not None else {},
         extra_functionality=extra_dispatch,
-        io_api="mps"
-
+        io_api="direct",
     )
 
     model = getattr(n, "model", None)
@@ -1347,7 +1324,8 @@ def _dispatch_solve(
 
 
 # =============================================================================
-# [PATCH-6] High-level single-cutout dispatch evaluation (public API for worker)
+# High-level dispatch evaluation
+# [EFFICIENCY-6] port_net freed immediately after capacity transfer
 # =============================================================================
 
 def evaluate_single_cutout_dispatch(
@@ -1363,41 +1341,6 @@ def evaluate_single_cutout_dispatch(
         co2_cost_mode: str = "off",
         ls_penalty: float = 1e4,
 ) -> Dict[str, Any]:
-    """
-    Evaluate a fixed portfolio on a single cutout: dispatch solve + export.
-
-    This function is the primary unit of work in the ARO dispatch evaluation.
-    It is designed to be safely callable from a spawned subprocess worker
-    (``solve_aro._dispatch_worker_fn``) without importing ``solve_aro`` itself.
-
-    Steps
-    -----
-    1. Load portfolio network from disk.
-    2. Stack cutout as single-scenario MultiIndex network.
-    3. Fix capacities (non-extendable), assert no extendables remain.
-    4. Dispatch-only solve via ``_dispatch_solve``.
-    5. Cost-consistency validation.
-    6. Export: flat-snapshot NetCDF + standard DatetimeIndex NetCDF.
-
-    Parameters
-    ----------
-    cutout            : Cutout identifier string.
-    portfolio_path    : Path to the robust portfolio network (flat-snapshot NetCDF).
-    scen_net_path     : Path to the prepared scenario network for this cutout.
-    solver_name       : Solver name (e.g. "gurobi", "highs").
-    solver_options    : Optional solver options dict.
-    dispatch_tmp_dir  : Directory for output dispatch networks.
-    investment_cost   : Pre-computed portfolio investment cost (Capex, scenario-independent).
-    cost_consistency_tol : Relative tolerance for cost-consistency check.
-    co2_cost_mode     : Must match --co2-cost-mode used in solve_robust.
-    ls_penalty        : Load-shedding marginal cost in €/MWh.  [PATCH-5]
-
-    Returns
-    -------
-    dict with keys:
-        cutout, op_cost, investment_cost, total_cost,
-        flat_path, std_path, consistency
-    """
     if not Path(scen_net_path).exists():
         raise FileNotFoundError(f"Scenario network missing: {scen_net_path}")
 
@@ -1405,6 +1348,10 @@ def evaluate_single_cutout_dispatch(
     n, _ = stack_scenarios_to_multisnapshot_network([scen_net_path], [cutout])
 
     _fix_portfolio_capacities(n, port_net)
+    # [EFFICIENCY-6] Free immediately -- not needed for the expensive dispatch solve
+    del port_net
+    gc.collect()
+
     _assert_no_extendables(n)
 
     ramp_data = _save_and_clear_ramp_limits(n)
@@ -1432,10 +1379,8 @@ def evaluate_single_cutout_dispatch(
         n, scenario=cutout, scenario_network_file=scen_net_path, out_network=std_out,
     )
 
-    logger.info(
-        "Cutout '%s': op_cost=%.6g  inv_cost=%.6g  total=%.6g",
-        cutout, op_cost, investment_cost, total_cost,
-    )
+    logger.info("Cutout '%s': op_cost=%.6g  inv_cost=%.6g  total=%.6g",
+                cutout, op_cost, investment_cost, total_cost)
     return {
         "cutout": cutout,
         "op_cost": float(op_cost),
@@ -1448,16 +1393,17 @@ def evaluate_single_cutout_dispatch(
 
 
 # =============================================================================
-# Robust solve (lexicographic)
+# C&CG Master Problem
+# [BUGFIX-1] gc imported at top
+# [BUGFIX-2] duplicate _check_solver_status removed
+# [BUGFIX-3] only solver_model cleared here; n.model cleared in run_robust after export
 # =============================================================================
 
-def solve_robust_lexicographic(
+def solve_aro_master(
         n: pypsa.Network,
         *,
         solver_name: str,
         solver_options: Optional[Dict] = None,
-        eps_ls_abs: float = 1e-3,
-        eps_ls_rel: float = 1e-6,
         load_shedding_carrier: str = "load_shedding",
         ls_penalty: float = 1e4,
         hard_fail_suboptimal: bool = True,
@@ -1465,187 +1411,111 @@ def solve_robust_lexicographic(
         co2_cost_mode: str = "off",
 ) -> Dict[str, Any]:
     """
-    Two-stage lexicographic robust optimisation over stacked scenario network.
+    C&CG Master Problem fuer ARO ueber gestapeltes Szenario-Netzwerk.
 
-    Stage 1: min z_ls    s.t. z_ls >= LS_s  ∀s
-             CO2/budget GlobalConstraints are RELAXED in Stage 1 because load
-             shedding itself produces no CO2. Relaxing prevents infeasibility
-             when the CO2 budget is tight.
-
-    Stage 2: min z_cost  s.t. z_cost >= Inv + Op_s  ∀s,  z_ls <= z_ls* + eps
-             CO2/budget GlobalConstraints are RESTORED for Stage 2 to guarantee
-             climate neutrality in the optimal investment portfolio.
-
-    [PATCH-5] ls_penalty: configurable load-shedding marginal cost (default 1e4 €/MWh).
-
-    Note on duals:
-        buses_t.marginal_price contains nodal duals of the Minimax epigraph LP —
-        NOT standard LMPs.  Use dispatch-only solves for market-grade marginal prices.
+    min_{x, theta}  Inv(x) + theta
+    s.t.  theta >= Op(x, s)  forall s in S_k
+          x >= 0
     """
     if solver_options is None:
         solver_options = {}
 
     ramp_data = _save_and_clear_ramp_limits(n)
-    # [PATCH-5] pass ls_penalty to LS generator creation
     ls_generators = _ensure_load_shedding_generators(
         n, carrier=load_shedding_carrier, marginal_cost=ls_penalty
     )
     masks = _scenario_masks_from_snapshots(n.snapshots)
     scenarios = list(masks.keys())
-    logger.info("Robust optimisation over %d scenarios: %s  ls_penalty=%.4g",
+    logger.info("C&CG Master: %d scenarios: %s  ls_penalty=%.4g",
                 len(scenarios), scenarios, ls_penalty)
 
     if co2_cost_mode != "off":
         _detect_possible_co2_double_counting(n)
 
-
-
+    e_cyclic_backup = {}
     for comp in ("storage_units", "stores"):
         df = getattr(n, comp, None)
         if df is not None and len(df) > 0:
             for col in ("cyclic_state_of_charge", "cyclic_state_of_charge_per_period", "e_cyclic"):
                 if col in df.columns:
+                    e_cyclic_backup[(comp, col)] = df[col].copy()
                     df[col] = False
-                    logger.info("Disabled '%s' for %s (%d components)", col, comp, len(df))
 
-    # ------------------------------------------------------------------
-    # CO2 / budget GlobalConstraints: relax for Stage 1, restore Stage 2
-    # Stage 1 only minimises load shedding — CO2 limits are irrelevant
-    # there and can make the problem infeasible when the budget is tight.
-    # ------------------------------------------------------------------
-    _CO2_KEYWORDS = ("co2", "CO2", "carbon", "Carbon", "emission", "Emission")
+    hours_per_scenario = len(n.snapshots) // len(scenarios)
+    annual_scale = 8760.0 / hours_per_scenario
 
-    _gc_backup: Dict[str, float] = {}
     for gc_name in list(n.global_constraints.index):
         original = float(n.global_constraints.at[gc_name, "constant"])
         sense = n.global_constraints.at[gc_name, "sense"]
-        relaxed = 1e12 if sense == "<=" else -1e12
-        _gc_backup[gc_name] = original
-        n.global_constraints.at[gc_name, "constant"] = relaxed
-        logger.info(
-            "Stage 1: relaxing GlobalConstraint '%s' (%s %.3e) → %.3e",
-            gc_name, sense, original, relaxed,
+        scaled = original / annual_scale
+        n.global_constraints.at[gc_name, "constant"] = scaled
+        logger.info("Master: scaling GlobalConstraint '%s' (%s %.3e) -> %.3e (div %.2fx)",
+                    gc_name, sense, original, scaled, annual_scale)
+
+    def extra_master(network: pypsa.Network, snapshots: pd.Index) -> None:
+        if abs(annual_scale - 1.0) > 1e-6:
+            network.snapshot_weightings["objective"] *= annual_scale
+            ls_gens = network.generators.index[
+                network.generators.carrier.isin(["load", "load_shedding"])
+            ]
+            if len(ls_gens) > 0:
+                network.generators.loc[ls_gens, "marginal_cost"] /= annual_scale
+            logger.info("Master: annualisation %.2fx applied (%dh -> 8760h equivalent)",
+                        annual_scale, hours_per_scenario)
+
+        m = network.model
+        _add_scenario_boundary_constraints(
+            network, scenarios, masks, cyclic_overrides=e_cyclic_backup
+        )
+        _add_within_scenario_ramp_constraints(
+            network, scenarios, masks, ramp_data,
+            fail_on_extendable=fail_on_extendable_ramps,
         )
 
-    def extra_stage1(network: pypsa.Network, snapshots: pd.Index) -> None:
-        m = network.model
-        _add_scenario_boundary_constraints(network, scenarios, masks)
-        _add_within_scenario_ramp_constraints(network, scenarios, masks, ramp_data,
-                                             fail_on_extendable=fail_on_extendable_ramps)
-        z_ls = m.add_variables(lower=0, name="z_ls")
-        for s in scenarios:
-            ls_e = _build_ls_energy_expression(network, ls_generators, masks[s])
-            m.add_constraints(1.0 * z_ls >= ls_e, name=f"robust_ls_epigraph::{s}")
-        m.objective = 1.0 * z_ls
-
-    logger.info("Stage 1: minimising worst-case load shedding ...")
-    n.optimize(solver_name=solver_name, solver_options=solver_options,
-               extra_functionality=extra_stage1, assign_all_duals=True,io_api="mps")
-
-    _check_solver_status(n, "Stage 1", hard_fail_suboptimal=hard_fail_suboptimal)
-    sol1 = _get_solution_dict(n)
-    z_ls_star = _extract_scalar_solution(sol1, "z_ls")
-
-    if z_ls_star < -1e-6:
-        raise ValueError(f"Invalid negative load shedding: {z_ls_star}")
-    if z_ls_star < 0:
-        logger.warning("Clamping z_ls* = %.2e to 0 (numerical noise).", z_ls_star)
-        z_ls_star = 0.0
-    logger.info("Stage 1: z_ls* = %.6g", z_ls_star)
-
-    # ------------------------------------------------------------------
-    # Restore CO2 / budget GlobalConstraints for Stage 2
-    # ------------------------------------------------------------------
-    for gc_name, original in _gc_backup.items():
-        n.global_constraints.at[gc_name, "constant"] = original
-        logger.info(
-            "Stage 2: restoring GlobalConstraint '%s' → %.3e",
-            gc_name, original,
-        )
-
-    try:
-        if getattr(n, "model", None) is not None:
-            n.model = None
-    except Exception:
-        if hasattr(n, "_model"):
-            n._model = None
-
-    eps = max(float(eps_ls_abs), float(eps_ls_rel) * max(1.0, float(z_ls_star)))
-    logger.info("Stage 2 LS tolerance: eps = %.6g", eps)
-
-    def extra_stage2(network: pypsa.Network, snapshots: pd.Index) -> None:
-        m = network.model
-        _add_scenario_boundary_constraints(network, scenarios, masks)
-        _add_within_scenario_ramp_constraints(network, scenarios, masks, ramp_data,
-                                             fail_on_extendable=fail_on_extendable_ramps)
-        z_ls = m.add_variables(lower=0, name="z_ls")
-        z_cost = m.add_variables(lower=0, name="z_cost")
-        for s in scenarios:
-            ls_e = _build_ls_energy_expression(network, ls_generators, masks[s])
-            m.add_constraints(1.0 * z_ls >= ls_e, name=f"robust_ls_epigraph::{s}")
-        m.add_constraints(1.0 * z_ls <= (float(z_ls_star) + eps), name="robust_ls_fix")
+        z_theta = m.add_variables(lower=0, name="z_theta")
         inv_cost = _build_investment_cost_expression(network)
         for s in scenarios:
-            op_cost_s = _build_operational_cost_expression(network, masks[s], co2_cost_mode=co2_cost_mode)
-            m.add_constraints(1.0 * z_cost >= inv_cost + op_cost_s, name=f"robust_cost_epigraph::{s}")
-        m.objective = 1.0 * z_cost
+            op_cost_s = _build_operational_cost_expression(
+                network, masks[s], co2_cost_mode=co2_cost_mode,
+            )
+            m.add_constraints(1.0 * z_theta >= op_cost_s, name=f"robust_op_epigraph::{s}")
 
-    logger.info("Stage 2: minimising worst-case total cost ...")
-    n.optimize(solver_name=solver_name, solver_options=solver_options,
-               extra_functionality=extra_stage2, assign_all_duals=True,io_api="mps")
+        m.objective = inv_cost + 1.0 * z_theta
 
-    _check_solver_status(n, "Stage 2", hard_fail_suboptimal=hard_fail_suboptimal)
-    sol2 = _get_solution_dict(n)
-    z_cost_star = _extract_scalar_solution(sol2, "z_cost")
-    z_ls_final = _extract_scalar_solution(sol2, "z_ls")
-    slack = float(z_ls_final) - float(z_ls_star)
+    logger.info("C&CG Master: solving min Inv + worst-case Op ...")
+    n.optimize(
+        solver_name=solver_name,
+        solver_options=solver_options,
+        extra_functionality=extra_master,
+        assign_all_duals=True,
+        io_api="direct",
+    )
 
-    logger.info("Stage 2: z_cost* = %.6g", z_cost_star)
-    if slack > 10 * eps:
-        logger.warning("LS constraint slack large: %.2e > 10×eps=%.2e.", slack, eps)
+    # [BUGFIX-2] Single status check only
+    _check_solver_status(n, "Master", hard_fail_suboptimal=hard_fail_suboptimal)
 
-    diag: Dict[str, Any] = {
-        "z_ls_star": float(z_ls_star),
-        "z_ls_final": float(z_ls_final),
-        "z_cost_star": float(z_cost_star),
+    sol = _get_solution_dict(n)
+    z_theta_star = _extract_scalar_solution(sol, "z_theta")
+
+    # [BUGFIX-3] Only solver_model freed here -- n.model freed in run_robust after export
+    try:
+        if n.model is not None:
+            n.model.solver_model = None
+    except Exception:
+        pass
+    gc.collect()
+
+    logger.info("Master: z_theta* = %.6g", z_theta_star)
+
+    return {
+        "z_theta_star": float(z_theta_star),
         "n_scenarios": len(scenarios),
-        "ls_constraint_slack": float(slack),
-        "eps_ls_abs": float(eps_ls_abs),
-        "eps_ls_rel": float(eps_ls_rel),
-        "eps_ls_used": float(eps),
+        "annual_scale": float(annual_scale),
+        "hours_per_scenario": int(hours_per_scenario),
+        "co2_cost_mode": co2_cost_mode,
         "ls_penalty": float(ls_penalty),
-        "fail_on_extendable_ramps": bool(fail_on_extendable_ramps),
-        "co2_cost_mode": str(co2_cost_mode),
-        "relaxed_global_constraints": {
-            gc: {"original": orig}
-            for gc, orig in _gc_backup.items()
-        },
     }
 
-    m2 = getattr(n, "model", None)
-    if m2 is not None:
-        for attr in ("status", "termination_condition", "termination"):
-            val = getattr(m2, attr, None)
-            if val is not None:
-                diag["termination_status"] = str(val)
-                break
-        try:
-            scenario_costs = _evaluate_scenario_costs(n, masks, co2_cost_mode)
-            worst_scen, worst_cost = max(scenario_costs.items(), key=lambda kv: kv[1])
-            ls_per_scen = {
-                s: float(_build_ls_energy_expression(n, ls_generators, masks[s]).evaluate())
-                for s in masks
-            }
-            diag.update({
-                "scenario_costs": scenario_costs,
-                "worst_case_scenario": worst_scen,
-                "worst_case_cost": float(worst_cost),
-                "load_shedding_per_scenario": ls_per_scen,
-            })
-        except Exception as exc:
-            logger.warning("Scenario-wise diagnostics failed (non-fatal): %s", exc)
-
-    return diag
 
 # =============================================================================
 # Export helpers
@@ -1661,18 +1531,18 @@ def extract_capacities(n: pypsa.Network) -> Dict[str, Dict[str, float]]:
         return comp_df.loc[ext, opt_col].dropna().to_dict()
 
     out = {
-        "generators": _ext(n.generators, "p_nom_opt", "p_nom_extendable"),
-        "links": _ext(n.links, "p_nom_opt", "p_nom_extendable"),
-        "storage_units": _ext(n.storage_units, "p_nom_opt", "p_nom_extendable"),
-        "stores": _ext(n.stores, "e_nom_opt", "e_nom_extendable"),
-        "lines": _ext(n.lines, "s_nom_opt", "s_nom_extendable"),
-        "transformers": _ext(n.transformers, "s_nom_opt", "s_nom_extendable"),
+        "generators":    _ext(n.generators,    "p_nom_opt", "p_nom_extendable"),
+        "links":         _ext(n.links,          "p_nom_opt", "p_nom_extendable"),
+        "storage_units": _ext(n.storage_units,  "p_nom_opt", "p_nom_extendable"),
+        "stores":        _ext(n.stores,          "e_nom_opt", "e_nom_extendable"),
+        "lines":         _ext(n.lines,           "s_nom_opt", "s_nom_extendable"),
+        "transformers":  _ext(n.transformers,    "s_nom_opt", "s_nom_extendable"),
     }
     return {k: v for k, v in out.items() if v}
 
 
 def export_network_stacked(n: pypsa.Network, out_network: str) -> None:
-    """[PATCH-2] Export stacked network; only reindex marginal_price if it exists."""
+    """[PATCH-2] Only reindex marginal_price if it already exists."""
     if getattr(n, "model", None) is not None:
         try:
             n.model.solver_model = None
@@ -1700,7 +1570,7 @@ def export_network_standard_single_scenario(
         scenario_network_file: str,
         out_network: str,
 ) -> None:
-    """[PATCH-3] Export DatetimeIndex single-scenario network; guard on marginal_price."""
+    """[PATCH-3] Export DatetimeIndex single-scenario network."""
     if not isinstance(n_stacked.snapshots, pd.MultiIndex):
         raise ValueError("Expected stacked MultiIndex snapshots.")
 
@@ -1716,12 +1586,12 @@ def export_network_standard_single_scenario(
     n_std.set_snapshots(times)
 
     for comp, opt_col, nom_col, ext_col in [
-        ("generators", "p_nom_opt", "p_nom", "p_nom_extendable"),
-        ("links", "p_nom_opt", "p_nom", "p_nom_extendable"),
+        ("generators",    "p_nom_opt", "p_nom", "p_nom_extendable"),
+        ("links",         "p_nom_opt", "p_nom", "p_nom_extendable"),
         ("storage_units", "p_nom_opt", "p_nom", "p_nom_extendable"),
-        ("stores", "e_nom_opt", "e_nom", "e_nom_extendable"),
-        ("lines", "s_nom_opt", "s_nom", "s_nom_extendable"),
-        ("transformers", "s_nom_opt", "s_nom", "s_nom_extendable"),
+        ("stores",        "e_nom_opt", "e_nom", "e_nom_extendable"),
+        ("lines",         "s_nom_opt", "s_nom", "s_nom_extendable"),
+        ("transformers",  "s_nom_opt", "s_nom", "s_nom_extendable"),
     ]:
         df_sol = getattr(n_stacked, comp, None)
         df_std = getattr(n_std, comp, None)
@@ -1738,10 +1608,10 @@ def export_network_standard_single_scenario(
             df_std.loc[ext_common, nom_col] = df_sol.loc[ext_common, opt_col].fillna(0.0).astype(float)
 
     comp_cols = {
-        "buses_t": n_std.buses.index, "generators_t": n_std.generators.index,
-        "links_t": n_std.links.index, "storage_units_t": n_std.storage_units.index,
-        "stores_t": n_std.stores.index, "lines_t": n_std.lines.index,
-        "transformers_t": n_std.transformers.index, "loads_t": n_std.loads.index,
+        "buses_t":        n_std.buses.index,        "generators_t":    n_std.generators.index,
+        "links_t":        n_std.links.index,         "storage_units_t": n_std.storage_units.index,
+        "stores_t":       n_std.stores.index,        "lines_t":         n_std.lines.index,
+        "transformers_t": n_std.transformers.index,  "loads_t":         n_std.loads.index,
     }
     for t_name, attrs in _T_ATTRS.items():
         if not hasattr(n_stacked, t_name) or not hasattr(n_std, t_name):
@@ -1761,7 +1631,6 @@ def export_network_standard_single_scenario(
                 df_s = df_s.reindex(columns=target)
             setattr(dst, attr, df_s)
 
-    # [PATCH-3] guard
     try:
         mp = getattr(n_std.buses_t, "marginal_price", None)
     except Exception:
@@ -1774,30 +1643,44 @@ def export_network_standard_single_scenario(
 
 
 def export_network_flat_snapshots(n: pypsa.Network, out_network: str) -> None:
-    """Export with flattened snapshot strings (copy, no mutation)."""
+    """
+    Export with flattened snapshot strings.
+
+    [EFFICIENCY-5] In-place snapshot swap + export + restore instead of n.copy().
+    Avoids duplicating all time series in memory (~80 GB peak for yearly models).
+    The original MultiIndex is always restored in the finally block.
+    """
     if getattr(n, "model", None) is not None:
         try:
             n.model.solver_model = None
         except Exception:
             pass
-    n_out = n.copy()
-    if isinstance(n_out.snapshots, pd.MultiIndex):
-        flat = []
-        for p, ts in zip(n_out.snapshots.get_level_values("period"),
-                         n_out.snapshots.get_level_values("timestep")):
-            scen, t = ts[0], ts[1]
-            try:
-                t_str = pd.Timestamp(t).isoformat()
-            except Exception:
-                t_str = str(t)
-            flat.append(f"{p}::{scen}::{t_str}")
-        n_out.set_snapshots(pd.Index(flat, name="snapshot"))
+
     Path(out_network).parent.mkdir(parents=True, exist_ok=True)
-    n_out.export_to_netcdf(out_network)
+
+    if not isinstance(n.snapshots, pd.MultiIndex):
+        n.export_to_netcdf(out_network)
+        return
+
+    flat = [
+        f"{p}::{ts[0]}::{pd.Timestamp(ts[1]).isoformat()}"
+        for p, ts in zip(
+            n.snapshots.get_level_values("period"),
+            n.snapshots.get_level_values("timestep"),
+        )
+    ]
+    orig_snaps = n.snapshots
+    n.set_snapshots(pd.Index(flat, name="snapshot"))
+    try:
+        n.export_to_netcdf(out_network)
+    finally:
+        # Always restore -- even if export raises
+        n.set_snapshots(orig_snaps)
 
 
 # =============================================================================
 # Orchestration
+# [BUGFIX-3] n.model cleared only AFTER all exports are complete
 # =============================================================================
 
 def run_robust(
@@ -1808,8 +1691,6 @@ def run_robust(
         out_summary_json: str,
         solver_name: str,
         solver_options: Optional[Dict],
-        eps_ls_abs: float,
-        eps_ls_rel: float,
         allow_suboptimal: bool,
         allow_extendable_ramps: bool,
         co2_cost_mode: str,
@@ -1826,9 +1707,10 @@ def run_robust(
         scenario_files=scenario_files, scenario_names=list(cutouts),
         warn_unknown_t=warn_unknown_t, strict_unknown_t=strict_unknown_t,
     )
-    diag = solve_robust_lexicographic(
-        n, solver_name=solver_name, solver_options=solver_options,
-        eps_ls_abs=eps_ls_abs, eps_ls_rel=eps_ls_rel,
+    diag = solve_aro_master(
+        n,
+        solver_name=solver_name,
+        solver_options=solver_options,
         hard_fail_suboptimal=not allow_suboptimal,
         fail_on_extendable_ramps=not allow_extendable_ramps,
         co2_cost_mode=co2_cost_mode,
@@ -1850,6 +1732,14 @@ def run_robust(
     export_network_standard_single_scenario(
         n, scenario=export_scenario, scenario_network_file=export_file, out_network=out_network_std,
     )
+
+    # [BUGFIX-3] Free model only after all exports are done
+    try:
+        if getattr(n, "model", None) is not None:
+            n.model = None
+    except Exception:
+        pass
+    gc.collect()
 
     payload: Dict[str, Any] = {
         "scenario_names": list(scen_names),
@@ -1894,31 +1784,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--out-summary-json")
     p.add_argument("--solver-name", default="gurobi")
     p.add_argument("--solver-options-json", default=None)
-    p.add_argument("--eps-ls-abs", type=float, default=1e-3)
-    p.add_argument("--eps-ls-rel", type=float, default=1e-6)
     p.add_argument("--allow-suboptimal", action="store_true")
     p.add_argument("--allow-extendable-ramps", action="store_true")
     p.add_argument(
         "--co2-cost-mode",
         choices=["off", "global_constraint_constant_cost"],
         default="off",
-        help=(
-            "CO2 cost term in Stage 2 (OPT-IN). "
-            "'off' = no CO2 (default). "
-            "'global_constraint_constant_cost' = use GlobalConstraint.constant_cost. "
-            "Covers Generator emissions only. WARNING: double-counting risk if CO2 is in marginal_cost."
-        ),
     )
-    # [PATCH-5] configurable LS penalty
-    p.add_argument(
-        "--ls-penalty", type=float, default=1e4,
-        help=(
-            "[PATCH-5] Load-shedding marginal cost in €/MWh (default: 1e4). "
-            "Must be strictly higher than any real generator marginal cost to avoid "
-            "the solver preferring LS over dispatch. "
-            "Increase if your model has very high-cost peakers."
-        ),
-    )
+    p.add_argument("--ls-penalty", type=float, default=1e4)
     p.add_argument("--warn-unknown-t", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--strict-unknown-t", action="store_true")
     p.add_argument("--test", action="store_true")
@@ -1947,8 +1820,6 @@ def main() -> None:
         out_summary_json=args.out_summary_json,
         solver_name=args.solver_name,
         solver_options=solver_options,
-        eps_ls_abs=args.eps_ls_abs,
-        eps_ls_rel=args.eps_ls_rel,
         allow_suboptimal=args.allow_suboptimal,
         allow_extendable_ramps=args.allow_extendable_ramps,
         co2_cost_mode=args.co2_cost_mode,

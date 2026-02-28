@@ -18,7 +18,7 @@ RDIR = str(get_rdir(run)).strip("/")  # IMPORTANT: same as Snakefile uses (and a
 
 RESULTS_DIR = Path("results") / RDIR
 
-ARO = config.get("aro", {})   # optional: dedicated aro block
+ARO = config.get("aro", config.get("robust", {}).get("aro", {}))
 ROB = config.get("robust", {})  # fallback: reuse robust block
 
 CUTOUTS = list(ARO.get("cutouts", ROB.get("cutouts", [])))
@@ -44,7 +44,6 @@ OUT_SUMMARY = Path(ARO.get("out_summary", str(RESULTS_DIR / "results" / "aro_sum
 # ARO loop controls
 INITIAL = list(ARO.get("initial_scenarios", [CUTOUTS[0]]))
 MAX_ITER = int(ARO.get("max_iter", 5))
-EPS_LS = float(ARO.get("eps_ls", 1e-6))
 
 ARO_CO2_COST_MODE = str(ARO.get("co2_cost_mode", "off"))
 ARO_LS_PENALTY = float(ARO.get("ls_penalty", 1e4))
@@ -109,15 +108,21 @@ if CANONICAL_SOLVED_OVERRIDE is not None:
     CANONICAL_SOLVED = Path(str(CANONICAL_SOLVED_OVERRIDE))
 else:
     IS_SECTOR_RUN = bool(SECTOR_OPTS_TOKEN)
-
     if IS_SECTOR_RUN:
         CANONICAL_SOLVED = (
-            RESULTS_DIR
-            / "networks"
-            / f"base_s_{CLUSTERS}_{OPTS_TOKEN}_{SECTOR_OPTS_TOKEN}_{PH_TOKEN}.nc"
+                RESULTS_DIR
+                / "networks"
+                / f"base_s_{CLUSTERS}_{OPTS_TOKEN}_{SECTOR_OPTS_TOKEN}_{PH_TOKEN}.nc"
         )
     else:
-        if OPTS_TOKEN:
+        # Myopic run: kein sector_opts aber planning_horizon vorhanden
+        if PH_TOKEN:
+            CANONICAL_SOLVED = (
+                    RESULTS_DIR
+                    / "networks"
+                    / f"base_s_{CLUSTERS}_{OPTS_TOKEN}__{PH_TOKEN}.nc"
+            )
+        elif OPTS_TOKEN:
             CANONICAL_SOLVED = RESULTS_DIR / "networks" / f"base_s_{CLUSTERS}_elec_{OPTS_TOKEN}.nc"
         else:
             CANONICAL_SOLVED = RESULTS_DIR / "networks" / f"base_s_{CLUSTERS}_elec.nc"
@@ -165,6 +170,8 @@ rule solve_aro:
         network=str(OUT_NETWORK),
         summary=str(OUT_SUMMARY),
         std_network=str(OUT_NETWORK_STD),
+    log:
+        str(RESULTS_DIR / "logs" / "solve_aro.log"),
     params:
         cutouts=lambda wc: " ".join(CUTOUTS),
         prepared_template=lambda wc: PREPARED_TEMPLATE,
@@ -172,7 +179,6 @@ rule solve_aro:
         max_iter=lambda wc: str(MAX_ITER),
         solver=lambda wc: SOLVER_NAME,
         solver_opts=lambda wc: SOLVER_OPTIONS_JSON,
-        eps_ls=lambda wc: str(EPS_LS),
         co2_cost_mode= lambda wc: ARO_CO2_COST_MODE,
         ls_penalty=lambda wc: ARO_LS_PENALTY,
         convergence_tol=lambda wc: ARO_CONVERGENCE_TOL,
@@ -194,11 +200,11 @@ rule solve_aro:
           --out-summary-json {output.summary} \
           --solver-name {params.solver} \
           --solver-options-json '{params.solver_opts}' \
-          --eps-ls {params.eps_ls} \
           --co2-cost-mode {params.co2_cost_mode} \
           --ls-penalty {params.ls_penalty} \
           --convergence-tol {params.convergence_tol} \
-          --dispatch-workers {params.dispatch_workers}
+          --dispatch-workers {params.dispatch_workers} \
+           2>&1 | tee {log}  
         """
 
 
