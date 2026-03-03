@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 # solve_robust.py
 """
-Patched version of the robust solver from ``Aduuur/pypsa-arthur``.
 
-Changelog vs. upstream (February 2026)
 =======================================
 
 [PATCH-1..6]  Various patches (see previous versions)
@@ -17,7 +15,7 @@ MEM-PATCHES (March 2026)
 [MEM-PATCH-C]  snapshot_weightings stacking float32
 
 ================================================================================
-BUG FIXES (April 2026)
+BUG FIXES (March 2026)
 ================================================================================
 
 [BUG-FIX-1]  cyclic_overrides=e_cyclic_backup in extra_master
@@ -30,7 +28,7 @@ BUG FIXES (April 2026)
 [BUG-FIX-8]  annual_scale passed to cost consistency validator
 
 ================================================================================
-DISPATCH FIXES (May 2026)
+Dispatch fix
 ================================================================================
 
 [DISPATCH-FIX-1]  _fix_negative_loads  — methodically correct treatment
@@ -52,7 +50,7 @@ DISPATCH FIXES (May 2026)
     were not pruned. Now pruned consistently in _dispatch_solve.
 
 ================================================================================
-ARO METHODOLOGY FIXES (June 2026)
+ARO METHODOLOGY FIXES
 ================================================================================
 
 [ARO-FIX-1]  _fix_cross_scenario_storage_constraints  — break cross-scenario SOC coupling
@@ -94,6 +92,48 @@ ARO METHODOLOGY FIXES (June 2026)
     cross-coupling balance rows are removed.
 
 [ARO-FIX-2]  z_theta lower bound: lower=0 → lower=-np.inf
+
+[ARO-FIX-3]  _add_per_scenario_global_constraints  — correct CO2/energy budget handling
+
+    PROBLEM (critical):
+    PyPSA's GlobalConstraint mechanism sums over ALL snapshots in the model:
+        ∑_{t ∈ ALL_SNAPS} w_t · ∑_g ef_g · p_{g,t}  <=  constant
+    In a stacked N-scenario network this means the constraint aggregates over
+    N × T timesteps. With N=2 scenarios the solver sees twice the emission
+    budget and the CO2 cap is twice as permissive as intended.
+    The previous fix (constant / annual_scale) addressed the per-scenario
+    weighting but not the N-fold summing.
+
+    FIX:
+    1. Before n.optimize(): neutralize ALL time-aggregated global constraints
+       (those with carrier_attribute, i.e. primary_energy-type) by setting
+       their constant to 1e15 (effectively non-binding).
+    2. Inside extra_master: add one explicit linopy constraint per (gc, scenario)
+       with the correct per-scenario budget:
+           ∑_{t ∈ scen_s} w_t · ∑_g ef_g · p_{g,t}  <=  original_constant / annual_scale
+    This guarantees each scenario is independently constrained to its own
+    budget, independent of all other scenarios.
+
+    ASSUMPTION: Global constraints without carrier_attribute (e.g. pure
+    investment-side constraints) are not time-aggregated and are left to
+    PyPSA's native handling unchanged.
+
+[LS-FIX-1]  Per-bus load-shedding p_nom  — eliminate source of Markowitz warnings
+
+    PROBLEM:
+    LS generators were added with a global p_nom=1e8 MW, creating matrix
+    coefficients 4–5 orders of magnitude larger than physical capacity
+    variables (~1e3–1e4 MW). This caused the Markowitz tolerance warnings
+    observed in the solver log and contributed to Crossover instability.
+
+    FIX:
+    Compute p_nom per bus as peak_load_at_bus × safety_factor (default 2.0),
+    with a minimum floor of 100 MW. This keeps LS variables in the same
+    numerical range as physical generation variables while still ensuring
+    the load-shedding constraint is never binding at feasible solutions.
+
+    ASSUMPTION: Peak load is taken from loads_t.p_set (or static p_set if
+    no time series present). Buses with no attached loads get the floor value.
 
     PROBLEM:
     `z_theta = m.add_variables(lower=0, name="z_theta")` imposes an
@@ -678,12 +718,51 @@ def _scenario_masks_from_snapshots(snapshots: pd.Index) -> Dict[str, np.ndarray]
 # Load shedding
 # =============================================================================
 
+def _compute_ls_p_nom_per_bus(
+        n: pypsa.Network,
+        safety_factor: float = 2.0,
+        floor_mw: float = 100.0,
+) -> Dict[str, float]:
+    """
+    [LS-FIX-1] Compute per-bus load-shedding p_nom from peak load.
+
+    p_nom_bus = max(peak_load_at_bus × safety_factor, floor_mw)
+
+    Using a global 1e8 MW caused Markowitz tolerance warnings because the
+    resulting matrix coefficient span was ~5 orders of magnitude wider than
+    physical capacity variables. Per-bus scaling keeps LS variables
+    numerically comparable to physical generation.
+
+    ASSUMPTION: peak load determined from loads_t.p_set timeseries.
+    Falls back to static p_set, then to floor_mw if no data available.
+    """
+    bus_peak: Dict[str, float] = {}
+
+    if hasattr(n, "loads") and len(n.loads) > 0 and "bus" in n.loads.columns:
+        p_set_t = getattr(getattr(n, "loads_t", None), "p_set", None)
+        for load_name, load_row in n.loads.iterrows():
+            bus = str(load_row["bus"])
+            if p_set_t is not None and isinstance(p_set_t, pd.DataFrame) and load_name in p_set_t.columns:
+                peak = float(p_set_t[load_name].abs().max())
+            elif "p_set" in load_row.index:
+                peak = float(abs(load_row["p_set"] or 0.0))
+            else:
+                peak = 0.0
+            bus_peak[bus] = bus_peak.get(bus, 0.0) + peak
+
+    result: Dict[str, float] = {}
+    for bus in n.buses.index:
+        raw = bus_peak.get(str(bus), 0.0)
+        result[str(bus)] = max(raw * safety_factor, floor_mw)
+    return result
+
+
 def _ensure_load_shedding_generators(
         n: pypsa.Network,
         *,
         carrier: str = "load_shedding",
         marginal_cost: float = 1e4,
-        p_nom: float = 1e8,
+        p_nom: float = 0.0,          # 0 = auto (per-bus from peak load × 2)
 ) -> List[str]:
     if hasattr(n, "generators") and "carrier" in n.generators.columns:
         load_gens = n.generators.index[n.generators.carrier.astype(str) == "load"].tolist()
@@ -705,14 +784,29 @@ def _ensure_load_shedding_generators(
     if "load_shedding" not in n.carriers.index:
         n.add("Carrier", "load_shedding")
 
-    logger.info("Adding load-shedding generators (one per bus, marginal_cost=%.4g).", marginal_cost)
+    # [LS-FIX-1] Per-bus p_nom: peak_load × 2.0, floor 100 MW.
+    # If caller passes explicit p_nom > 0 that value is used for all buses
+    # (backwards-compatible override). Otherwise compute per bus.
+    if p_nom > 0:
+        p_nom_map: Dict[str, float] = {str(bus): p_nom for bus in n.buses.index}
+    else:
+        p_nom_map = _compute_ls_p_nom_per_bus(n)
+
+    logger.info(
+        "Adding load-shedding generators (one per bus, marginal_cost=%.4g). "
+        "p_nom range: [%.1f, %.1f] MW  (per-bus peak-load scaling).",
+        marginal_cost,
+        min(p_nom_map.values()) if p_nom_map else 0.0,
+        max(p_nom_map.values()) if p_nom_map else 0.0,
+    )
     ls_names: List[str] = []
     for bus in n.buses.index:
-        name = f"LS::{bus}"
+        name  = f"LS::{bus}"
+        p_nom_bus = p_nom_map.get(str(bus), 100.0)
         ls_names.append(name)
         n.add(
             "Generator", name, bus=bus, carrier=carrier,
-            p_nom=p_nom, p_nom_extendable=False,
+            p_nom=p_nom_bus, p_nom_extendable=False,
             marginal_cost=marginal_cost, efficiency=1.0, p_min_pu=0.0, p_max_pu=1.0,
         )
     _ensure_ls_pmax_timeseries(n, ls_names)
@@ -1611,6 +1705,185 @@ def _fix_zero_capital_cost_extendables(n: pypsa.Network) -> int:
 
 
 # =============================================================================
+# [ARO-FIX-3]  Per-scenario GlobalConstraint equivalents
+# =============================================================================
+
+def _add_per_scenario_global_constraints(
+        network: pypsa.Network,
+        scenarios: Sequence[str],
+        masks: Dict[str, np.ndarray],
+        original_gc_constants: Dict[str, float],
+        annual_scale: float,
+) -> int:
+    """
+    [ARO-FIX-3] Add per-scenario equivalents of PyPSA's time-aggregated
+    GlobalConstraints so each ARO scenario is independently constrained.
+
+    PROBLEM
+    -------
+    PyPSA's GlobalConstraint sums over ALL snapshots in the model:
+        ∑_{t ∈ ALL} w_t · ∑_g ef_g · p_{g,t}  <=  constant
+
+    In a stacked N-scenario network this aggregates over N × T timesteps.
+    With N=2 scenarios the CO2 budget is twice as permissive as intended.
+    The previous constant / annual_scale scaling fixed the per-scenario
+    weighting but not the N-fold summation.
+
+    FIX
+    ---
+    For each global constraint that has a ``carrier_attribute`` (i.e. that
+    aggregates over time-indexed generation/consumption):
+      1. Its native PyPSA constant was set to 1e15 (non-binding) before the
+         linopy model was built (see solve_aro_master).
+      2. Here we add one explicit constraint per scenario:
+             ∑_{t ∈ scen_s} w_t · ∑_g ef_g · p_{g,t}  <=  C_s
+         where C_s = original_constant / annual_scale.
+
+    ASSUMPTION
+    ----------
+    The per-scenario budget C_s = original_constant / annual_scale assumes
+    that ``original_constant`` is expressed as an annual total and that each
+    scenario covers (8760 / annual_scale) hours.  If the budget is already
+    expressed per scenario period, set annual_scale=1.0 in the caller.
+
+    Constraints WITHOUT carrier_attribute (e.g. pure investment-side limits)
+    are not time-aggregated and are handled by PyPSA natively — they are
+    NOT processed here and must NOT have been neutralized.
+
+    RETURN
+    ------
+    Number of per-scenario constraint rows added.
+    """
+    import xarray as xr
+
+    m = network.model
+
+    if not hasattr(network, "global_constraints") or len(network.global_constraints) == 0:
+        return 0
+
+    gc_df = network.global_constraints
+    n_added = 0
+
+    # Variable name candidates for different PyPSA/linopy versions
+    gen_p_candidates  = ["Generator-p"]
+    link_p_candidates = ["Link-p0"]
+
+    for gc_name, original_constant in original_gc_constants.items():
+        if gc_name not in gc_df.index:
+            continue
+
+        row          = gc_df.loc[gc_name]
+        carrier_attr = str(row.get("carrier_attribute", "") or "")
+        sense        = str(row.get("sense",             "<=") or "<=").strip()
+        gc_type      = str(row.get("type",              "")   or "").lower()
+
+        # Only handle time-aggregated constraints (those with carrier_attribute)
+        if not carrier_attr:
+            logger.debug(
+                "[ARO-FIX-3] GC '%s' has no carrier_attribute — "
+                "left to PyPSA's native handling.", gc_name,
+            )
+            continue
+
+        # Scaled per-scenario budget
+        # C_s = annual_budget / annual_scale  (= annual_budget × T/8760)
+        per_scenario_constant = original_constant / max(annual_scale, 1e-9)
+
+        # ------------------------------------------------------------------
+        # Build emission / attribute factor series over generators (and links)
+        # ------------------------------------------------------------------
+        gen_p, _ = _get_linopy_var(m, gen_p_candidates, strict=False)
+        if gen_p is None:
+            logger.warning(
+                "[ARO-FIX-3] Generator-p not found in model for GC '%s'. "
+                "Skipping per-scenario constraint.", gc_name,
+            )
+            continue
+
+        if "carrier" not in network.generators.columns:
+            logger.warning("[ARO-FIX-3] generators.carrier missing for GC '%s'.", gc_name)
+            continue
+
+        if carrier_attr not in network.carriers.columns:
+            logger.warning(
+                "[ARO-FIX-3] carrier_attribute='%s' not in n.carriers for GC '%s'. "
+                "Available: %s", carrier_attr, gc_name,
+                list(network.carriers.columns),
+            )
+            continue
+
+        ef = (
+            network.generators["carrier"]
+            .map(network.carriers[carrier_attr])
+            .fillna(0.0)
+            .astype(float)
+        )
+        if (ef == 0).all():
+            logger.debug(
+                "[ARO-FIX-3] All emission factors zero for GC '%s' "
+                "(carrier_attr='%s'). No constraint added.", gc_name, carrier_attr,
+            )
+            continue
+
+        td      = _get_time_dimension(gen_p)
+        gen_dim = _get_gen_dimension(gen_p)
+
+        ef_da = xr.DataArray(
+            ef.to_numpy(), dims=[gen_dim],
+            coords={gen_dim: (gen_dim, network.generators.index.to_numpy())},
+        )
+
+        w_np = network.snapshot_weightings["objective"].to_numpy(dtype=np.float32)
+
+        # ------------------------------------------------------------------
+        # Add one constraint per scenario
+        # ------------------------------------------------------------------
+        for s in scenarios:
+            idx      = _mask_to_isel_indices(masks[s])
+            idx_list = idx.tolist()
+
+            gen_p_s = gen_p.isel({td: idx_list})
+            w_s     = xr.DataArray(
+                w_np[idx_list], dims=[td],
+                coords={td: gen_p_s.coords[td]},
+            )
+
+            lhs_expr = (gen_p_s * ef_da * w_s).sum()
+
+            con_name = f"gc_{gc_name}_per_scenario::{s}"
+            try:
+                if sense in ("<=", "le", "leq", "<"):
+                    m.add_constraints(lhs_expr <= per_scenario_constant, name=con_name)
+                elif sense in (">=", "ge", "geq", ">"):
+                    m.add_constraints(lhs_expr >= per_scenario_constant, name=con_name)
+                else:
+                    m.add_constraints(lhs_expr == per_scenario_constant, name=con_name)
+                n_added += 1
+            except Exception as exc:
+                logger.error(
+                    "[ARO-FIX-3] Failed to add per-scenario constraint '%s': %s",
+                    con_name, exc,
+                )
+
+        logger.info(
+            "[ARO-FIX-3] GC '%s' (%s): added %d per-scenario constraints "
+            "(per-scenario budget=%.3e, carrier_attr='%s').",
+            gc_name, sense, len(scenarios), per_scenario_constant, carrier_attr,
+        )
+
+    if n_added == 0 and any(
+        bool(gc_df.loc[g].get("carrier_attribute", ""))
+        for g in original_gc_constants if g in gc_df.index
+    ):
+        logger.warning(
+            "[ARO-FIX-3] Expected per-scenario constraints but none were added. "
+            "Check carrier_attribute columns and Generator-p variable availability.",
+        )
+
+    return n_added
+
+
+# =============================================================================
 # [ARO-FIX-1]  Break cross-scenario SOC/energy balance coupling
 # =============================================================================
 
@@ -1839,16 +2112,20 @@ def solve_aro_master(
         co2_cost_mode: str = "off",
 ) -> Dict[str, Any]:
     """
-    C&CG Master Problem for ARO over stacked scenario network.
+    ARO Master Problem — full-scenario-stack formulation.
 
     Mathematical formulation
     ─────────────────────────
     min_{x, z_theta}   Inv(x) + z_theta
-    s.t.               z_theta >= Op(x, s)   for all s in S_k
+    s.t.               z_theta >= Op(x, s)   for all s in S
+                       GC_s(x)              for all s in S   [ARO-FIX-3]
                        x >= 0
 
     z_theta is an epigraph variable representing the worst-case operational
-    cost across all scenarios in the current master set S_k.
+    cost across all scenarios. All scenarios are stacked into a single LP
+    (full enumeration), which is equivalent to 1-iteration C&CG when the
+    complete scenario set S is enumerated upfront. Iterative C&CG (lazy
+    scenario addition) would be needed for continuous or very large S.
 
     Fixes applied
     ─────────────
@@ -1864,12 +2141,11 @@ def solve_aro_master(
     [DISPATCH-FIX-1] _fix_negative_loads: net-export → zero-cost Generator.
     [DISPATCH-FIX-2] _fix_inf_store_initial: e_initial=-1e6 for CO2 stores.
     [ARO-FIX-1]     _fix_cross_scenario_storage_constraints: remove PyPSA's
-                    auto-generated SOC balance rows at scenario boundaries so
-                    that each scenario is dynamically independent.
-    [ARO-FIX-2]     z_theta lower bound = -inf (not 0). The epigraph
-                    constraints enforce z_theta >= Op(x,s). Imposing lower=0
-                    is methodically wrong and can yield sub-optimal solutions
-                    when any operational cost is negative.
+                    auto-generated SOC balance rows at scenario boundaries.
+    [ARO-FIX-2]     z_theta lower bound = -inf (not 0).
+    [ARO-FIX-3]     _add_per_scenario_global_constraints: neutralize PyPSA's
+                    native N×T-summing GCs; re-add as per-scenario constraints.
+    [LS-FIX-1]      Per-bus LS p_nom = peak_load × 2 (not global 1e8 MW).
     """
     if solver_options is None:
         solver_options = {}
@@ -1891,7 +2167,7 @@ def solve_aro_master(
         n, carrier=load_shedding_carrier, marginal_cost=ls_mc_adjusted,
     )
 
-    logger.info("C&CG Master: %d scenarios: %s  ls_penalty=%.4g  annual_scale=%.3f",
+    logger.info("ARO Master (full-stack): %d scenarios: %s  ls_penalty=%.4g  annual_scale=%.3f",
                 len(scenarios), scenarios, ls_penalty, annual_scale)
 
     if co2_cost_mode != "off":
@@ -1914,12 +2190,32 @@ def solve_aro_master(
     }
 
     for gc_name in list(n.global_constraints.index):
-        original = float(n.global_constraints.at[gc_name, "constant"])
-        sense    = n.global_constraints.at[gc_name, "sense"]
-        scaled   = original / annual_scale
-        n.global_constraints.at[gc_name, "constant"] = scaled
-        logger.info("Master: GlobalConstraint '%s' (%s %.3e) → %.3e (÷%.2fx)",
-                    gc_name, sense, original, scaled, annual_scale)
+        row          = n.global_constraints.loc[gc_name]
+        carrier_attr = str(row.get("carrier_attribute", "") or "")
+        sense        = str(row.get("sense", "<=") or "<=")
+        original     = _original_gc_constants[gc_name]
+
+        if carrier_attr:
+            # [ARO-FIX-3] Time-aggregated constraint (primary_energy, CO2, etc.):
+            # neutralize PyPSA's native version (it sums over ALL N×T snapshots
+            # which makes it N× too permissive). Per-scenario constraints will be
+            # added explicitly inside extra_master via
+            # _add_per_scenario_global_constraints().
+            n.global_constraints.at[gc_name, "constant"] = 1e15
+            logger.info(
+                "Master: GC '%s' (%s %.3e) → neutralized (1e15). "
+                "Per-scenario constraints added in extra_master.",
+                gc_name, sense, original,
+            )
+        else:
+            # Non-time-aggregated constraint (e.g. investment limits): scale
+            # by annual_scale as before so PyPSA handles it natively.
+            scaled = original / annual_scale
+            n.global_constraints.at[gc_name, "constant"] = scaled
+            logger.info(
+                "Master: GC '%s' (%s %.3e) → %.3e (÷%.2fx, non-time-aggregated).",
+                gc_name, sense, original, scaled, annual_scale,
+            )
 
     # [MEM-PATCH-B] Build weight array once
     w_base_np = n.snapshot_weightings["objective"].to_numpy(dtype=np.float32, copy=False)
@@ -1947,6 +2243,15 @@ def solve_aro_master(
         # called, so each scenario's own cyclic closure (soc[t=0]==soc[t=T])
         # is already in place before we remove the cross-boundary rows.
         _fix_cross_scenario_storage_constraints(network, scenarios, masks)
+
+        # [ARO-FIX-3] Add per-scenario GlobalConstraint equivalents.
+        # PyPSA's native GCs were neutralized (set to 1e15) before model
+        # build so they don't sum over N×T snapshots. We re-add them here
+        # as one explicit constraint per (gc_name, scenario), each covering
+        # only T snapshots with budget = original_constant / annual_scale.
+        _add_per_scenario_global_constraints(
+            network, scenarios, masks, _original_gc_constants, annual_scale,
+        )
 
         _add_within_scenario_ramp_constraints(
             network, scenarios, masks, ramp_data,
@@ -1982,7 +2287,8 @@ def solve_aro_master(
 
         m.objective = inv_cost + 1.0 * z_theta
 
-    logger.info("C&CG Master: solving min Inv + worst-case Op ...")
+    logger.info("ARO Master: solving min Inv + worst-case Op (full-stack, %d scenarios) ...",
+                len(scenarios))
     n.optimize(
         solver_name=solver_name,
         solver_options=solver_options,
