@@ -61,7 +61,7 @@ robust:
   aro:
     co2_cost_mode: "off"      # "off" | "global_constraint_constant_cost"
     ls_penalty: 10000          # €/MWh — muss > max(marginal_cost) aller Generatoren
-    convergence_tol: 0.0001    # rel. Gap-Toleranz — 0.01%, auf 0.0 für klassisches ARO
+    convergence_tol: 0.001    # rel. Gap-Toleranz — 0.01%, auf 0.0 für klassisches ARO
     dispatch_workers: 1
     # Lexicographic tolerance
     eps_ls: 0.05
@@ -69,6 +69,19 @@ robust:
     initial_cutouts:
       - cutout_mCNRM-CERFACS-CM5_rcp45_2010
     max_iter: 5
+    solver_options:
+      threads: 8
+      method: 2
+      crossover: 0
+      BarConvTol: 1.0e-5
+      Seed: 123
+      AggFill: 0
+      PreDual: 0
+      NodefileStart: 0.5
+      NodefileDir: "/tmp"
+      MemLimit: 450
+      DualReductions: 0
+      NumericFocus: 1
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#foresight
 foresight: myopic
@@ -83,7 +96,12 @@ scenario:
   sector_opts:
   - ''
   planning_horizons:
-  - 2050
+   # - 2025
+   # - 2030
+    #- 2035
+    #- 2040
+   # - 2045
+    - 2050
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#countries
 countries:
@@ -577,6 +595,9 @@ sector:
   aviation: false
   agriculture: false
   fossil_fuels: true
+  #H2_retrofit: true
+  #biomass_to_liquid_cc: true
+  #biogas_upgrading_cc: true
   district_heating:
     potential: 0.6
     progress:
@@ -1075,8 +1096,8 @@ clustering:
       ramp_limit_up: max
       ramp_limit_down: max
   temporal:
-    resolution_elec: false
-    resolution_sector: false
+    resolution_elec: false # später wieder anpassen
+    resolution_sector: 4h
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#adjustments
 adjustments:
@@ -1243,7 +1264,7 @@ solving:
     rolling_horizon: false
     seed: 123
     custom_extra_functionality: "../data/custom_extra_functionality.py"
-    # io_api: "direct"  # Increases performance but only supported for the highs and gurobi solvers
+    io_api: "direct"  # Increases performance but only supported for the highs and gurobi solvers
     # options that go into the optimize function
     track_iterations: false
     min_iterations: 2
@@ -1316,6 +1337,10 @@ solving:
       AggFill: 0
       PreDual: 0
       GURO_PAR_BARDENSETHRESH: 200
+      NodefileStart: 0.5    # Swap Gurobi-interne Daten ab 50% RAM-Auslastung
+      NodefileDir: "/tmp"   # Wohin swappen
+      MemLimit: 450
+
     gurobi-numeric-focus:
       NumericFocus: 3       # Favour numeric stability over speed
       method: 2             # barrier

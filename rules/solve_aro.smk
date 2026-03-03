@@ -55,7 +55,6 @@ ARO_DISPATCH_WORKERS = int(ARO.get("dispatch_workers", 0))
 SOLVING = config.get("solving", {})
 SOLVER_BLOCK = SOLVING.get("solver", {})
 SOLVER_NAME = SOLVER_BLOCK.get("name", "gurobi")
-
 SOLVER_OPT_KEY = SOLVER_BLOCK.get("options", None)
 ALL_SOLVER_OPTIONS = SOLVING.get("solver_options", {}) or {}
 if SOLVER_OPT_KEY is not None:
@@ -63,6 +62,14 @@ if SOLVER_OPT_KEY is not None:
 else:
     SOLVER_OPTIONS = SOLVER_BLOCK.get("solver_options", {}) or {}
 SOLVER_OPTIONS_JSON = json.dumps(SOLVER_OPTIONS)
+
+# ARO-spezifische solver_options überschreiben den globalen Block wenn vorhanden.
+# Konfiguriert unter config["robust"]["aro"]["solver_options"] — ermöglicht
+# separate Gurobi-Optionen für den ARO-Master ohne den normalen Solve zu beeinflussen.
+ARO_SOLVER_OPTIONS = ARO.get("solver_options", None)
+if ARO_SOLVER_OPTIONS:
+    SOLVER_OPTIONS = dict(ARO_SOLVER_OPTIONS)
+    SOLVER_OPTIONS_JSON = json.dumps(SOLVER_OPTIONS)
 
 # =============================================================================
 # Scenario singleton contract (bind wildcards to concrete filenames)

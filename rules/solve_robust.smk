@@ -246,6 +246,21 @@ rule build_base_network_per_cutout:
         if renewable_overlay:
             overlay["renewable"] = renewable_overlay
 
+        # Temporal resolution: nested run muss konsistent zum Netzwerktyp sein
+        is_temporal_sector = (
+                _is_sector_run()
+                or (PLANNING_HORIZON is not None and str(PLANNING_HORIZON).strip() not in ("", "None"))
+        )
+
+        if is_temporal_sector:
+            overlay.setdefault("clustering",{}).setdefault("temporal",{})["resolution_elec"] = False
+            if "resolution_sector" in config.get("clustering",{}).get("temporal",{}):
+                overlay.setdefault("clustering",{}).setdefault("temporal",{})["resolution_sector"] = \
+                    config["clustering"]["temporal"]["resolution_sector"]
+        else:
+            overlay.setdefault("clustering",{}).setdefault("temporal",{})["resolution_elec"] = \
+                config.get("clustering",{}).get("temporal",{}).get("resolution_elec",False)
+
         overlay_dir = Path("resources") / "robust_overlays"
         overlay_dir.mkdir(parents=True, exist_ok=True)
         overlay_path = overlay_dir / f"overlay__{subrun}.yaml"
