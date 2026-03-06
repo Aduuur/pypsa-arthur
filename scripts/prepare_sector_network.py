@@ -2095,6 +2095,8 @@ def add_storage_and_grids(
             upper=e_nom.quantile(0.98), inplace=True
         )  # limit extremely large storage
         n.stores.loc[gas_i, "e_nom_min"] = e_nom
+        n.stores.loc[gas_i, "e_nom_max"] = e_nom  # ← FIX: Limit storage capacity
+        n.stores.loc[gas_i, "e_nom_extendable"] = False  # ← FIX: No expansion
 
         # add candidates for new gas pipelines to achieve full connectivity
 
@@ -4042,6 +4044,8 @@ def add_biomass(
         bus=spatial.gas.biogas,
         carrier="biogas",
         p_nom=biogas_potentials_spatial,
+        p_nom_max=biogas_potentials_spatial,  # ← NEU!
+        p_nom_extendable=False,  # ← NEU!
         marginal_cost=costs.at["biogas", "fuel"],
         e_sum_min=0,
         e_sum_max=biogas_potentials_spatial,
@@ -4053,6 +4057,8 @@ def add_biomass(
         bus=spatial.biomass.nodes,
         carrier="solid biomass",
         p_nom=solid_biomass_potentials_spatial,
+        p_nom_max=solid_biomass_potentials_spatial,  # ← FIX!
+        p_nom_extendable=False,  # ← NEU!
         marginal_cost=costs.at["solid biomass", "fuel"],
         e_sum_min=0,
         e_sum_max=solid_biomass_potentials_spatial,
@@ -6381,6 +6387,16 @@ if __name__ == "__main__":
     nyears = nhours / 8760
 
     costs = load_costs(snakemake.input.costs)
+    try:
+        from scripts.override_costs import override_fuel_costs
+
+        override_path = snakemake.input.get("custom_fuel_costs", None)
+        if override_path:
+            year = int(snakemake.wildcards.planning_horizons)
+            costs = override_fuel_costs(costs, override_path, year)
+            logger.info("Fuel costs overridden from %s for year %d", override_path, year)
+    except Exception as _e:
+        logger.warning("Could not apply fuel cost overrides (non-fatal): %s", _e)
 
     pop_weighted_energy_totals = (
         pd.read_csv(snakemake.input.pop_weighted_energy_totals, index_col=0) * nyears

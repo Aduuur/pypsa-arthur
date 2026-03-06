@@ -314,6 +314,67 @@ def add_carbon_constraint(n: pypsa.Network, snapshots: pd.DatetimeIndex) -> None
             rhs = glc.constant
             n.model.add_constraints(lhs <= rhs, name=f"GlobalConstraint-{name}")
 
+def ignore_technical_potentials(n: pypsa.Network, config: dict) -> None:
+    """
+    Disable endogenous technical potentials (p_nom_max and bus-level nom_max_*)
+    for extendable renewable generators so that external CCL constraints can bind.
+
+    Activated by config switch:
+        solving:
+          ignore_technical_potentials: true
+    """
+    if not config.get("solving", {}).get("ignore_technical_potentials", False):
+        return
+
+    # Which carriers count as "renewables" to uncap
+    renewable_carriers = set(config.get("electricity", {}).get("renewable_carriers", []))
+
+    # Fallback (robust against configs that don't define renewable_carriers)
+    if not renewable_carriers:
+        renewable_carriers = {
+            "onwind",
+            "offwind-ac",
+            "offwind-dc",
+            "offwind-float",
+            "solar",
+            "solar rooftop",
+            "solar-hsat",
+        }
+
+    # Only extendable generators
+    mask = n.generators.p_nom_extendable & n.generators.carrier.isin(renewable_carriers)
+    gen_i = n.generators.index[mask]
+
+    if gen_i.empty:
+        logger.info(
+            "ignore_technical_potentials: no extendable renewable generators found - nothing to do."
+        )
+        return
+
+    # Use a large *finite* number (avoid inf -> can cause numerical issues / NaNs in some pipelines)
+    BIG = 1e9  # MW-scale network => this is safely non-binding
+
+    # 1) Uncap generator-level p_nom_max
+    n.generators.loc[gen_i, "p_nom_max"] = BIG
+
+    # 2) Uncap perfect-foresight bus-level nominal maxima created by add_land_use_constraint_perfect()
+    #    These columns look like: nom_max_onwind_2030, nom_max_solar, nom_max_offwind-ac_2040, ...
+    bus_cols = [c for c in n.buses.columns if isinstance(c, str) and c.startswith("nom_max_")]
+    if bus_cols:
+        # for each such bus constraint column, check if it corresponds to a renewable carrier
+        for col in bus_cols:
+            # strip prefix
+            tail = col[len("nom_max_"):]  # e.g. "onwind_2030" or "solar-hsat" etc.
+            carrier = tail.split("_")[0]  # carrier is before first underscore (build_year part)
+
+            if carrier in renewable_carriers:
+                # set to BIG where it exists (NaNs should become BIG as well to avoid accidental binding)
+                n.buses[col] = n.buses[col].fillna(BIG).clip(lower=BIG)
+
+    logger.warning(
+        "ignore_technical_potentials: uncapped technical potentials for renewables "
+        f"({len(gen_i)} generators). Binding limits should now come from CCL/other policy constraints."
+    )
 
 def add_carbon_budget_constraint(n: pypsa.Network, snapshots: pd.DatetimeIndex) -> None:
     glcs = n.global_constraints.query('type == "Co2Budget"')

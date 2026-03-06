@@ -858,6 +858,7 @@ rule add_electricity:
         ),
         aggregation_strategies=config_provider("clustering", "aggregation_strategies"),
         exclude_carriers=config_provider("clustering", "exclude_carriers"),
+        costs=config_provider("costs"),
     input:
         unpack(input_profile_tech),
         unpack(input_class_regions),

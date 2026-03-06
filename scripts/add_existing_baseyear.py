@@ -19,12 +19,11 @@ import xarray as xr
 
 from scripts._helpers import (
     configure_logging,
-    load_costs,
     sanitize_custom_columns,
     set_scenario_config,
     update_config_from_wildcards,
 )
-from scripts.add_electricity import sanitize_carriers
+from scripts.add_electricity import load_costs, sanitize_carriers
 from scripts.build_energy_totals import cartesian
 from scripts.definitions.heat_system import HeatSystem
 from scripts.prepare_sector_network import cluster_heat_buses, define_spatial
@@ -159,27 +158,6 @@ def add_power_capacities_installed_before_baseyear(
 ) -> None:
     """
     Add power generation capacities installed before base year.
-
-    Parameters
-    ----------
-    n : pypsa.Network
-        Network to modify
-    costs : pd.DataFrame
-        Technology costs
-    grouping_years : list
-        Intervals to group existing capacities
-    baseyear : int
-        Base year for analysis
-    powerplants_file : str
-        Path to powerplants CSV file
-    countries : list
-        List of countries to consider
-    capacity_threshold : float
-        Minimum capacity threshold
-    lifetime_values : dict
-        Default values for missing data
-    renewable_carriers: list
-        List of renewable carriers in the network
     """
     logger.debug(f"Adding power capacities installed before {baseyear}")
 
@@ -221,9 +199,26 @@ def add_power_capacities_installed_before_baseyear(
     # Fill missing DateIn
     biomass_i = df_agg.loc[df_agg.Fueltype == "urban central solid biomass CHP"].index
     mean = df_agg.loc[biomass_i, "DateIn"].mean()
-    df_agg.loc[biomass_i, "DateIn"] = df_agg.loc[biomass_i, "DateIn"].fillna(int(mean))
+
+    # Add a check to prevent ValueError if all DateIn values for biomass are missing
+    if pd.notna(mean):
+        df_agg.loc[biomass_i, "DateIn"] = df_agg.loc[biomass_i, "DateIn"].fillna(
+            int(mean)
+        )
+    else:
+        # If mean is NaN, all DateIn values are missing. Fill with the baseyear as a fallback.
+        logger.warning(
+            "Could not determine the mean build year for 'urban central solid biomass CHP' plants. "
+            f"Filling missing 'DateIn' with the scenario baseyear ({baseyear})."
+        )
+        df_agg.loc[biomass_i, "DateIn"] = df_agg.loc[biomass_i, "DateIn"].fillna(
+            baseyear
+        )
+
     # Fill missing DateOut
-    dateout = df_agg.loc[biomass_i, "DateIn"] + lifetime_values["lifetime"]
+    # Make sure the lifetime value is a number, not a Series, to avoid index alignment issues
+    lifetime_val = lifetime_values.get("lifetime", 30)
+    dateout = df_agg.loc[biomass_i, "DateIn"] + lifetime_val
     df_agg.loc[biomass_i, "DateOut"] = df_agg.loc[biomass_i, "DateOut"].fillna(dateout)
 
     # include renewables in df_agg
@@ -374,11 +369,9 @@ def add_power_capacities_installed_before_baseyear(
                         bus2="co2 atmosphere",
                         carrier=generator,
                         marginal_cost=costs.at[generator, "efficiency"]
-                        * costs.at[generator, "VOM"],  # NB: VOM is per MWel
+                        * costs.at[generator, "VOM"],
                         capital_cost=costs.at[generator, "efficiency"]
-                        * costs.at[
-                            generator, "capital_cost"
-                        ],  # NB: fixed cost is per MWel
+                        * costs.at[generator, "capital_cost"],
                         p_nom=new_capacity / costs.at[generator, "efficiency"],
                         efficiency=costs.at[generator, "efficiency"],
                         efficiency2=costs.at[carrier[generator], "CO2 intensity"],
@@ -387,30 +380,100 @@ def add_power_capacities_installed_before_baseyear(
                     )
                 else:
                     key = "central solid biomass CHP"
-                    central_heat = n.buses.query(
-                        "carrier == 'urban central heat'"
-                    ).location.unique()
-                    heat_buses = new_capacity.index.map(
-                        lambda i: i + " urban central heat" if i in central_heat else ""
-                    )
 
-                    n.add(
-                        "Link",
-                        new_capacity.index,
-                        suffix=name_suffix,
-                        bus0=spatial.biomass.df.loc[new_capacity.index]["nodes"].values,
-                        bus1=new_capacity.index,
-                        bus2=heat_buses,
-                        carrier=generator,
-                        p_nom=new_capacity / costs.at[key, "efficiency"],
-                        capital_cost=costs.at[key, "capital_cost"]
-                        * costs.at[key, "efficiency"],
-                        marginal_cost=costs.at[key, "VOM"],
-                        efficiency=costs.at[key, "efficiency"],
-                        build_year=grouping_year,
-                        efficiency2=costs.at[key, "efficiency-heat"],
-                        lifetime=lifetime_assets.loc[new_capacity.index],
-                    )
+                    # Überprüfen, ob Biomasse-Busse überhaupt existieren.
+                    if (
+                        not hasattr(spatial, "biomass")
+                        or n.buses.index.str.contains("biomass").sum() == 0
+                    ):
+                        logger.warning(
+                            "Biomass infrastructure is not enabled in the configuration. "
+                            f"Adding all {len(new_capacity)} 'urban central solid biomass CHP' plants as electricity-only generators."
+                        )
+                        # Füge alle als reine Stromerzeuger hinzu
+                        n.add(
+                            "Generator",
+                            new_capacity.index,
+                            suffix=name_suffix,
+                            bus=new_capacity.index,
+                            carrier="biomass",
+                            p_nom=new_capacity,
+                            marginal_cost=costs.at[key, "VOM"],
+                            capital_cost=costs.at[key, "capital_cost"],
+                            efficiency=costs.at[key, "efficiency"],
+                            build_year=grouping_year,
+                            lifetime=lifetime_assets.loc[new_capacity.index],
+                        )
+                    else:
+                        # Biomasse-Infrastruktur existiert
+                        central_heat_buses = n.buses.index[
+                            n.buses.carrier == "urban central heat"
+                        ]
+
+                        # Finde für jeden Standort heraus, ob ein Wärmebus existiert
+                        heat_bus_map = pd.Series(
+                            central_heat_buses.str.replace(
+                                " urban central heat", ""
+                            ),
+                            index=central_heat_buses,
+                        )
+
+                        # Erstelle eine Liste der Ziel-Wärmebusse
+                        heat_buses = new_capacity.index.map(
+                            lambda i: i + " urban central heat"
+                            if i in heat_bus_map.values
+                            else pd.NA
+                        )
+
+                        # Teile die Anlagen in solche mit und ohne gültigen Wärmebus auf
+                        with_heat = new_capacity[heat_buses.notna()]
+                        without_heat = new_capacity[heat_buses.isna()]
+
+                        if not with_heat.empty:
+                            logger.info(
+                                f"Adding {len(with_heat)} urban central solid biomass CHP plants with heat connection."
+                            )
+                            n.add(
+                                "Link",
+                                with_heat.index,
+                                suffix=name_suffix,
+                                bus0=spatial.biomass.df.loc[with_heat.index][
+                                    "nodes"
+                                ].values,
+                                bus1=with_heat.index,
+                                bus2=heat_buses[heat_buses.notna()].values,
+                                carrier=generator,
+                                p_nom=with_heat / costs.at[key, "efficiency"],
+                                capital_cost=costs.at[key, "capital_cost"]
+                                * costs.at[key, "efficiency"],
+                                marginal_cost=costs.at[key, "VOM"],
+                                efficiency=costs.at[key, "efficiency"],
+                                build_year=grouping_year,
+                                efficiency2=costs.at[key, "efficiency-heat"],
+                                lifetime=lifetime_assets.loc[with_heat.index],
+                            )
+
+                        if not without_heat.empty:
+                            logger.warning(
+                                f"Could not find a specific heat bus for {len(without_heat)} urban central solid biomass CHP plants. "
+                                "Adding them as electricity-only generators. "
+                                f"Problematic assets: {without_heat.index.to_list()}"
+                            )
+                            # Füge die restlichen als reine Stromerzeuger hinzu
+                            n.add(
+                                "Generator",
+                                without_heat.index,
+                                suffix=name_suffix,
+                                bus=without_heat.index,
+                                carrier="biomass",
+                                p_nom=without_heat,
+                                marginal_cost=costs.at[key, "VOM"],
+                                capital_cost=costs.at[key, "capital_cost"],
+                                efficiency=costs.at[key, "efficiency"],
+                                build_year=grouping_year,
+                                lifetime=lifetime_assets.loc[without_heat.index],
+                            )
+
         # check if existing capacities are larger than technical potential
         existing_large = n.generators[
             n.generators["p_nom_min"] > n.generators["p_nom_max"]
@@ -433,33 +496,8 @@ def get_efficiency(
     costs: pd.DataFrame,
 ) -> pd.Series | float:
     """
-    Computes the heating system efficiency based on the sector and carrier
-    type.
-
-    Parameters
-    ----------
-    heat_system : object
-    carrier : str
-        The type of fuel or energy carrier (e.g., 'gas', 'oil').
-    nodes : pandas.Series
-        A pandas Series containing node information used to match the heating efficiency data.
-    efficiencies : dict
-        A dictionary containing efficiency values for different carriers and sectors.
-    costs : pandas.DataFrame
-        A DataFrame containing boiler cost and efficiency data for different heating systems.
-
-    Returns
-    -------
-    efficiency : pandas.Series or float
-        A pandas Series mapping the efficiencies based on nodes for residential and services sectors, or a single
-        efficiency value for other heating systems (e.g., urban central).
-
-    Notes
-    -----
-    - For residential and services sectors, efficiency is mapped based on the nodes.
-    - For other sectors, the default boiler efficiency is retrieved from the `costs` database.
+    Computes the heating system efficiency based on the sector and carrier type.
     """
-
     if heat_system.value == "urban central":
         boiler_costs_name = getattr(heat_system, f"{carrier}_boiler_costs_name")
         efficiency = costs.at[boiler_costs_name, "efficiency"]
@@ -492,35 +530,6 @@ def add_heating_capacities_installed_before_baseyear(
 ) -> None:
     """
     Add heating capacities installed before base year.
-
-    Parameters
-    ----------
-    n : pypsa.Network
-        Network to modify
-    costs : pd.DataFrame
-        Technology costs
-    baseyear : int
-        Base year for analysis
-    grouping_years : list
-        Intervals to group capacities
-    heat_pump_cop : xr.DataArray
-        Heat pump coefficients of performance
-    use_time_dependent_cop : bool
-        Use time-dependent COPs
-    heating_default_lifetime : int
-        Default lifetime for heating systems
-    existing_capacities : pd.DataFrame
-        Existing heating capacity distribution
-    heat_pump_source_types : dict
-        Heat pump sources by system type
-    efficiency_file : str
-        Path to heating efficiencies file
-    energy_totals_year : int
-        Year for energy totals
-    capacity_threshold : float
-        Minimum capacity threshold
-    use_electricity_distribution_grid : bool
-        Whether to use electricity distribution grid
     """
     logger.debug(f"Adding heating capacities installed before {baseyear}")
 
@@ -539,20 +548,17 @@ def add_heating_capacities_installed_before_baseyear(
             n.buses.location[n.buses.index.str.contains(f"{heat_system} heat")]
         )
 
-        if (
-            not heat_system == HeatSystem.URBAN_CENTRAL
-        ) and use_electricity_distribution_grid:
+        if (not heat_system == HeatSystem.URBAN_CENTRAL) and use_electricity_distribution_grid:
             nodes_elec = nodes + " low voltage"
         else:
             nodes_elec = nodes
 
-            too_large_grouping_years = [
-                gy for gy in grouping_years if gy >= int(baseyear)
-            ]
+            too_large_grouping_years = [gy for gy in grouping_years if gy >= int(baseyear)]
             if too_large_grouping_years:
                 logger.warning(
                     f"Grouping years >= baseyear are ignored. Dropping {too_large_grouping_years}."
                 )
+
             valid_grouping_years = pd.Series(
                 [
                     int(grouping_year)
@@ -599,22 +605,22 @@ def add_heating_capacities_installed_before_baseyear(
                     "Link",
                     nodes,
                     suffix=f" {heat_system} {heat_source} heat pump-{grouping_year}",
-                    bus0=nodes + " " + heat_system.value + " heat",
-                    bus1=nodes_elec,
+                    bus0=nodes_elec,
+                    bus1=nodes + " " + heat_system.value + " heat",
                     carrier=f"{heat_system} {heat_source} heat pump",
-                    efficiency=1 / efficiency.clip(lower=0.001),
-                    capital_cost=costs.at[costs_name, "capital_cost"],
+                    efficiency=efficiency,
+                    capital_cost=costs.at[costs_name, "efficiency"]
+                    * costs.at[costs_name, "capital_cost"],
                     p_nom=existing_capacities.loc[
                         nodes, (heat_system.value, f"{heat_source} heat pump")
                     ]
-                    * ratio,
-                    p_max_pu=0,
-                    p_min_pu=-1 * efficiency / efficiency.clip(lower=0.001),
+                    * ratio
+                    / costs.at[costs_name, "efficiency"],
                     build_year=int(grouping_year),
                     lifetime=costs.at[costs_name, "lifetime"],
                 )
 
-            # add resistive heater, gas boilers and oil boilers
+            # add resistive heater
             n.add(
                 "Link",
                 nodes,
@@ -622,33 +628,29 @@ def add_heating_capacities_installed_before_baseyear(
                 bus0=nodes_elec,
                 bus1=nodes + " " + heat_system.value + " heat",
                 carrier=heat_system.value + " resistive heater",
-                efficiency=costs.at[
-                    heat_system.resistive_heater_costs_name, "efficiency"
-                ],
+                efficiency=costs.at[heat_system.resistive_heater_costs_name, "efficiency"],
                 capital_cost=(
                     costs.at[heat_system.resistive_heater_costs_name, "efficiency"]
                     * costs.at[heat_system.resistive_heater_costs_name, "capital_cost"]
                 ),
                 p_nom=(
-                    existing_capacities.loc[
-                        nodes, (heat_system.value, "resistive heater")
-                    ]
+                    existing_capacities.loc[nodes, (heat_system.value, "resistive heater")]
                     * ratio
                     / costs.at[heat_system.resistive_heater_costs_name, "efficiency"]
                 ),
                 build_year=int(grouping_year),
+                # BUGFIX: use resistive heater lifetime (not gas boiler)
                 lifetime=costs.at[heat_system.resistive_heater_costs_name, "lifetime"],
             )
 
-            efficiency = get_efficiency(
-                heat_system, "gas", nodes, heating_efficiencies, costs
-            )
+            # add gas boilers
+            efficiency = get_efficiency(heat_system, "gas", nodes, heating_efficiencies, costs)
 
             n.add(
                 "Link",
                 nodes,
                 suffix=f" {heat_system} gas boiler-{grouping_year}",
-                bus0="EU gas" if "EU gas" in spatial.gas.nodes else nodes + " gas",
+                bus0="EU gas" if hasattr(spatial, "gas") and "EU gas" in spatial.gas.nodes else nodes + " gas",
                 bus1=nodes + " " + heat_system.value + " heat",
                 bus2="co2 atmosphere",
                 carrier=heat_system.value + " gas boiler",
@@ -667,9 +669,8 @@ def add_heating_capacities_installed_before_baseyear(
                 lifetime=costs.at[heat_system.gas_boiler_costs_name, "lifetime"],
             )
 
-            efficiency = get_efficiency(
-                heat_system, "oil", nodes, heating_efficiencies, costs
-            )
+            # add oil boilers
+            efficiency = get_efficiency(heat_system, "oil", nodes, heating_efficiencies, costs)
 
             n.add(
                 "Link",
@@ -689,21 +690,17 @@ def add_heating_capacities_installed_before_baseyear(
                     / costs.at[heat_system.oil_boiler_costs_name, "efficiency"]
                 ),
                 build_year=int(grouping_year),
-                lifetime=costs.at[
-                    f"{heat_system.central_or_decentral} gas boiler", "lifetime"
-                ],
+                lifetime=costs.at[f"{heat_system.central_or_decentral} gas boiler", "lifetime"],
             )
 
+            # add biomass boilers (guard to avoid redundant additions / crashes)
             efficiency = get_efficiency(
                 heat_system, "biomass", nodes, heating_efficiencies, costs
             )
 
-            # prevents redundant addition of urban central biomass boiler which tends to crash
             if (
-                existing_capacities.loc[
-                    nodes, (heat_system.value, "biomass boiler")
-                ].sum()
-                > 0
+                (heat_system.value, "biomass boiler") in existing_capacities.columns
+                and existing_capacities.loc[nodes, (heat_system.value, "biomass boiler")].sum() > 0
             ):
                 n.add(
                     "Link",
@@ -713,12 +710,9 @@ def add_heating_capacities_installed_before_baseyear(
                     bus1=nodes + " " + heat_system.value + " heat",
                     carrier=heat_system.value + " biomass boiler",
                     efficiency=efficiency,
-                    capital_cost=efficiency
-                    * costs.at["biomass boiler", "capital_cost"],
+                    capital_cost=efficiency * costs.at["biomass boiler", "capital_cost"],
                     p_nom=(
-                        existing_capacities.loc[
-                            nodes, (heat_system.value, "biomass boiler")
-                        ]
+                        existing_capacities.loc[nodes, (heat_system.value, "biomass boiler")]
                         * ratio
                         / efficiency
                     ),
@@ -742,8 +736,7 @@ def add_heating_capacities_installed_before_baseyear(
                 [
                     index
                     for index in n.links.index.to_list()
-                    if str(grouping_year) in index
-                    and n.links.p_nom[index] < capacity_threshold
+                    if str(grouping_year) in index and n.links.p_nom[index] < capacity_threshold
                 ],
             )
 
@@ -761,7 +754,7 @@ if __name__ == "__main__":
             planning_horizons=2030,
         )
 
-    configure_logging(snakemake)  # pylint: disable=E0606
+    configure_logging(snakemake)
     set_scenario_config(snakemake)
 
     update_config_from_wildcards(snakemake.config, snakemake.wildcards)
@@ -778,7 +771,11 @@ if __name__ == "__main__":
     spatial = define_spatial(n.buses[n.buses.carrier == "AC"].index, options)
     add_build_year_to_new_assets(n, baseyear)
 
-    costs = load_costs(snakemake.input.costs)
+    Nyears = n.snapshot_weightings.generators.sum() / 8760.0
+    costs = load_costs(
+        snakemake.input.costs,
+        nyears=Nyears,
+    )
 
     grouping_years_power = snakemake.params.existing_capacities["grouping_years_power"]
     grouping_years_heat = snakemake.params.existing_capacities["grouping_years_heat"]
@@ -807,9 +804,7 @@ if __name__ == "__main__":
             grouping_years=grouping_years_heat,
             heat_pump_cop=xr.open_dataarray(snakemake.input.cop_profiles),
             use_time_dependent_cop=options["time_dep_hp_cop"],
-            default_lifetime=snakemake.params.existing_capacities[
-                "default_heating_lifetime"
-            ],
+            default_lifetime=snakemake.params.existing_capacities["default_heating_lifetime"],
             existing_capacities=pd.read_csv(
                 snakemake.input.existing_heating_distribution,
                 header=[0, 1],
@@ -818,13 +813,9 @@ if __name__ == "__main__":
             heat_pump_source_types=snakemake.params.heat_pump_sources,
             efficiency_file=snakemake.input.heating_efficiencies,
             energy_totals_year=snakemake.params["energy_totals_year"],
-            capacity_threshold=snakemake.params.existing_capacities[
-                "threshold_capacity"
-            ],
+            capacity_threshold=snakemake.params.existing_capacities["threshold_capacity"],
             use_electricity_distribution_grid=options["electricity_distribution_grid"],
         )
-
-    # Set defaults for missing missing values
 
     if options.get("cluster_heat_buses", False):
         cluster_heat_buses(n)

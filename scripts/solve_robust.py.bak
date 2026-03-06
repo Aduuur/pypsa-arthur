@@ -1201,40 +1201,6 @@ def _build_co2_cost_expression(n: pypsa.Network, mask: np.ndarray) -> Any:
     return total_co2
 
 
-def _finite_stores(n: pypsa.Network) -> pd.DataFrame:
-    s = n.stores
-    is_ext = s.get("e_nom_extendable", pd.Series(False, index=s.index)).fillna(False).astype(bool)
-    e_nom_vals = s["e_nom"].fillna(0).astype(float)
-
-    # Für nicht-extendable Stores: e_nom ist die fixe Kapazität.
-    # Wenn e_nom nicht endlich-positiv → Store-p unbegrenzt → ausschließen.
-    # KEIN is_inf_max Check — e_nom_max ist für nicht-extendable irrelevant
-    # und wird von _fix_unbounded_infrastructure geändert (was den alten Check bricht).
-    is_bad_nom = ~(np.isfinite(e_nom_vals) & (e_nom_vals > 0))
-    exclude = (~is_ext) & is_bad_nom
-
-    if exclude.any():
-        logger.info(
-            "_finite_stores: excluding %d unbounded non-extendable stores: %s  carriers=%s",
-            int(exclude.sum()),
-            s.index[exclude][:5].tolist(),
-            s.loc[exclude, "carrier"].value_counts().to_dict(),
-        )
-        # === DIAGNOSE ===
-
-    logger.info(
-    "[DIAG] _finite_stores: total=%d  excluded=%d (unbounded)  included=%d  ",
-    "excluded_carriers=%s",
-    len(s),
-    int(exclude.sum()),
-    int((~exclude).sum()),
-    s.loc[exclude, "carrier"].value_counts().head(5).to_dict() if exclude.any() else {},
-
-        )
-
-        # === ENDE ===
-    return s[~exclude].copy()
-
 def _build_operational_cost_expression(
         n: pypsa.Network,
         mask: np.ndarray,
@@ -1275,15 +1241,13 @@ def _build_operational_cost_expression(
         nonlocal total
         if comp_df is None or len(comp_df) == 0 or "marginal_cost" not in comp_df.columns:
             return
-
-
         var, _ = _get_linopy_var(m, var_names, strict=False)
         if var is None:
             return
-        td = _get_time_dimension(var)
+        td    = _get_time_dimension(var)
         var_s = _var_isel(var, td)
-        wd = _w_da(var_s, td)
-        mc_s = comp_df["marginal_cost"].reindex(comp_df.index).fillna(0.0).astype(float)
+        wd    = _w_da(var_s, td)
+        mc_s  = comp_df["marginal_cost"].reindex(comp_df.index).fillna(0.0).astype(float)
 
         if mc_t is not None and not mc_t.empty:
             mc_t_s = (mc_t.reindex(columns=comp_df.index)
@@ -1327,10 +1291,9 @@ def _build_operational_cost_expression(
         _add_uc(v_shut,   sd_c)
         _add_uc(v_status, nl_c)
 
-
     _add_mc(n.generators,    getattr(getattr(n, "generators_t",    None), "marginal_cost", None), ["Generator-p"],                            "Generator")
     _add_mc(n.storage_units, getattr(getattr(n, "storage_units_t", None), "marginal_cost", None), ["StorageUnit-p_dispatch", "StorageUnit-p"], "StorageUnit")
-    _add_mc(_finite_stores(n), getattr(getattr(n, "stores_t", None), "marginal_cost", None), ["Store-p"], "Store")
+    _add_mc(n.stores,        getattr(getattr(n, "stores_t",        None), "marginal_cost", None), ["Store-p"],                                "Store")
     _add_mc(n.links,         getattr(getattr(n, "links_t",         None), "marginal_cost", None), ["Link-p0"],                                "Link")
     _add_uc_costs()
 
@@ -1338,18 +1301,6 @@ def _build_operational_cost_expression(
         total = total + _build_co2_cost_expression(n, mask)
     elif co2_cost_mode != "off":
         raise ValueError(f"Unknown co2_cost_mode='{co2_cost_mode}'.")
-
-    # === DIAGNOSE: Op-Cost Aufbau ===
-    try:
-        n_terms = len(getattr(total, 'terms', [])) if hasattr(total, 'terms') else -1
-        logger.debug(
-            "[DIAG] Op-cost expression built: scenario_mask sum=%d  annual_scale=%.4f  "
-            "n_terms=%d  co2_mode=%s",
-            int(mask.sum()), annual_scale, n_terms, co2_cost_mode,
-        )
-    except Exception:
-        pass
-    # === ENDE ===
 
     return total
 
@@ -1571,22 +1522,9 @@ def _dispatch_solve(
 
     # [DISPATCH-FIX-2] Relax e_initial for unbounded stores
     _fix_inf_store_initial(n)
-    _fix_unbounded_infrastructure(n)
 
     # [DISPATCH-FIX-3] Prune zero-capacity assets to match master model size
     _prune_zero_capacity_assets(n)
-
-    # === DIAGNOSE: Dispatch-Netzwerk nach Prune ===
-    logger.info(
-        "[DIAG] Dispatch network post-prune: gens=%d  links=%d  stores=%d  su=%d",
-        len(n.generators), len(n.links), len(n.stores), len(n.storage_units),
-    )
-    # Gibt es noch LS-Gens?
-    ls = n.generators[n.generators.carrier.isin(["load_shedding", "load"])]
-    logger.info("[DIAG] LS generators pre-dispatch: %d  p_nom_total=%.1f GW  mc=%.0f EUR/MWh",
-                len(ls), ls.p_nom.sum() / 1e3 if len(ls) else 0,
-                ls.marginal_cost.mean() if len(ls) else 0)
-    # === ENDE ===
 
     # [BUG-FIX-7] Consistent annual_scale and LS penalty
     annual_scale   = _compute_dispatch_annual_scale(n)
@@ -1605,9 +1543,6 @@ def _dispatch_solve(
             annual_scale=annual_scale,
         )
         m.objective = op_cost
-    w = n.snapshot_weightings["objective"]
-    logger.info("DISPATCH WEIGHT CHECK: min=%.3f max=%.3f sum=%.1f n=%d annual_scale=%.4f",
-    w.min(), w.max(), w.sum(), len(w), annual_scale)
 
     n.optimize(
         solver_name=solver_name,
@@ -1647,25 +1582,6 @@ def evaluate_single_cutout_dispatch(
 
     port_net = pypsa.Network(str(portfolio_path))
     _fix_portfolio_capacities(n, port_net)
-
-    # === DIAGNOSE: Portfolio-Kapazitäten ===
-    for comp, opt_col, _, ext_col in [
-        ("generators", "p_nom_opt", "p_nom", "p_nom_extendable"),
-        ("links", "p_nom_opt", "p_nom", "p_nom_extendable"),
-        ("stores", "e_nom_opt", "e_nom", "e_nom_extendable"),
-    ]:
-        df = getattr(n, comp)
-        if opt_col not in df.columns: continue
-        built = df[df[opt_col].fillna(0) > 1]
-        if len(built):
-            logger.info("[DIAG] Portfolio %s built: %s",
-                        comp,
-                        built.groupby("carrier")[opt_col].sum().sort_values(ascending=False).head(5).to_dict()
-                        )
-        else:
-            logger.warning("[DIAG] Portfolio %s: NOTHING BUILT (p_nom_opt=0 everywhere)!", comp)
-    # === ENDE ===
-
     del port_net
     gc.collect()
 
@@ -1938,16 +1854,12 @@ def _fix_unbounded_infrastructure(n: pypsa.Network) -> Dict[str, int]:
     fixed: Dict[str, int] = {}
 
     # Fix biomass generators
-    # In _fix_unbounded_infrastructure, ersetze die bisherigen co2/gas Store Blöcke
-    # durch diesen generellen Block:
-
-
     if hasattr(n, "generators") and len(n.generators) > 0:
         bio_mask = n.generators.carrier.str.contains("biomass", case=False, na=False)
         bio_inf = bio_mask & (n.generators.p_nom_max == np.inf)
         if bio_inf.any():
             n.generators.loc[bio_inf, "p_nom_max"] = 1e6
-            count = int(bio_inf.sum())
+            count = bio_inf.sum()
             fixed["generators::biomass"] = count
             examples = n.generators.index[bio_inf][:3].tolist()
             logger.info(
@@ -1955,47 +1867,18 @@ def _fix_unbounded_infrastructure(n: pypsa.Network) -> Dict[str, int]:
                 "Examples: %s", count, examples
             )
 
+    # Fix gas stores
     if hasattr(n, "stores") and len(n.stores) > 0:
-        # Carrier-spezifische Obergrenzen (MWh)
-        carrier_caps = {
-            "co2 stored": 1e9,  # CCS-Speicher: 1 TWh
-            "co2": 1e12,  # Atmosphäre: praktisch unbegrenzt
-            "gas": 1e9,  # Gas-Speicher
-            "H2 Store": 1e9,  # Wasserstoff
-            "ammonia store": 1e9,
-            "battery": 1e8,
-            "home battery": 1e7,
-            "biomass": 1e9,
-            "coal": 1e9,
-            "lignite": 1e9,
-            "uranium": 1e12,  # Kernbrennstoff: sehr groß
-            "oil": 1e9,
-            "methanol": 1e9,
-            "geothermal_heat": 1e8,
-            "rural water tanks": 1e8,
-            "urban central water pits": 1e8,
-            "urban central water tanks": 1e8,
-            "urban decentral water tanks": 1e8,
-        }
-        default_cap = 1e9  # für alle nicht gelisteten Carrier
-
-        inf_mask = n.stores.e_nom_max.fillna(np.inf).apply(np.isinf)
-        mc_mask = n.stores.marginal_cost.fillna(0) > 0
-        to_fix = n.stores.index[inf_mask & mc_mask]
-
-        if len(to_fix) > 0:
-            for store_name in to_fix:
-                carrier = str(n.stores.at[store_name, "carrier"])
-                cap = carrier_caps.get(carrier, default_cap)
-                n.stores.at[store_name, "e_nom_max"] = cap
-
-            count = len(to_fix)
-            fixed["stores::all_unbounded"] = count
+        gas_mask = n.stores.carrier == "gas"
+        gas_inf = gas_mask & (n.stores.e_nom_max == np.inf)
+        if gas_inf.any():
+            n.stores.loc[gas_inf, "e_nom_max"] = 1e9
+            count = gas_inf.sum()
+            fixed["stores::gas"] = count
+            examples = n.stores.index[gas_inf][:3].tolist()
             logger.info(
-                "[INFRA-FIX] Capped %d unbounded stores (e_nom_max inf→carrier-specific). "
-                "Carriers: %s",
-                count,
-                n.stores.loc[to_fix, "carrier"].value_counts().to_dict(),
+                "[INFRA-FIX] Fixed %d gas stores: e_nom_max inf→1e9 MWh. "
+                "Examples: %s", count, examples
             )
 
     if not fixed:
@@ -2426,8 +2309,42 @@ def solve_aro_master(
         fail_on_extendable_ramps: bool = True,
         co2_cost_mode: str = "off",
 ) -> Dict[str, Any]:
+    """
+    ARO Master Problem — full-scenario-stack formulation.
 
+    Mathematical formulation
+    ─────────────────────────
+    min_{x, z_theta}   Inv(x) + z_theta
+    s.t.               z_theta >= Op(x, s)   for all s in S
+                       GC_s(x)              for all s in S   [ARO-FIX-3]
+                       x >= 0
 
+    z_theta is an epigraph variable representing the worst-case operational
+    cost across all scenarios. All scenarios are stacked into a single LP
+    (full enumeration), which is equivalent to 1-iteration C&CG when the
+    complete scenario set S is enumerated upfront. Iterative C&CG (lazy
+    scenario addition) would be needed for continuous or very large S.
+
+    Fixes applied
+    ─────────────
+    [MEM-PATCH-B]   No snapshot_weightings mutation; w_override_np + annual_scale.
+    [FIX-2]         LS generators: marginal_cost = ls_penalty / annual_scale.
+    [FIX-3]         z_theta extracted via multi-fallback _extract_scalar_solution.
+    [BUG-FIX-1]     cyclic_overrides = e_cyclic_backup (not {}) in extra_master.
+    [BUG-FIX-2]     is not None guard in _add_scenario_boundary_constraints.
+    [BUG-FIX-3]     GlobalConstraint constants saved and restored after solve.
+    [BUG-FIX-4]     Ramp limits restored via _restore_ramp_limits after solve.
+    [BUG-FIX-5]     e_cyclic_backup restored after solve.
+    [BUG-FIX-6]     IIS debug gated behind ARO_IIS_DEBUG env variable.
+    [DISPATCH-FIX-1] _fix_negative_loads: net-export → zero-cost Generator.
+    [DISPATCH-FIX-2] _fix_inf_store_initial: e_initial=-1e6 for CO2 stores.
+    [ARO-FIX-1]     _fix_cross_scenario_storage_constraints: remove PyPSA's
+                    auto-generated SOC balance rows at scenario boundaries.
+    [ARO-FIX-2]     z_theta lower bound = -inf (not 0).
+    [ARO-FIX-3]     _add_per_scenario_global_constraints: neutralize PyPSA's
+                    native N×T-summing GCs; re-add as per-scenario constraints.
+    [LS-FIX-1]      Per-bus LS p_nom = peak_load × 2 (not global 1e8 MW).
+    """
     if solver_options is None:
         solver_options = {}
 
@@ -2441,24 +2358,6 @@ def solve_aro_master(
         logger.info("[BIOMASS-FIX] Carrier growth limits applied: %s",
                     list(growth_limits.keys()))
     _fix_zero_capital_cost_extendables(n)
-
-    # === DIAGNOSE: Investment-Potenzial ===
-    for comp, nom_col, ext_col, cap_col in [
-        ("generators", "p_nom", "p_nom_extendable", "capital_cost"),
-        ("links", "p_nom", "p_nom_extendable", "capital_cost"),
-        ("stores", "e_nom", "e_nom_extendable", "capital_cost"),
-    ]:
-        df = getattr(n, comp)
-        if ext_col not in df.columns: continue
-        ext = df[df[ext_col].fillna(False).astype(bool)]
-        if len(ext) == 0: continue
-        logger.info(
-            "[DIAG] Extendable %s: n=%d  carriers=%s  cap_cost=[%.0f, %.0f] EUR/MW",
-            comp, len(ext),
-            ext.get("carrier", pd.Series(dtype=str)).value_counts().head(5).to_dict(),
-            ext[cap_col].fillna(0).min(), ext[cap_col].fillna(0).max(),
-        )
-    # === ENDE ===
 
     masks     = _scenario_masks_from_snapshots(n.snapshots)
     scenarios = list(masks.keys())
@@ -2564,25 +2463,23 @@ def solve_aro_master(
         )
 
         # [ARO-FIX-1] Remove PyPSA's auto-generated SOC/energy balance rows
-        # at scenario boundaries...
+        # at scenario boundaries. These couple consecutive scenarios through
+        # storage dynamics (soc[scen_i, t=0] = f(soc[scen_{i-1}, t=T])),
+        # which violates the ARO independence assumption.
+        # PRECONDITION: _add_scenario_boundary_constraints has just been
+        # called, so each scenario's own cyclic closure (soc[t=0]==soc[t=T])
+        # is already in place before we remove the cross-boundary rows.
         _fix_cross_scenario_storage_constraints(network, scenarios, masks)
 
-        # [ARO-FIX-3] Add per-scenario GlobalConstraint equivalents...
+        # [ARO-FIX-3] Add per-scenario GlobalConstraint equivalents.
+        # PyPSA's native GCs whose carrier_attribute was resolvable were
+        # neutralized (set to abs(original)*1000) before model build so
+        # they don't sum over N×T snapshots. We re-add them here as one
+        # explicit constraint per (gc_name, scenario), each covering only
+        # T snapshots with budget = original_constant / annual_scale.
         _add_per_scenario_global_constraints(
             network, scenarios, masks, _original_gc_constants, annual_scale,
         )
-
-        # === DIAGNOSE: Modellgröße ===
-        logger.info(
-            "[DIAG] Variables in model: %s",
-            list(m.variables)[:20],
-        )
-        logger.info(
-            "[DIAG] Constraints in model: %d  names: %s",
-            len(m.constraints),
-            list(m.constraints)[:10],
-        )
-        # === ENDE ===
 
         _add_within_scenario_ramp_constraints(
             network, scenarios, masks, ramp_data,
@@ -2590,7 +2487,16 @@ def solve_aro_master(
         )
 
         # [ARO-FIX-2] lower=-np.inf  (was lower=0).
-        z_theta = m.add_variables(lower=-np.inf, name="z_theta")
+        # Rationale: in the C&CG epigraph formulation
+        #   min Inv(x) + z_theta   s.t.  z_theta >= Op(x, s)  ∀ s ∈ S_k
+        # the epigraph constraints alone ensure z_theta equals the worst-case
+        # operational cost. Imposing lower=0 is an extraneous constraint that
+        # is methodically wrong: if any scenario has Op < 0 (e.g. due to
+        # negative marginal prices or export revenues) the true optimum is
+        # blocked and the master returns a sub-optimal, non-robust portfolio.
+        # Even when Op > 0 in practice, lower=0 adds a redundant constraint
+        # that increases problem size and can worsen Barrier/Crossover numerics.
+        z_theta  = m.add_variables(lower=-np.inf, name="z_theta")
         inv_cost = _build_investment_cost_expression(network)
 
         for s in scenarios:
@@ -2601,52 +2507,16 @@ def solve_aro_master(
                 w_override_np=w_base_np,
                 annual_scale=annual_scale,
             )
-            # op_cost_s enthält KEINE LS-Kosten mehr (gefiltert in _add_mc)
             m.add_constraints(
                 1.0 * z_theta >= op_cost_s,
                 name=f"robust_op_epigraph::{s}",
             )
             del op_cost_s
+
         m.objective = inv_cost + 1.0 * z_theta
-
-        # === DIAGNOSE: Zielfunktion ===
-        logger.info("[DIAG] Objective set: inv_cost + z_theta. Epigraph constraints: %d",
-                    sum(1 for k in m.constraints if k.startswith("robust_op_epigraph")))
-        # Prüfe ob inv_cost > 0 (sonst keine Investment-Variablen)
-        try:
-            inv_terms = sum(1 for k in m.variables if "p_nom" in k or "e_nom" in k or "s_nom" in k)
-            logger.info("[DIAG] Investment variables in model: %d (p_nom/e_nom/s_nom)", inv_terms)
-        except Exception:
-            pass
-        # === ENDE ===
-
 
     logger.info("ARO Master: solving min Inv + worst-case Op (full-stack, %d scenarios) ...",
                 len(scenarios))
-
-    # === BILLIONEN-DIAGNOSE ===
-    w = n.snapshot_weightings["objective"]
-    logger.info("WEIGHTS: min=%.3f  max=%.3f  sum=%.1f  n=%d  n_scen=%d",
-                w.min(), w.max(), w.sum(), len(w), len(scenarios))
-    logger.info("SCALE:   hours_per_scenario=%.1f  annual_scale=%.4f",
-                hours_per_scenario, annual_scale)
-    logger.info("LS_MC:   ls_mc_adjusted=%.4f EUR/MWh  (ls_penalty=%.4g / annual_scale=%.4f)",
-                ls_mc_adjusted, ls_penalty, annual_scale)
-
-    # Maximale theoretische LS-Kosten
-    ls_gens_check = n.generators[n.generators.carrier.isin(["load_shedding", "load"])]
-    max_ls_mwh = float(ls_gens_check.p_nom.sum()) * float(w.sum())
-    max_ls_cost = max_ls_mwh * ls_mc_adjusted
-    logger.info("MAX_THEORETICAL_LS: p_nom_total=%.1f GW  max_mwh=%.3e  max_cost=%.3e EUR",
-                ls_gens_check.p_nom.sum() / 1e3, max_ls_mwh, max_ls_cost)
-
-    # Extendables nach Prune
-    for comp in ["generators", "links", "storage_units"]:
-        df = getattr(n, comp)
-        n_ext = df.get("p_nom_extendable", pd.Series(False)).fillna(False).sum()
-        logger.info("EXTENDABLE_%s: %d assets", comp.upper(), n_ext)
-    # === ENDE DIAGNOSE ===
-
     n.optimize(
         solver_name=solver_name,
         solver_options=solver_options,
@@ -2688,32 +2558,6 @@ def solve_aro_master(
 
     sol          = _get_solution_dict(n)
     z_theta_star = _extract_scalar_solution(sol, "z_theta")
-
-    # ⚠️ DIAGNOSE: Wieviel Load Shedding wurde genutzt? ⚠️
-    if hasattr(n, 'generators_t') and hasattr(n.generators_t, 'p'):
-        gen_p_df = n.generators_t.p
-        ls_gens = n.generators.index[
-            n.generators["carrier"].isin(["load_shedding", "load"])
-        ]
-        if len(ls_gens) > 0 and isinstance(gen_p_df, pd.DataFrame) and not gen_p_df.empty:
-            ls_cols = gen_p_df.columns.intersection(ls_gens)
-            if len(ls_cols) > 0:
-                ls_usage_total = float(gen_p_df[ls_cols].sum().sum())  # Total MWh
-                ls_usage_max = float(gen_p_df[ls_cols].max().max())  # Peak MW
-
-                if ls_usage_total > 1.0:
-                    logger.error(
-                        "⚠️  EXCESSIVE LOAD SHEDDING: %.2f MWh total, %.2f MW peak! "
-                        "Check network feasibility or increase penalty.",
-                        ls_usage_total, ls_usage_max
-                    )
-                elif ls_usage_total > 0.01:
-                    logger.warning(
-                        "⚠️  Minor load shedding: %.4f MWh total, %.2f MW peak.",
-                        ls_usage_total, ls_usage_max
-                    )
-                else:
-                    logger.info("✓ No significant load shedding detected (%.2e MWh).", ls_usage_total)
 
     # [BUG-FIX-3] Restore GlobalConstraint constants
     for gc_name, orig_val in _original_gc_constants.items():
@@ -3251,23 +3095,6 @@ def run_robust(
 
     Path(out_network).parent.mkdir(parents=True, exist_ok=True)
     Path(out_summary_json).parent.mkdir(parents=True, exist_ok=True)
-
-    # === DIAGNOSE: Master-Ergebnis Sanity Check ===
-    z = diag.get("z_theta_star", float("nan"))
-    ls_pen = diag.get("ls_penalty", float("nan"))
-    n_scen = diag.get("n_scenarios", 1)
-    logger.info(
-        "[DIAG] Master result: z_theta*=%.3e  ls_penalty=%.4g  "
-        "max_realistic_z=%.3e (= ls_penalty × 8760h × peak_load_approx)",
-        z, ls_pen, ls_pen * 8760 * 800e3  # ~800 GW Europa-Peak
-    )
-    if z > ls_pen * 8760 * 1e6:
-        logger.error("[DIAG] z_theta* implausibly large — likely still driven by LS or unbounded stores!")
-    elif z < 1e9:
-        logger.warning("[DIAG] z_theta* very small (%.3e) — check if op-cost expression is empty", z)
-    else:
-        logger.info("[DIAG] z_theta* in plausible range ✓")
-    # === ENDE ===
 
     logger.info("Exporting stacked robust network → %s", out_network)
     _ensure_standard_pypsa_result_frames(n)

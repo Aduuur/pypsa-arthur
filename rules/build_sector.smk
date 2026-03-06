@@ -1558,6 +1558,10 @@ rule prepare_sector_network:
         biomass_potentials=resources(
             "biomass_potentials_s_{clusters}_{planning_horizons}.csv"
         ),
+        custom_fuel_costs=lambda w: (
+                config_provider("costs","custom_cost_adaptions","file")(w)
+                or []
+        ),
         costs=lambda w: (
             resources(f"costs_{config_provider("costs", "year")(w)}_processed.csv")
             if config_provider("foresight")(w) == "overnight"

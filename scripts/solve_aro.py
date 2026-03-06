@@ -265,8 +265,10 @@ def _rotate_master_set(
 def _dispatch_worker_fn(kwargs: Dict[str, Any]) -> Dict[str, Any]:
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s [worker] %(name)s: %(message)s",
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # solve_robust wird als Modul importiert → __name__="solve_robust" → explizit aktivieren
+    logging.getLogger("solve_robust").setLevel(logging.INFO)
     cutout = kwargs.get("cutout", "?")
     logger.info("Worker starting for cutout '%s'.", cutout)
     try:

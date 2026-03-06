@@ -370,6 +370,100 @@ if __name__ == "__main__":
         capacity_threshold=snakemake.params.threshold_capacity,
     )
 
+    #  NEU: Brownfield-Kapazitäten nachträglich anpassen
+    adjust_cfg = snakemake.config.get("adjust_brownfield_capacities", {})
+    if adjust_cfg.get("enable", False):
+        logger.info(f"Adjusting brownfield capacities for planning year {year}...")
+
+
+        def _country_of(series, buses_df):
+            """Hilfsfunktion: ermittelt Ländercode eines Bus-Strings (Fallback: ersten 2 Buchstaben)."""
+            c = series.map(buses_df["country"]).astype(object)
+            fallback = series.astype(str).str[:2]
+            c = c.where(c.notna() & (c != ""), fallback)
+            return c
+
+
+        for country, tech_limits in adjust_cfg.items():
+            if country == "enable":
+                continue
+            country_code = country.upper()
+
+            for tech, target in tech_limits.items():
+                # Falls target ein dict ist, hole jahresspezifischen Wert
+                if isinstance(target, dict):
+                    target_total = target.get(str(year), target.get(int(year), None))
+                    if target_total is None:
+                        logger.warning(f"[{country_code} {tech}] Kein Limit für Jahr {year} gefunden – überspringe")
+                        continue
+                else:
+                    target_total = target
+
+                # ------------------------------------------------------------
+                # LINKS (z. B. Kohle/Braunkohle) — ABER NICHT für Kernkraft
+                # ------------------------------------------------------------
+                if tech != "nuclear" and not n.links.empty:
+                    bus1_country = _country_of(n.links["bus1"], n.buses)
+                    mask_links_ctry = (n.links["carrier"] == tech) & (bus1_country == country_code)
+                    if mask_links_ctry.any():
+                        idx = n.links.index[mask_links_ctry]
+                        cur = n.links.loc[idx, "p_nom"].fillna(0.0)
+                        total = float(cur.sum())
+
+                        if "p_nom_max" not in n.links.columns:
+                            n.links["p_nom_max"] = np.inf
+
+                        if total <= target_total:
+                            n.links.loc[idx, "p_nom_max"] = target_total
+                        else:
+                            # proportional runter skalieren
+                            w = cur.replace(0.0, 1.0)
+                            w = w / w.sum()
+                            new_p = w * target_total
+                            n.links.loc[idx, "p_nom"] = new_p
+                            n.links.loc[idx, "p_nom_max"] = np.maximum(
+                                n.links.loc[idx, "p_nom_max"].fillna(0.0), new_p
+                            )
+                        logger.info(
+                            f"[{country_code} {tech}] Links: {total:.0f} → ≤ {target_total:.0f} MW "
+                            f"({len(idx)} Einträge)"
+                        )
+                    else:
+                        logger.info(f"[{country_code} {tech}] Links: keine Einträge gefunden.")
+                elif tech == "nuclear":
+                    logger.debug(f"[{country_code} {tech}] Link-Anpassung übersprungen (nuclear).")
+
+                # ------------------------------------------------------------
+                # GENERATORS (betrifft u.a. nuclear → wird NICHT übersprungen)
+                # ------------------------------------------------------------
+                if not n.generators.empty:
+                    bus_country = _country_of(n.generators["bus"], n.buses)
+                    mask_gens_ctry = (n.generators["carrier"] == tech) & (bus_country == country_code)
+                    if mask_gens_ctry.any():
+                        idx = n.generators.index[mask_gens_ctry]
+                        cur = n.generators.loc[idx, "p_nom"].fillna(0.0)
+                        total = float(cur.sum())
+
+                        if "p_nom_max" not in n.generators.columns:
+                            n.generators["p_nom_max"] = np.inf
+
+                        if total <= target_total:
+                            n.generators.loc[idx, "p_nom_max"] = target_total
+                        else:
+                            w = cur.replace(0.0, 1.0)
+                            w = w / w.sum()
+                            new_p = w * target_total
+                            n.generators.loc[idx, "p_nom"] = new_p
+                            n.generators.loc[idx, "p_nom_max"] = np.maximum(
+                                n.generators.loc[idx, "p_nom_max"].fillna(0.0), new_p
+                            )
+                        logger.info(
+                            f"[{country_code} {tech}] Generators: {total:.0f} → ≤ {target_total:.0f} MW "
+                            f"({len(idx)} Einträge)"
+                        )
+                    else:
+                        logger.info(f"[{country_code} {tech}] Generators: keine Einträge gefunden.")
+
     disable_grid_expansion_if_limit_hit(n)
 
     n.meta = dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards)))
