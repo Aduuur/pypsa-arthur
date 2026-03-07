@@ -122,6 +122,100 @@ import pypsa
 
 logger = logging.getLogger(__name__)
 
+def _debug_cost_ranking(costs: Dict[str, float], stage: str) -> None:
+    if not costs:
+        logger.warning("[%s] No costs available.", stage)
+        return
+    ranking = sorted(costs.items(), key=lambda kv: kv[1], reverse=True)
+    logger.info("[%s] Cost ranking (worst→best): %s",
+                stage,
+                " | ".join(f"{k}={v:.3e}" for k, v in ranking))
+
+
+def _debug_master_membership(
+        all_costs: Dict[str, float],
+        master_set: List[str],
+        stage: str,
+) -> None:
+    if not all_costs:
+        return
+    logger.info("[%s] Master set: %s", stage, master_set)
+    for c in master_set:
+        if c in all_costs:
+            logger.info("[%s]   master cost: %s = %.6e", stage, c, all_costs[c])
+        else:
+            logger.warning("[%s]   master scenario '%s' missing in cost table.", stage, c)
+
+
+def _debug_gap_details(
+        all_costs: Dict[str, float],
+        master_set: List[str],
+        gap: float,
+        worst_total: float,
+        worst_in_master: float,
+        stage: str,
+) -> None:
+    logger.info(
+        "[%s] GAP details: gap=%.6f  worst_total=%.6e  worst_in_master=%.6e  diff=%.6e",
+        stage, gap, worst_total, worst_in_master, worst_total - worst_in_master,
+    )
+    non_master = {k: v for k, v in all_costs.items() if k not in set(master_set)}
+    if non_master:
+        ranking = sorted(non_master.items(), key=lambda kv: kv[1], reverse=True)[:10]
+        logger.info(
+            "[%s] Worst outside master: %s",
+            stage,
+            " | ".join(f"{k}={v:.3e}" for k, v in ranking),
+        )
+
+
+def _debug_json_summary(tmp_sum: str, stage: str) -> None:
+    p = Path(tmp_sum)
+    if not p.exists():
+        logger.warning("[%s] Summary JSON not found: %s", stage, tmp_sum)
+        return
+    try:
+        with open(p, "r") as f:
+            data = json.load(f)
+        diag = data.get("diagnostics", {})
+        rv = diag.get("robustness_verify", {})
+        logger.info(
+            "[%s] Robust summary: z_theta*=%.6e  n_scen=%s  annual_scale=%s  "
+            "ls_penalty=%s  robustness_ok=%s  rel_gap=%s",
+            stage,
+            float(diag.get("z_theta_star", float("nan"))),
+            diag.get("n_scenarios"),
+            diag.get("annual_scale"),
+            diag.get("ls_penalty"),
+            rv.get("ok"),
+            rv.get("rel_gap"),
+        )
+        caps = data.get("capacities", {})
+        for comp in ["generators", "links", "storage_units", "stores"]:
+            if comp in caps and caps[comp]:
+                items = list(caps[comp].items())[:10]
+                logger.info("[%s] capacities[%s] sample: %s", stage, comp, items)
+    except Exception as exc:
+        logger.warning("[%s] Could not parse summary JSON '%s': %s", stage, tmp_sum, exc)
+
+
+def _debug_cache_decision(
+        final_path: str,
+        cached_path: str,
+        use_cache: bool,
+        stage: str,
+) -> None:
+    try:
+        final_md5 = _file_md5(final_path) if Path(final_path).exists() else "missing"
+        cache_md5 = _file_md5(cached_path) if Path(cached_path).exists() else "missing"
+        logger.info(
+            "[%s] Cache check: use_cache=%s  final=%s  cached=%s",
+            stage, use_cache, final_md5, cache_md5,
+        )
+    except Exception as exc:
+        logger.warning("[%s] Cache debug failed: %s", stage, exc)
+
+
 # [OPT-3] Interpreter und Env einmal cachen
 _PYTHON = sys.executable
 _SUBPROCESS_ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
@@ -373,6 +467,13 @@ def evaluate_all_cutouts(
                 (r["consistency"].get("rel_diff") or 0.0) * 100,
             )
 
+    logger.info(
+        "[dispatch_eval_summary] completed %d cutouts. worst=%s  best=%s",
+        len(costs),
+        max(costs, key=costs.get) if costs else None,
+        min(costs, key=costs.get) if costs else None,
+    )
+    _debug_cost_ranking(costs, "dispatch_eval_summary")
     return costs, dispatch_paths, dispatch_std_paths
 
 
@@ -591,6 +692,8 @@ def main() -> None:
         if not Path(tmp_net).exists():
             raise RuntimeError(f"Robust solver did not produce: {tmp_net}")
 
+        _debug_json_summary(tmp_sum, f"iter{iteration}_after_robust_solve")
+
         # ------------------------------------------------------------------
         # Step 2: Dispatch-Evaluation über ALLE Cutouts
         # ------------------------------------------------------------------
@@ -610,6 +713,8 @@ def main() -> None:
             ls_penalty=ls_penalty,
             workers=args.dispatch_workers,
         )
+        _debug_cost_ranking(all_costs, f"iter{iteration}_dispatch_eval")
+        _debug_master_membership(all_costs, master_set, f"iter{iteration}_dispatch_eval")
 
         if not all_costs:
             raise RuntimeError("evaluate_all_cutouts returned empty costs dict.")
@@ -618,6 +723,11 @@ def main() -> None:
         worst_cost   = all_costs[worst_cutout]
 
         gap, worst_total, worst_in_master = _compute_aro_gap(all_costs, master_set)
+
+        _debug_gap_details(
+            all_costs, master_set, gap, worst_total, worst_in_master,
+            f"iter{iteration}_gap"
+        )
 
         logger.info(
             "[Iter %d] Costs: %s",
@@ -706,6 +816,20 @@ def main() -> None:
             master_set, evicted = _rotate_master_set(
                 master_set, worst_cutout, max_master_size,
             )
+            if evicted is not None:
+                logger.info(
+                    "[ROT-DEBUG] added='%s' cost=%.6e  evicted='%s' cost=%.6e  new_master=%s",
+                    worst_cutout, all_costs.get(worst_cutout, float("nan")),
+                    evicted, all_costs.get(evicted, float("nan")),
+                    master_set,
+                )
+            else:
+                logger.info(
+                    "[ROT-DEBUG] added='%s' cost=%.6e  no eviction  new_master=%s",
+                    worst_cutout, all_costs.get(worst_cutout, float("nan")),
+                    master_set,
+                )
+
             # [ROT-FIX-1] Evicted scenario zurück in remaining
             if evicted and evicted not in remaining:
                 remaining.append(evicted)
@@ -792,6 +916,12 @@ def main() -> None:
             cache_md5 = _file_md5(last_iter_portfolio)
             if final_md5 == cache_md5:
                 _use_cache = True
+                _debug_cache_decision(
+                    args.out_network,
+                    last_iter_portfolio,
+                    _use_cache,
+                    "final_cache_check",
+                )
                 logger.info(
                     "[OPT-1] Reusing cached dispatch results from last iteration "
                     "(MD5 match — portfolio unchanged, skipping redundant dispatch solve).",
@@ -800,6 +930,12 @@ def main() -> None:
                 logger.info(
                     "[OPT-1] Portfolio changed (MD5 mismatch) — "
                     "running fresh dispatch evaluation.",
+                    _debug_cache_decision(
+                        args.out_network,
+                        last_iter_portfolio,
+                        _use_cache,
+                        "final_cache_check",
+                    )
                 )
         except Exception as exc:
             logger.warning("[OPT-1] MD5 check failed (%s) — running fresh dispatch.", exc)
@@ -833,6 +969,12 @@ def main() -> None:
         final_costs, master_set,
     )
 
+    _debug_cost_ranking(final_costs, "final_evaluation")
+    _debug_master_membership(final_costs, master_set, "final_evaluation")
+    _debug_gap_details(
+        final_costs, master_set, final_gap, final_worst_total, final_worst_in_master,
+        "final_evaluation"
+    )
     logger.info(
         "Final worst-case: '%s' (total_cost=%.6g)  gap=%.4f%%",
         worst_final, worst_final_cost, final_gap * 100,

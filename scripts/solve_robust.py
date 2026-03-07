@@ -187,6 +187,270 @@ import pypsa
 logger = logging.getLogger(__name__)
 
 # =============================================================================
+# Debug / filtering helpers
+# =============================================================================
+
+_SYNTHETIC_GENERATOR_CARRIERS = {"load", "load_shedding", "net_export"}
+_SYNTHETIC_GENERATOR_PREFIXES = ("LS::", "NegLoad::")
+
+# Alles, was wir im Portfolio-Debug als "verdächtig" ansehen
+_SUSPICIOUS_CARRIERS = {
+    "load", "load_shedding", "net_export",
+    "co2", "co2 stored", "co2 sequestered",
+    "uranium", "coal", "lignite", "geothermal_heat",
+    "oil refining", "electricity distribution grid",
+    "biomass", "solid biomass", "biogas",
+    "urban central water pits charger",
+    "urban central water pits discharger",
+    "H2 Store",
+}
+
+def _is_synthetic_generator_row(name: str, row: pd.Series) -> bool:
+    carrier = str(row.get("carrier", ""))
+    if carrier in _SYNTHETIC_GENERATOR_CARRIERS:
+        return True
+    if any(str(name).startswith(p) for p in _SYNTHETIC_GENERATOR_PREFIXES):
+        return True
+    return False
+
+
+def _drop_orphan_timeseries_columns(n: pypsa.Network) -> None:
+    """
+    Remove *_t columns whose assets no longer exist in the corresponding static table.
+    This fixes the repeated PyPSA warning about p_max_pu columns for missing generators.
+    """
+    checks = [
+        ("generators", "generators_t"),
+        ("links", "links_t"),
+        ("storage_units", "storage_units_t"),
+        ("stores", "stores_t"),
+        ("loads", "loads_t"),
+        ("lines", "lines_t"),
+        ("transformers", "transformers_t"),
+        ("buses", "buses_t"),
+    ]
+
+    total_dropped = 0
+
+    for static_name, t_name in checks:
+        static_df = getattr(n, static_name, None)
+        t_obj = getattr(n, t_name, None)
+        if static_df is None or t_obj is None:
+            continue
+
+        valid = set(static_df.index)
+
+        for attr in list(vars(t_obj)):
+            df = getattr(t_obj, attr, None)
+            if isinstance(df, pd.DataFrame) and len(df.columns) > 0:
+                keep = [c for c in df.columns if c in valid]
+                dropped = len(df.columns) - len(keep)
+                if dropped > 0:
+                    setattr(t_obj, attr, df.loc[:, keep])
+                    total_dropped += dropped
+                    logger.warning(
+                        "[ORPHAN-FIX] %s.%s: dropped %d orphan columns.",
+                        t_name, attr, dropped,
+                    )
+
+    if total_dropped > 0:
+        logger.warning("[ORPHAN-FIX] Total orphan *_t columns dropped: %d", total_dropped)
+    else:
+        logger.info("[ORPHAN-FIX] No orphan *_t columns found.")
+
+
+def _debug_suspicious_assets(n: pypsa.Network, stage: str) -> None:
+    logger.info("=== DEBUG SUSPICIOUS ASSETS: %s ===", stage)
+
+    for comp in ["generators", "links", "stores", "storage_units"]:
+        df = getattr(n, comp, None)
+        if df is None or len(df) == 0 or "carrier" not in df.columns:
+            continue
+
+        suspicious = df[df["carrier"].astype(str).isin(_SUSPICIOUS_CARRIERS)].copy()
+        if suspicious.empty:
+            continue
+
+        cols_show = [c for c in [
+            "carrier",
+            "p_nom", "p_nom_opt", "p_nom_max",
+            "e_nom", "e_nom_opt", "e_nom_max",
+            "capital_cost", "marginal_cost",
+            "p_nom_extendable", "e_nom_extendable",
+        ] if c in suspicious.columns]
+
+        logger.warning(
+            "[%s] suspicious %s: n=%d carriers=%s",
+            stage, comp, len(suspicious),
+            suspicious["carrier"].value_counts().to_dict(),
+        )
+        if cols_show:
+            logger.warning("[%s] suspicious %s sample:\n%s",
+                           stage, comp, suspicious[cols_show].head(20).to_string())
+
+def _debug_component_overview(n: pypsa.Network, stage: str) -> None:
+    logger.info("=== DEBUG OVERVIEW: %s ===", stage)
+    logger.info(
+        "components: buses=%d gens=%d loads=%d links=%d lines=%d su=%d stores=%d snaps=%d",
+        len(getattr(n, "buses", [])),
+        len(getattr(n, "generators", [])),
+        len(getattr(n, "loads", [])),
+        len(getattr(n, "links", [])),
+        len(getattr(n, "lines", [])),
+        len(getattr(n, "storage_units", [])),
+        len(getattr(n, "stores", [])),
+        len(getattr(n, "snapshots", [])),
+    )
+
+
+def _debug_extendables(n: pypsa.Network, stage: str) -> None:
+    logger.info("=== DEBUG EXTENDABLES: %s ===", stage)
+
+    for comp, ext_col, cap_col, max_col in [
+        ("generators", "p_nom_extendable", "p_nom", "p_nom_max"),
+        ("links", "p_nom_extendable", "p_nom", "p_nom_max"),
+        ("storage_units", "p_nom_extendable", "p_nom", "p_nom_max"),
+        ("stores", "e_nom_extendable", "e_nom", "e_nom_max"),
+        ("lines", "s_nom_extendable", "s_nom", "s_nom_max"),
+        ("transformers", "s_nom_extendable", "s_nom", "s_nom_max"),
+    ]:
+        df = getattr(n, comp, None)
+        if df is None or len(df) == 0 or ext_col not in df.columns:
+            continue
+
+        ext = df[df[ext_col].fillna(False).astype(bool)].copy()
+        if len(ext) == 0:
+            logger.info("[%s] %s: no extendables", stage, comp)
+            continue
+
+        carrier_info = {}
+        if "carrier" in ext.columns:
+            try:
+                carrier_info = ext["carrier"].value_counts().head(15).to_dict()
+            except Exception:
+                pass
+
+        zero_cap_cost = 0
+        nan_cap_cost = 0
+        if "capital_cost" in ext.columns:
+            cc = pd.to_numeric(ext["capital_cost"], errors="coerce")
+            zero_cap_cost = int((cc.fillna(0.0) == 0.0).sum())
+            nan_cap_cost = int(cc.isna().sum())
+
+        inf_max = 0
+        if max_col in ext.columns:
+            try:
+                inf_max = int(np.isinf(pd.to_numeric(ext[max_col], errors="coerce")).sum())
+            except Exception:
+                pass
+
+        logger.info(
+            "[%s] %s: n_ext=%d  carriers=%s  zero_cap_cost=%d  nan_cap_cost=%d  inf_%s=%d",
+            stage, comp, len(ext), carrier_info, zero_cap_cost, nan_cap_cost, max_col, inf_max,
+        )
+
+        cols_show = [c for c in ["carrier", cap_col, max_col, "capital_cost", "marginal_cost"] if c in ext.columns]
+        if cols_show:
+            logger.info("[%s] %s sample extendables:\n%s", stage, comp, ext[cols_show].head(10).to_string())
+
+
+def _debug_nonextendable_infinite_assets(n: pypsa.Network, stage: str) -> None:
+    logger.info("=== DEBUG NON-EXTENDABLE INFINITE ASSETS: %s ===", stage)
+
+    for comp, ext_col, max_col in [
+        ("generators", "p_nom_extendable", "p_nom_max"),
+        ("links", "p_nom_extendable", "p_nom_max"),
+        ("storage_units", "p_nom_extendable", "p_nom_max"),
+        ("stores", "e_nom_extendable", "e_nom_max"),
+    ]:
+        df = getattr(n, comp, None)
+        if df is None or len(df) == 0 or ext_col not in df.columns or max_col not in df.columns:
+            continue
+
+        is_ext = df[ext_col].fillna(False).astype(bool)
+        max_vals = pd.to_numeric(df[max_col], errors="coerce")
+        bad = df[(~is_ext) & np.isinf(max_vals)]
+
+        if len(bad) > 0:
+            cols_show = [c for c in ["carrier", max_col, "capital_cost", "marginal_cost"] if c in bad.columns]
+            logger.warning(
+                "[%s] %s: %d non-extendable assets still have %s=inf. carriers=%s",
+                stage, comp, len(bad), max_col,
+                bad["carrier"].value_counts().head(15).to_dict() if "carrier" in bad.columns else {},
+            )
+            if cols_show:
+                logger.warning("[%s] %s sample non-extendable inf assets:\n%s",
+                               stage, comp, bad[cols_show].head(10).to_string())
+
+
+def _debug_timeseries_orphans(n: pypsa.Network, stage: str) -> None:
+    logger.info("=== DEBUG TIMESERIES ORPHANS: %s ===", stage)
+
+    checks = [
+        ("generators", "generators_t", ["p_max_pu", "p_min_pu", "marginal_cost", "p"]),
+        ("links", "links_t", ["p_max_pu", "p_min_pu", "marginal_cost", "p0"]),
+        ("storage_units", "storage_units_t", ["p_max_pu", "p_min_pu", "marginal_cost", "p"]),
+        ("stores", "stores_t", ["marginal_cost", "p", "e"]),
+        ("loads", "loads_t", ["p_set"]),
+    ]
+
+    for static_name, t_name, attrs in checks:
+        static_df = getattr(n, static_name, None)
+        t_obj = getattr(n, t_name, None)
+        if static_df is None or t_obj is None:
+            continue
+
+        valid = set(static_df.index)
+        for attr in attrs:
+            df = getattr(t_obj, attr, None)
+            if isinstance(df, pd.DataFrame) and len(df.columns) > 0:
+                orphans = [c for c in df.columns if c not in valid]
+                if orphans:
+                    logger.warning(
+                        "[%s] %s.%s has %d orphan columns. examples=%s",
+                        stage, t_name, attr, len(orphans), orphans[:10],
+                    )
+
+
+def _debug_load_shedding_breakdown(n: pypsa.Network, stage: str) -> None:
+    if not hasattr(n, "generators") or not hasattr(n, "generators_t"):
+        return
+    p = getattr(n.generators_t, "p", None)
+    if not isinstance(p, pd.DataFrame) or p.empty:
+        return
+
+    ls_mask = n.generators["carrier"].isin(["load_shedding", "load"])
+    ls_names = n.generators.index[ls_mask]
+    if len(ls_names) == 0:
+        logger.info("[%s] No LS generators found.", stage)
+        return
+
+    cols = p.columns.intersection(ls_names)
+    if len(cols) == 0:
+        logger.info("[%s] LS generators exist, but no dispatch columns found.", stage)
+        return
+
+    total = float(p[cols].sum().sum())
+    peak = float(p[cols].max().max())
+    by_carrier = (
+        n.generators.loc[cols, "carrier"]
+        .value_counts()
+        .to_dict()
+        if "carrier" in n.generators.columns else {}
+    )
+    by_bus = (
+        p[cols].sum(axis=0)
+        .sort_values(ascending=False)
+        .head(10)
+        .to_dict()
+    )
+
+    logger.warning(
+        "[%s] LS breakdown: total=%.3e MWh  peak=%.3e MW  carriers=%s  top_assets=%s",
+        stage, total, peak, by_carrier, by_bus,
+    )
+
+# =============================================================================
 # Constants
 # =============================================================================
 
@@ -211,6 +475,14 @@ _T_ATTRS: Dict[str, List[str]] = {
     "stores_t": ["p", "e", "e_min_pu", "e_max_pu", "marginal_cost"],
 }
 
+_COMP_FOR_T_CONTAINER: Dict[str, str] = {
+    "generators_t":    "generators",
+    "links_t":         "links",
+    "storage_units_t": "storage_units",
+    "stores_t":        "stores",
+    "loads_t":         "loads",
+    "lines_t":         "lines",
+}
 _T_ATTRS_INPUT_ONLY: Dict[str, List[str]] = {
     "buses_t":         [],
     "generators_t":    ["p_max_pu", "p_min_pu", "marginal_cost", "efficiency"],
@@ -643,9 +915,16 @@ def stack_scenarios_to_multisnapshot_network(
                     continue
                 if isinstance(df_i, pd.Series):
                     df_i = df_i.to_frame()
+                # [NAME-FIX] Strip year suffix (e.g. '-2050') from variable_cols
+                # to match prepared_cutout names (e.g. 'AT0 0 0 solar-hsat')
+                # vs base network names ('AT0 0 0 solar-hsat-2050')
+                import re as _re
+                cols_lookup = pd.Index([
+                    _re.sub(r'-\d{4}$', '', c) for c in meta["variable_cols"]
+                ])
                 arr[start:end, :] = (
                     df_i
-                    .reindex(index=base_snaps, columns=meta["variable_cols"])
+                    .reindex(index=base_snaps, columns=cols_lookup)
                     .to_numpy(dtype=np.float32)
                 )
 
@@ -675,6 +954,20 @@ def stack_scenarios_to_multisnapshot_network(
                     columns=meta["variable_cols"],
                     copy=False,
                 ).astype(np.float32, copy=False)
+                # [NAME-FIX] Map cols from prepared_cutout names (no year suffix)
+                # to stacked network names (may have year suffix e.g. -2050)
+                import re as _re
+                comp_name = _COMP_FOR_T_CONTAINER.get(t_container_name, "")
+                comp_df = getattr(n, comp_name, None)
+                if comp_df is not None and len(comp_df) > 0:
+                    stripped_to_actual = {}
+                    for nm in comp_df.index:
+                        key = _re.sub(r"-\d{4}$", "", nm)
+                        if key not in stripped_to_actual:
+                            stripped_to_actual[key] = nm
+                    df_var.columns = pd.Index([
+                        stripped_to_actual.get(c, c) for c in df_var.columns
+                    ])
                 setattr(n_t, attr, df_var)
                 del arrays[t_container_name][attr]
 
@@ -1220,19 +1513,26 @@ def _finite_stores(n: pypsa.Network) -> pd.DataFrame:
             s.index[exclude][:5].tolist(),
             s.loc[exclude, "carrier"].value_counts().to_dict(),
         )
-        # === DIAGNOSE ===
 
-    logger.info(
-    "[DIAG] _finite_stores: total=%d  excluded=%d (unbounded)  included=%d  ",
-    "excluded_carriers=%s",
-    len(s),
-    int(exclude.sum()),
-    int((~exclude).sum()),
-    s.loc[exclude, "carrier"].value_counts().head(5).to_dict() if exclude.any() else {},
-
+        # IMMER loggen, nicht nur bei exclude.any()
+        logger.info(
+            "_finite_stores: total=%d  excluded=%d  included=%d  excluded_carriers=%s  "
+            "co2_atm_e_nom=%s  co2_atm_ext=%s",
+            len(s), int(exclude.sum()), int((~exclude).sum()),
+            s.loc[exclude, "carrier"].value_counts().to_dict() if exclude.any() else {},
+            str(s.loc["co2 atmosphere", "e_nom"]) if "co2 atmosphere" in s.index else "N/A",
+            str(s.loc["co2 atmosphere", "e_nom_extendable"]) if "co2 atmosphere" in s.index else "N/A",
         )
 
-        # === ENDE ===
+    if "co2 atmosphere" in s.index:
+        logger.warning(
+            "_finite_stores: co2 atmosphere present with e_nom=%s e_nom_max=%s ext=%s capital_cost=%s marginal_cost=%s",
+            s.at["co2 atmosphere", "e_nom"] if "e_nom" in s.columns else "NA",
+            s.at["co2 atmosphere", "e_nom_max"] if "e_nom_max" in s.columns else "NA",
+            s.at["co2 atmosphere", "e_nom_extendable"] if "e_nom_extendable" in s.columns else "NA",
+            s.at["co2 atmosphere", "capital_cost"] if "capital_cost" in s.columns else "NA",
+            s.at["co2 atmosphere", "marginal_cost"] if "marginal_cost" in s.columns else "NA",
+        )
     return s[~exclude].copy()
 
 def _build_operational_cost_expression(
@@ -1576,6 +1876,9 @@ def _dispatch_solve(
     # [DISPATCH-FIX-3] Prune zero-capacity assets to match master model size
     _prune_zero_capacity_assets(n)
 
+    _drop_orphan_timeseries_columns(n)
+    _debug_suspicious_assets(n, "dispatch_after_prune_before_ls")
+
     # === DIAGNOSE: Dispatch-Netzwerk nach Prune ===
     logger.info(
         "[DIAG] Dispatch network post-prune: gens=%d  links=%d  stores=%d  su=%d",
@@ -1648,6 +1951,26 @@ def evaluate_single_cutout_dispatch(
     port_net = pypsa.Network(str(portfolio_path))
     _fix_portfolio_capacities(n, port_net)
 
+    # Harte Plausibilitätsprüfung: synthetische Generatoren dürfen keine portfolio-
+    # relevanten optimalen Kapazitäten tragen.
+    if hasattr(n, "generators") and "p_nom_opt" in n.generators.columns:
+        syn = n.generators[
+            n.generators.apply(lambda r: _is_synthetic_generator_row(r.name, r), axis=1)
+        ].copy()
+        if len(syn) > 0:
+            bad = syn[syn["p_nom_opt"].fillna(0.0).replace([np.inf, -np.inf], np.nan).fillna(0.0) > 1.0]
+            if len(bad) > 0:
+                cols_show = [c for c in ["carrier", "p_nom", "p_nom_opt", "capital_cost", "marginal_cost"] if c in bad.columns]
+                logger.error(
+                    "[PORTFOLIO-CHECK] Synthetic generators carry nontrivial p_nom_opt after portfolio transfer!"
+                )
+                logger.error("[PORTFOLIO-CHECK] Offending rows:\n%s", bad[cols_show].head(20).to_string())
+
+    _debug_component_overview(n, f"dispatch_{cutout}_after_fix_portfolio")
+    _debug_extendables(n, f"dispatch_{cutout}_after_fix_portfolio")
+    _debug_nonextendable_infinite_assets(n, f"dispatch_{cutout}_after_fix_portfolio")
+    _debug_timeseries_orphans(n, f"dispatch_{cutout}_after_fix_portfolio")
+
     # === DIAGNOSE: Portfolio-Kapazitäten ===
     for comp, opt_col, _, ext_col in [
         ("generators", "p_nom_opt", "p_nom", "p_nom_extendable"),
@@ -1655,16 +1978,45 @@ def evaluate_single_cutout_dispatch(
         ("stores", "e_nom_opt", "e_nom", "e_nom_extendable"),
     ]:
         df = getattr(n, comp)
-        if opt_col not in df.columns: continue
-        built = df[df[opt_col].fillna(0) > 1]
+        if opt_col not in df.columns:
+            continue
+
+        built = df[df[opt_col].fillna(0) > 1].copy()
+
+        # Für Generatoren synthetische Carrier rausfiltern
+        if comp == "generators" and len(built) > 0:
+            synthetic_mask = built.apply(lambda r: _is_synthetic_generator_row(r.name, r), axis=1)
+            synthetic = built[synthetic_mask]
+            built = built[~synthetic_mask]
+
+            if len(synthetic) > 0:
+                cols_show = [c for c in ["carrier", opt_col, "capital_cost", "marginal_cost"] if c in synthetic.columns]
+                logger.warning(
+                    "[DIAG] Portfolio generators include %d synthetic assets (excluded from build summary).",
+                    len(synthetic),
+                )
+                if cols_show:
+                    logger.warning("[DIAG] Synthetic generator sample:\n%s",
+                                   synthetic[cols_show].head(20).to_string())
+
         if len(built):
-            logger.info("[DIAG] Portfolio %s built: %s",
-                        comp,
-                        built.groupby("carrier")[opt_col].sum().sort_values(ascending=False).head(5).to_dict()
-                        )
+            logger.info(
+                "[DIAG] Portfolio %s built (filtered): %s",
+                comp,
+                built.groupby("carrier")[opt_col]
+                .sum()
+                .sort_values(ascending=False)
+                .head(10)
+                .to_dict(),
+            )
         else:
-            logger.warning("[DIAG] Portfolio %s: NOTHING BUILT (p_nom_opt=0 everywhere)!", comp)
+            logger.warning(
+                "[DIAG] Portfolio %s: no non-synthetic built assets with %s > 1.",
+                comp, opt_col,
+            )
     # === ENDE ===
+
+    _debug_suspicious_assets(n, f"dispatch_{cutout}_after_fix_portfolio")
 
     del port_net
     gc.collect()
@@ -1678,6 +2030,7 @@ def evaluate_single_cutout_dispatch(
         co2_cost_mode=co2_cost_mode,
         ls_penalty=ls_penalty,
     )
+    _debug_load_shedding_breakdown(n, f"dispatch_{cutout}_post_solve")
     total_cost = investment_cost + dispatch_op_cost
     logger.info("Dispatch '%s': op_cost=%.6g  inv_cost=%.6g  total=%.6g",
                 cutout, dispatch_op_cost, investment_cost, total_cost)
@@ -1953,6 +2306,32 @@ def _fix_unbounded_infrastructure(n: pypsa.Network) -> Dict[str, int]:
             logger.info(
                 "[INFRA-FIX] Fixed %d biomass generators: p_nom_max inf→1e6 MW. "
                 "Examples: %s", count, examples
+            )
+        # [BIOGAS-FIX] Biogas auf ENSPRESO-Potential cappen
+        bio_gas_mask = n.generators.carrier.str.lower() == 'biogas'
+        bio_gas_big  = bio_gas_mask & (n.generators.p_nom_max > 1e6)
+        if bio_gas_big.any():
+            n.generators.loc[bio_gas_big, 'p_nom_max'] = n.generators.loc[bio_gas_big, 'p_nom'].clip(upper=1e6)
+            count_bg = int(bio_gas_big.sum())
+            fixed['generators::biogas_cap'] = count_bg
+            logger.info('[INFRA-FIX] Capped %d biogas generators p_nom_max→p_nom (max 1e6 MW)', count_bg)
+    # Links mit p_nom_max=inf, mc>0, capital_cost≈0
+    if hasattr(n, "links") and len(n.links) > 0:
+        lk = n.links
+        is_ext = lk.get("p_nom_extendable", False).fillna(False).astype(bool)
+        inf_max = lk.get("p_nom_max", np.inf).fillna(np.inf).apply(np.isinf)
+        mc_pos = lk.get("marginal_cost", 0).fillna(0).astype(float) > 0
+        low_cc = lk.get("capital_cost", 0).fillna(0).astype(float) < 1.0
+
+        to_fix = lk.index[is_ext & inf_max & mc_pos & low_cc]
+        if len(to_fix) > 0:
+            n.links.loc[to_fix, "capital_cost"] = 1.0  # 1 EUR/MW verhindert inf-Expansion
+            fixed["links::zero_cc"] = len(to_fix)
+            logger.info(
+                "[INFRA-FIX] Set capital_cost=1 EUR/MW for %d links "
+                "(p_nom_max=inf, mc>0, cc≈0). Carriers: %s",
+                len(to_fix),
+                lk.loc[to_fix, "carrier"].value_counts().to_dict(),
             )
 
     if hasattr(n, "stores") and len(n.stores) > 0:
@@ -2442,6 +2821,42 @@ def solve_aro_master(
                     list(growth_limits.keys()))
     _fix_zero_capital_cost_extendables(n)
 
+    _debug_suspicious_assets(n, "master_after_fixes")
+
+    # ------------------------------------------------------------------
+    # HARD GUARDRAIL: carriers that must never be investment drivers
+    # ------------------------------------------------------------------
+    for comp, ext_col in [
+        ("generators", "p_nom_extendable"),
+        ("links", "p_nom_extendable"),
+        ("storage_units", "p_nom_extendable"),
+        ("stores", "e_nom_extendable"),
+    ]:
+        df = getattr(n, comp, None)
+        if df is None or len(df) == 0 or "carrier" not in df.columns or ext_col not in df.columns:
+            continue
+
+        forbid = df["carrier"].astype(str).isin({
+            "load", "load_shedding", "net_export",
+            "co2", "co2 stored", "co2 sequestered",
+            "uranium", "coal", "lignite", "geothermal_heat",
+            "oil refining",
+        })
+
+        n_forbid = int(forbid.sum())
+        if n_forbid > 0:
+            df.loc[forbid, ext_col] = False
+            logger.warning(
+                "[GUARDRAIL] %s: forced %d assets to %s=False for forbidden carriers=%s",
+                comp, n_forbid, ext_col,
+                sorted(df.loc[forbid, "carrier"].astype(str).unique().tolist()),
+            )
+
+    _debug_component_overview(n, "master_after_fixes")
+    _debug_extendables(n, "master_after_fixes")
+    _debug_nonextendable_infinite_assets(n, "master_after_fixes")
+    _debug_timeseries_orphans(n, "master_after_fixes")
+
     # === DIAGNOSE: Investment-Potenzial ===
     for comp, nom_col, ext_col, cap_col in [
         ("generators", "p_nom", "p_nom_extendable", "capital_cost"),
@@ -2459,6 +2874,35 @@ def solve_aro_master(
             ext[cap_col].fillna(0).min(), ext[cap_col].fillna(0).max(),
         )
     # === ENDE ===
+
+    for comp in ["generators", "links", "stores", "storage_units"]:
+        df = getattr(n, comp, None)
+        if df is None or len(df) == 0 or "carrier" not in df.columns:
+            continue
+
+        suspicious = df[df["carrier"].astype(str).isin([
+            "biomass", "solid biomass", "biogas", "coal", "lignite",
+            "uranium", "geothermal_heat", "co2", "co2 stored",
+            "oil refining", "electricity distribution grid",
+            "urban central water pits charger", "urban central water pits discharger",
+            "H2 Store"
+        ])]
+
+        if len(suspicious) > 0:
+            cols_show = [c for c in [
+                "carrier", "capital_cost", "marginal_cost",
+                "p_nom", "p_nom_max", "e_nom", "e_nom_max",
+                "p_nom_extendable", "e_nom_extendable"
+            ] if c in suspicious.columns]
+            logger.warning(
+                "[master_pre_solve] suspicious %s assets found: n=%d carriers=%s",
+                comp, len(suspicious),
+                suspicious["carrier"].value_counts().to_dict()
+            )
+            logger.warning(
+                "[master_pre_solve] suspicious %s sample:\n%s",
+                comp, suspicious[cols_show].head(20).to_string()
+            )
 
     masks     = _scenario_masks_from_snapshots(n.snapshots)
     scenarios = list(masks.keys())
@@ -2517,7 +2961,7 @@ def solve_aro_master(
             # better than silently dropping the constraint).
             gen_ef, _ = _resolve_gc_emission_factors(n, carrier_attr)
             if gen_ef is not None:
-                neutralized = abs(original) * 1000.0
+                neutralized = abs(original) * 1000.0 if abs(original) > 1e-6 else 1e15
                 n.global_constraints.at[gc_name, "constant"] = neutralized
                 logger.info(
                     "Master: GC '%s' (%s %.3e) → neutralized (%.3e = |orig|×1000). "
@@ -2646,6 +3090,27 @@ def solve_aro_master(
         n_ext = df.get("p_nom_extendable", pd.Series(False)).fillna(False).sum()
         logger.info("EXTENDABLE_%s: %d assets", comp.upper(), n_ext)
     # === ENDE DIAGNOSE ===
+
+    for comp, ext_col in [
+        ("generators", "p_nom_extendable"),
+        ("links", "p_nom_extendable"),
+        ("storage_units", "p_nom_extendable"),
+        ("stores", "e_nom_extendable"),
+    ]:
+        df = getattr(n, comp, None)
+        if df is None or len(df) == 0 or ext_col not in df.columns or "capital_cost" not in df.columns:
+            continue
+        ext = df[df[ext_col].fillna(False).astype(bool)].copy()
+        if len(ext) == 0:
+            continue
+
+        cols_show = [c for c in ["carrier", "capital_cost", "marginal_cost", "p_nom_max", "e_nom_max"] if c in ext.columns]
+        if cols_show:
+            logger.info(
+                "[master_pre_optimize] %s extendables sorted by capital_cost:\n%s",
+                comp,
+                ext[cols_show].sort_values("capital_cost").head(25).to_string()
+            )
 
     n.optimize(
         solver_name=solver_name,
@@ -3156,6 +3621,15 @@ def run_robust(
         warn_unknown_t=warn_unknown_t,
         strict_unknown_t=strict_unknown_t,
     )
+    _debug_component_overview(n, "after_stacking")
+    _debug_extendables(n, "after_stacking")
+    _debug_nonextendable_infinite_assets(n, "after_stacking")
+    _debug_timeseries_orphans(n, "after_stacking")
+
+    logger.info("Applying infrastructure fixes to stacked master network ...")
+    _fix_unbounded_infrastructure(n)
+    _fix_zero_capital_cost_extendables(n)
+
     diag = solve_aro_master(
         n,
         solver_name=solver_name,

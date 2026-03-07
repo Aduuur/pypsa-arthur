@@ -170,8 +170,8 @@ electricity:
 
   extendable_carriers:
     Generator: [solar, onwind, offwind-ac, offwind-dc, OCGT, CCGT]
-    StorageUnit: [] # battery, H2
-    Store: [battery, H2]
+    StorageUnit: [battery, H2] # battery, H2
+    Store: []#battery, H2
     Link: [H2 pipeline] # H2 pipeline
 
   powerplants_filter: (DateOut >= 2024 or DateOut != DateOut) and not (Country == 'Germany' and Fueltype == 'Nuclear')
@@ -1061,8 +1061,8 @@ costs:
     FOM: 0
     VOM: 0
     efficiency: 1
-    fuel: 0
-    investment: 0
+    #fuel: 0
+    #investment: null
     lifetime: 25
     "CO2 intensity": 0
     "discount rate": 0.07
