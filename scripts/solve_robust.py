@@ -590,6 +590,91 @@ def _apply_constant_cols_to_static(
 
 
 # =============================================================================
+# [HEAT-VENT-FIX] Heat vents are not extendable — cap to existing p_nom
+# =============================================================================
+def _fix_heat_vents(n: pypsa.Network) -> None:
+    """
+    Heat vent generators (urban/rural heat vent) must NOT be extendable.
+    In the prepared network they are incorrectly set to p_nom_extendable=True
+    with p_nom_max=inf and capital_cost=1.0. This causes the solver to build
+    absurd capacities (>9 GW/bus) because mc=-0.01 creates revenue from dispatch.
+    Fix: set p_nom_extendable=False and cap p_nom_max=p_nom.
+    """
+    mask = n.generators.carrier.str.contains("heat vent", na=False) | (n.generators.carrier == "oil")
+    n_vents = mask.sum()
+    if n_vents == 0:
+        return
+    n.generators.loc[mask, "p_nom_extendable"] = False
+    # p_nom_max = p_nom (existing capacity only, no new build)
+    n.generators.loc[mask, "p_nom_max"] = n.generators.loc[mask, "p_nom"]
+    logger.info(
+        "[HEAT-VENT-FIX] Capped %d heat vent / oil generators to non-extendable "
+        "(p_nom_max=p_nom). Was: p_nom_extendable=True, p_nom_max=inf.",
+        n_vents,
+    )
+
+# =============================================================================
+# [DIST-GRID-FIX] Distribution grid p_nom = existing peak LV demand
+# =============================================================================
+def _fix_distribution_grid(n: pypsa.Network) -> None:
+    """
+    [DIST-GRID-FIX] Distribution grid links haben p_nom=0 im prepared network,
+    obwohl das Grid in der Realität bereits existiert und die aktuelle Last trägt.
+    
+    Fix: p_nom = peak LV load per bus (existing capacity).
+    p_nom_extendable=True bleibt erhalten → Ausbau über Bestand hinaus möglich.
+    p_nom_max=inf bleibt → kein Cap nach oben.
+    
+    Ohne diesen Fix hat der Master p_nom_opt=0 weil LS-Gens direkt auf LV-Bussen
+    sitzen und das Grid aus Solver-Sicht wertlos ist.
+    """
+    dg_mask = (
+        n.links.carrier.str.contains("electricity distribution grid", na=False)
+        & ~n.links.index.str.contains("reversed", na=False)
+    )
+    n_dg = dg_mask.sum()
+    if n_dg == 0:
+        return
+
+    # Peak LV load pro Bus aus loads_t.p_set
+    lv_buses = n.buses[n.buses.carrier.str.contains("low voltage", case=False, na=False)].index
+    lv_loads = n.loads[n.loads.bus.isin(lv_buses)]
+
+    bus_peak: Dict[str, float] = {}
+    if len(lv_loads) > 0:
+        if hasattr(n, "loads_t") and hasattr(n.loads_t, "p_set") and len(n.loads_t.p_set.columns) > 0:
+            p_set_t = n.loads_t.p_set
+            for load_name, load_row in lv_loads.iterrows():
+                bus = str(load_row["bus"])
+                if load_name in p_set_t.columns:
+                    peak = float(p_set_t[load_name].abs().max())
+                else:
+                    peak = float(abs(load_row.get("p_set", 0.0) or 0.0))
+                bus_peak[bus] = bus_peak.get(bus, 0.0) + peak
+        else:
+            for load_name, load_row in lv_loads.iterrows():
+                bus = str(load_row["bus"])
+                peak = float(abs(load_row.get("p_set", 0.0) or 0.0))
+                bus_peak[bus] = bus_peak.get(bus, 0.0) + peak
+
+    # p_nom setzen: peak LV load des Zielbusses (bus1 = LV bus)
+    fixed = 0
+    for link_name in n.links.index[dg_mask]:
+        bus1 = str(n.links.at[link_name, "bus1"])
+        peak = bus_peak.get(bus1, 0.0)
+        if peak > 0:
+            n.links.at[link_name, "p_nom"] = peak
+            fixed += 1
+
+    logger.info(
+        "[DIST-GRID-FIX] Set p_nom=peak_LV_load for %d/%d distribution grid links. "
+        "p_nom range: [%.0f, %.0f] MW. p_nom_extendable remains True.",
+        fixed, n_dg,
+        n.links.loc[dg_mask, "p_nom"].min(),
+        n.links.loc[dg_mask, "p_nom"].max(),
+    )
+
+# =============================================================================
 # [DISPATCH-FIX-1] Negative load → Generator conversion (methodically correct)
 # =============================================================================
 
@@ -2041,8 +2126,10 @@ def _build_investment_cost_expression(n: pypsa.Network):
         if var is None:
             return
         cc    = comp_df["capital_cost"].reindex(comp_df.index).fillna(0.0)
-        cc_da = xr.DataArray(cc.to_numpy(), dims=[dim],
-                             coords={dim: (dim, comp_df.index.to_numpy())})
+        # [BUG-FIX-11b] Use actual var dim to avoid xarray cross-product.
+        actual_dim = var.dims[-1]
+        cc_da = xr.DataArray(cc.to_numpy(), dims=[actual_dim],
+                             coords={actual_dim: (actual_dim, comp_df.index.to_numpy())})
         expr = expr + (var * cc_da).sum()
 
     _add(n.generators,    ["Generator-p_nom"],   "Generator")
@@ -2189,17 +2276,19 @@ def _build_operational_cost_expression(
         td = _get_time_dimension(var)
         var_s = _var_isel(var, td)
         wd = _w_da(var_s, td)
+        # [BUG-FIX-11] Use actual variable dim name to avoid xarray cross-product.
+        actual_dim = [d for d in var_s.dims if d != td][0]
         mc_s = comp_df["marginal_cost"].reindex(comp_df.index).fillna(0.0).astype(float)
 
         if mc_t is not None and not mc_t.empty:
             mc_t_s = (mc_t.reindex(columns=comp_df.index)
                       .reindex(index=n.snapshots[idx_list]).astype(float).fillna(mc_s))
-            mc_da = xr.DataArray(mc_t_s.to_numpy(), dims=[td, dim],
+            mc_da = xr.DataArray(mc_t_s.to_numpy(), dims=[td, actual_dim],
                                  coords={td: var_s.coords[td],
-                                         dim: (dim, comp_df.index.to_numpy())})
+                                         actual_dim: (actual_dim, comp_df.index.to_numpy())})
         else:
-            mc_da = xr.DataArray(mc_s.to_numpy(), dims=[dim],
-                                 coords={dim: (dim, comp_df.index.to_numpy())})
+            mc_da = xr.DataArray(mc_s.to_numpy(), dims=[actual_dim],
+                                 coords={actual_dim: (actual_dim, comp_df.index.to_numpy())})
 
         total = total + (var_s * mc_da * wd).sum()
 
@@ -2473,6 +2562,11 @@ def _dispatch_solve(
         solver_options = {}
 
     # [DISPATCH-FIX-1] Convert negative loads to generators (methodically correct)
+    # [HEAT-VENT-FIX] Heat vents must not be extendable
+    _fix_heat_vents(n)
+    # [DIST-GRID-FIX] Distribution grid p_nom = existing peak LV demand
+    _fix_distribution_grid(n)
+
     _fix_negative_loads(n)
 
     # [DISPATCH-FIX-2] Relax e_initial for unbounded stores
@@ -2902,7 +2996,7 @@ def _fix_unbounded_infrastructure(n: pypsa.Network) -> Dict[str, int]:
         # z.B. DE0: 155e6 MWh -> faelschlich als 155 TW interpretiert
         # Korrektur: p_nom_MW = p_nom_MWh / 8760
         solid_mask = n.generators.carrier.str.lower() == "solid biomass"
-        solid_big  = solid_mask & (n.generators.p_nom > 1e5)
+        solid_big  = solid_mask & (n.generators.p_nom > 1e3)  # ENSPRESO: auch 10k-100k MW sind falsch
         if solid_big.any():
             n.generators.loc[solid_big, "p_nom"]     = (n.generators.loc[solid_big, "p_nom"] / 8760.0).clip(upper=1e6)
             n.generators.loc[solid_big, "p_nom_max"] = n.generators.loc[solid_big, "p_nom"]
@@ -2913,7 +3007,7 @@ def _fix_unbounded_infrastructure(n: pypsa.Network) -> Dict[str, int]:
         # ENSPRESO speichert Energiepotenziale (MWh) faelschlich als p_nom (MW)
         # z.B. FR0: 7.1e7 MWh -> wird als 71 TW Kapazitaet interpretiert
         bio_gas_mask = n.generators.carrier.str.lower() == 'biogas'
-        bio_gas_big  = bio_gas_mask & (n.generators.p_nom > 1e4)
+        bio_gas_big  = bio_gas_mask & (n.generators.p_nom > 1e3)  # ENSPRESO: Threshold gesenkt
         if bio_gas_big.any():
             n.generators.loc[bio_gas_big, 'p_nom']     = (n.generators.loc[bio_gas_big, 'p_nom'] / 8760.0).clip(upper=1e6)
             n.generators.loc[bio_gas_big, 'p_nom_max'] = n.generators.loc[bio_gas_big, 'p_nom']
@@ -3635,6 +3729,10 @@ def solve_aro_master(
 
     # [DISPATCH-FIX-1] Convert negative loads to generators (methodically correct)
     # Replaces the previous inline clip which incorrectly removed energy from balance
+    # [HEAT-VENT-FIX] Heat vents must not be extendable
+    _fix_heat_vents(n)
+    # [DIST-GRID-FIX] Distribution grid p_nom = existing peak LV demand
+    _fix_distribution_grid(n)
     _fix_negative_loads(n)
 
     # [DISPATCH-FIX-2] Relax e_initial for unbounded stores

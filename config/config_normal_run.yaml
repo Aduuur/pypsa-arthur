@@ -28,7 +28,7 @@ remote:
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#run
 run:
   prefix: ""
-  name: "test-normal-run"
+  name: "test-normal-run-45"
   scenarios:
     enable: false
     file: config/scenarios.yaml
@@ -263,7 +263,7 @@ atlite:
       y: [ 33., 72. ]
       dx: 0.3
       dy: 0.3
-      time: [ '2045', '2045' ]
+      time: [ '2010', '2010' ]
       prepare_kwargs:
         features: [ 'temperature', 'runoff', 'height' ]
 
@@ -273,7 +273,7 @@ atlite:
         y: [ 33., 72. ]
         dx: 0.3
         dy: 0.3
-        time: [ '2045', '2045' ]
+        time: [ '2010', '2010' ]
         prepare_kwargs:
           features: [ 'temperature', 'runoff', 'height' ]
 
@@ -307,7 +307,7 @@ renewable:
     resource:
       method: wind
       #turbine: NREL_ReferenceTurbine_2020ATB_5.5MW
-      turbine: /mnt/endata/Cordex/Pypsa-Compatibility/results/europe/CNRM-CERFACS-CM5/techfiles/wind_offshore_mCNRM-CERFACS-CM5_rcp26_2010_notAgg_pypsa.nc
+      turbine: /mnt/endata/Cordex/Pypsa-Compatibility/results/europe/CNRM-CERFACS-CM5/techfiles/wind_offshore_mCNRM-CERFACS-CM5_rcp45_2010_notAgg_pypsa.nc
       smooth: false
       add_cutout_windspeed: false
     resource_classes: 1
@@ -347,7 +347,7 @@ renewable:
     resource:
       method: wind
       #turbine: NREL_ReferenceTurbine_2020ATB_5.5MW
-      turbine: /mnt/endata/Cordex/Pypsa-Compatibility/results/europe/CNRM-CERFACS-CM5/techfiles/wind_offshore_mCNRM-CERFACS-CM5_rcp26_2010_notAgg_pypsa.nc
+      turbine: /mnt/endata/Cordex/Pypsa-Compatibility/results/europe/CNRM-CERFACS-CM5/techfiles/wind_offshore_mCNRM-CERFACS-CM5_rcp45_2010_notAgg_pypsa.nc
       smooth: false
       add_cutout_windspeed: false
     resource_classes: 1
@@ -370,7 +370,7 @@ renewable:
     resource:
       method: pv
       #panel: CSi
-      panel: /mnt/endata/Cordex/Pypsa-Compatibility/results/europe/CNRM-CERFACS-CM5/techfiles/pv_mCNRM-CERFACS-CM5_rcp26_2010_notAgg_pypsa.nc
+      panel: /mnt/endata/Cordex/Pypsa-Compatibility/results/europe/CNRM-CERFACS-CM5/techfiles/pv_mCNRM-CERFACS-CM5_rcp45_2010_notAgg_pypsa.nc
       orientation:
         slope: 35.
         azimuth: 180.
@@ -387,7 +387,7 @@ renewable:
     resource:
       method: pv
       #panel: CSi
-      panel: /mnt/endata/Cordex/Pypsa-Compatibility/results/europe/CNRM-CERFACS-CM5/techfiles/pv_mCNRM-CERFACS-CM5_rcp26_2010_notAgg_pypsa.nc
+      panel: /mnt/endata/Cordex/Pypsa-Compatibility/results/europe/CNRM-CERFACS-CM5/techfiles/pv_mCNRM-CERFACS-CM5_rcp45_2010_notAgg_pypsa.nc
       orientation:
         slope: 35.
         azimuth: 180.
