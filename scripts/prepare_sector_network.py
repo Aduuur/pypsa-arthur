@@ -5987,6 +5987,12 @@ def lossy_bidirectional_links(n, carrier, efficiencies={}):
     rev_links["capital_cost"] = 0
     rev_links["length"] = 0
     rev_links["reversed"] = True
+    # Prevent zero-capital-cost reverse links from becoming free expandables.
+    # Reverse entries represent directional counterpart of existing links.
+    if "p_nom_extendable" in rev_links.columns:
+        rev_links["p_nom_extendable"] = False
+    if "p_nom" in rev_links.columns and "p_nom_max" in rev_links.columns:
+        rev_links["p_nom_max"] = rev_links["p_nom"].fillna(0.0)
     rev_links.index = rev_links.index.map(lambda x: x + "-reversed")
 
     n.links["reversed"] = n.links.get("reversed", False)

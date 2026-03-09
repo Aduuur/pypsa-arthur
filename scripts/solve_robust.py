@@ -184,6 +184,12 @@ import numpy as np
 import pandas as pd
 import pypsa
 
+try:
+    from scripts.cost_validation import validate_extendable_capital_costs
+except ModuleNotFoundError:
+    from cost_validation import validate_extendable_capital_costs
+
+
 logger = logging.getLogger(__name__)
 
 # =============================================================================
@@ -730,6 +736,211 @@ def _fix_inf_store_initial(n: pypsa.Network) -> None:
 # =============================================================================
 # Scenario stacking
 # =============================================================================
+# =============================================================================
+# Stacking debug helpers
+# =============================================================================
+
+def _find_component_columns_by_keywords(
+        cols: pd.Index,
+        keywords: Sequence[str],
+) -> List[str]:
+    """
+    Return columns whose names contain at least one keyword (case-insensitive).
+    """
+    if cols is None or len(cols) == 0:
+        return []
+    kws = [str(k).lower() for k in keywords]
+    out = []
+    for c in cols:
+        s = str(c).lower()
+        if any(kw in s for kw in kws):
+            out.append(str(c))
+    return out
+
+
+def _debug_compare_stacked_timeseries(
+        n: pypsa.Network,
+        *,
+        scenario_names: Sequence[str],
+        t_container_name: str,
+        attr: str,
+        keywords: Sequence[str],
+        top_n: int = 8,
+        atol_identical: float = 1e-7,
+) -> None:
+    """
+    Debug helper:
+    For selected columns in a stacked *_t DataFrame, compare scenario blocks and log whether
+    they are identical or different across scenarios.
+
+    This is useful to detect stacking bugs where scenario-dependent time series were
+    accidentally flattened to one common profile.
+    """
+    if not hasattr(n, t_container_name):
+        logger.info("[STACK-DEBUG] %s.%s missing on stacked network.", t_container_name, attr)
+        return
+
+    t_obj = getattr(n, t_container_name)
+    df = getattr(t_obj, attr, None)
+
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        logger.info("[STACK-DEBUG] %s.%s empty or absent.", t_container_name, attr)
+        return
+
+    if not isinstance(n.snapshots, pd.MultiIndex):
+        logger.warning("[STACK-DEBUG] Expected MultiIndex snapshots, got %s.", type(n.snapshots))
+        return
+
+    masks = _scenario_masks_from_snapshots(n.snapshots)
+    available_scenarios = [s for s in scenario_names if s in masks]
+
+    if len(available_scenarios) < 2:
+        logger.info("[STACK-DEBUG] Need at least 2 scenarios for comparison in %s.%s.", t_container_name, attr)
+        return
+
+    candidate_cols = _find_component_columns_by_keywords(df.columns, keywords)
+    if not candidate_cols:
+        logger.info(
+            "[STACK-DEBUG] No columns matched keywords=%s in %s.%s.",
+            list(keywords), t_container_name, attr
+        )
+        return
+
+    candidate_cols = candidate_cols[:top_n]
+
+    logger.info(
+        "[STACK-DEBUG] Comparing %s.%s for keywords=%s | matched=%d | showing=%d",
+        t_container_name, attr, list(keywords), len(_find_component_columns_by_keywords(df.columns, keywords)), len(candidate_cols)
+    )
+
+    for col in candidate_cols:
+        series_per_scenario: Dict[str, np.ndarray] = {}
+        stats_per_scenario: Dict[str, Tuple[float, float, float]] = {}
+
+        for scen in available_scenarios:
+            block = df.loc[masks[scen], col]
+            arr = block.to_numpy(dtype=np.float64, copy=False)
+            series_per_scenario[scen] = arr
+
+            if arr.size == 0 or np.all(np.isnan(arr)):
+                stats_per_scenario[scen] = (np.nan, np.nan, np.nan)
+            else:
+                stats_per_scenario[scen] = (
+                    float(np.nanmin(arr)),
+                    float(np.nanmax(arr)),
+                    float(np.nanmean(arr)),
+                )
+
+        reference_scen = available_scenarios[0]
+        ref_arr = series_per_scenario[reference_scen]
+
+        all_identical = True
+        pair_summaries = []
+
+        for scen in available_scenarios[1:]:
+            arr = series_per_scenario[scen]
+
+            same_shape = ref_arr.shape == arr.shape
+            if not same_shape:
+                all_identical = False
+                pair_summaries.append(f"{reference_scen} vs {scen}: shape {ref_arr.shape} != {arr.shape}")
+                continue
+
+            equal_mask = np.isclose(ref_arr, arr, atol=atol_identical, rtol=0.0, equal_nan=True)
+            identical = bool(np.all(equal_mask))
+
+            if not identical:
+                all_identical = False
+                max_abs_diff = float(np.nanmax(np.abs(ref_arr - arr))) if ref_arr.size else np.nan
+                pair_summaries.append(f"{reference_scen} vs {scen}: DIFFERENT (max_abs_diff={max_abs_diff:.3e})")
+            else:
+                pair_summaries.append(f"{reference_scen} vs {scen}: identical")
+
+        logger.info(
+            "[STACK-DEBUG] %-60s | %s",
+            col,
+            "ALL IDENTICAL" if all_identical else "SCENARIO-DEPENDENT"
+        )
+
+        for scen in available_scenarios:
+            mn, mx, av = stats_per_scenario[scen]
+            logger.info(
+                "[STACK-DEBUG]    %-20s min=%12.5g max=%12.5g mean=%12.5g",
+                scen, mn, mx, av
+            )
+
+        for msg in pair_summaries:
+            logger.info("[STACK-DEBUG]    %s", msg)
+
+
+def _debug_log_stacking_overview(
+        n: pypsa.Network,
+        *,
+        scenario_names: Sequence[str],
+) -> None:
+    """
+    High-level debug overview after stacking.
+    Focuses on the most relevant operational drivers:
+      - generators_t.p_max_pu  (VRE availability)
+      - loads_t.p_set          (demand differences)
+      - generators_t.marginal_cost
+      - links_t.efficiency / p_max_pu (if relevant)
+    """
+    logger.info("=" * 79)
+    logger.info("[STACK-DEBUG] START stacked scenario diagnostics")
+    logger.info("=" * 79)
+
+    try:
+        _debug_compare_stacked_timeseries(
+            n,
+            scenario_names=scenario_names,
+            t_container_name="generators_t",
+            attr="p_max_pu",
+            keywords=["solar", "onwind", "offwind", "wind", "biomass", "ror"],
+            top_n=12,
+        )
+    except Exception as exc:
+        logger.warning("[STACK-DEBUG] generators_t.p_max_pu debug failed: %s", exc)
+
+    try:
+        _debug_compare_stacked_timeseries(
+            n,
+            scenario_names=scenario_names,
+            t_container_name="loads_t",
+            attr="p_set",
+            keywords=["load", "demand", "DE", "FR", "GB"],
+            top_n=12,
+        )
+    except Exception as exc:
+        logger.warning("[STACK-DEBUG] loads_t.p_set debug failed: %s", exc)
+
+    try:
+        _debug_compare_stacked_timeseries(
+            n,
+            scenario_names=scenario_names,
+            t_container_name="generators_t",
+            attr="marginal_cost",
+            keywords=["biomass", "gas", "OCGT", "CCGT", "coal", "lignite", "oil"],
+            top_n=12,
+        )
+    except Exception as exc:
+        logger.warning("[STACK-DEBUG] generators_t.marginal_cost debug failed: %s", exc)
+
+    try:
+        _debug_compare_stacked_timeseries(
+            n,
+            scenario_names=scenario_names,
+            t_container_name="links_t",
+            attr="p_max_pu",
+            keywords=["battery", "H2", "electrolysis", "fuel cell", "heat pump"],
+            top_n=12,
+        )
+    except Exception as exc:
+        logger.warning("[STACK-DEBUG] links_t.p_max_pu debug failed: %s", exc)
+
+    logger.info("=" * 79)
+    logger.info("[STACK-DEBUG] END stacked scenario diagnostics")
+    logger.info("=" * 79)
 
 def stack_scenarios_to_multisnapshot_network(
         scenario_files: Sequence[str],
@@ -737,22 +948,234 @@ def stack_scenarios_to_multisnapshot_network(
         *,
         warn_unknown_t: bool = True,
         strict_unknown_t: bool = False,
+        name_normalization_mode: str = "exact",
 ) -> Tuple[pypsa.Network, List[str]]:
     """
     Stack N scenario networks into a single MultiIndex-snapshot network.
-    Memory-optimized v2 + MEM-PATCH-A.
+
+    Robust version:
+    - decides constant vs variable across ALL scenarios, not only ref
+    - handles year suffix mismatches robustly (e.g. '-2050')
+    - validates static component index consistency
+    - keeps a column static ONLY if:
+        (a) present in all scenarios
+        (b) constant over time in every scenario
+        (c) same constant value in every scenario
+    - everything else is stacked as scenario-dependent *_t data
     """
+    logger.info(
+        "Scenario stacking: %d scenarios | name_normalization_mode=%s",
+        len(scenario_names),
+        name_normalization_mode,
+    )
+    CONST_TOL = 1e-6
+
     if len(scenario_files) != len(scenario_names):
         raise ValueError("scenario_files and scenario_names must have equal length.")
     if len(set(scenario_names)) != len(scenario_names):
         raise ValueError(f"Duplicate scenario names: {scenario_names}")
+    if len(scenario_files) == 0:
+        raise ValueError("No scenario files provided.")
 
-    n_scenarios = len(scenario_names)
+    # -------------------------------------------------------------------------
+    # local helpers
+    # -------------------------------------------------------------------------
+    import re as _re
+    from collections import defaultdict
 
+
+    def _safe_get_t_attrs(t_obj: Any) -> List[str]:
+        """
+        Try to list dynamic attributes of a PyPSA *_t container.
+        Only keep DataFrame/Series-like attributes.
+        """
+        attrs = []
+        for name in dir(t_obj):
+            if name.startswith("_"):
+                continue
+            try:
+                val = getattr(t_obj, name)
+            except Exception:
+                continue
+            if isinstance(val, (pd.DataFrame, pd.Series)):
+                attrs.append(name)
+        return sorted(set(attrs))
+
+    def _get_static_comp_name(t_container_name: str) -> Optional[str]:
+        return _T_CONTAINER_TO_STATIC_COMP.get(t_container_name)
+
+    # =============================================================================
+    # Stacking name helpers
+    # =============================================================================
+
+    def _identity_name(x: Any) -> str:
+        return str(x)
+
+    def _strip_trailing_year(x: Any) -> str:
+        import re
+        return re.sub(r"-\d{4}$", "", str(x))
+
+    def _make_name_normalizer(mode: str):
+        """
+        mode:
+          - 'exact'      -> keep names exactly as they are
+          - 'strip_year' -> remove trailing -YYYY
+        """
+        if mode == "exact":
+            return _identity_name
+        if mode == "strip_year":
+            return _strip_trailing_year
+        raise ValueError(f"Unknown name_normalization_mode='{mode}'")
+
+    def _build_static_name_lookup(
+            n_ref: pypsa.Network,
+            *,
+            name_normalization_mode: str = "exact",
+    ) -> Dict[str, Dict[str, str]]:
+        """
+        Build normalized_name -> actual_name lookup for each static component table.
+
+        In exact mode this is just identity mapping.
+        In strip_year mode collisions are checked explicitly and raise an error.
+        """
+        norm = _make_name_normalizer(name_normalization_mode)
+
+        lookup: Dict[str, Dict[str, str]] = {}
+
+        for t_container_name, static_comp in _T_CONTAINER_TO_STATIC_COMP.items():
+            if not hasattr(n_ref, static_comp):
+                continue
+
+            df = getattr(n_ref, static_comp, None)
+            if df is None or len(df) == 0:
+                lookup[t_container_name] = {}
+                continue
+
+            norm_to_actual: Dict[str, str] = {}
+            collisions: Dict[str, List[str]] = {}
+
+            for nm in df.index:
+                key = norm(nm)
+                if key in norm_to_actual and norm_to_actual[key] != str(nm):
+                    collisions.setdefault(key, [norm_to_actual[key]])
+                    if str(nm) not in collisions[key]:
+                        collisions[key].append(str(nm))
+                else:
+                    norm_to_actual[key] = str(nm)
+
+            if collisions:
+                examples = {k: v for k, v in list(collisions.items())[:10]}
+                raise ValueError(
+                    f"Normalized-name collision in static component '{static_comp}' "
+                    f"under mode='{name_normalization_mode}'. Examples: {examples}"
+                )
+
+            lookup[t_container_name] = norm_to_actual
+
+        return lookup
+
+    def _normalize_df_columns(
+            df: pd.DataFrame,
+            *,
+            t_container_name: str,
+            static_lookup: Dict[str, Dict[str, str]],
+            scenario_name: str,
+            attr: str,
+            name_normalization_mode: str = "exact",
+            drop_unknown_columns: bool = True,
+    ) -> pd.DataFrame:
+        norm = _make_name_normalizer(name_normalization_mode)
+
+        if df is None or df.empty:
+            return pd.DataFrame(index=base_snaps)
+
+        df = df.copy()
+        df = df.reindex(base_snaps)
+
+        norm_cols = pd.Index([norm(c) for c in df.columns])
+
+        dup_mask = norm_cols.duplicated(keep=False)
+        if dup_mask.any():
+            dup_vals = norm_cols[dup_mask].unique().tolist()
+            raise ValueError(
+                f"After normalization, duplicate columns detected in scenario='{scenario_name}', "
+                f"{t_container_name}.{attr}, mode='{name_normalization_mode}'. "
+                f"Examples: {dup_vals[:10]}"
+            )
+
+        df.columns = norm_cols
+
+        lookup = static_lookup.get(t_container_name, {})
+        if lookup:
+            known_cols = [c for c in df.columns if c in lookup]
+            unknown_cols = [c for c in df.columns if c not in lookup]
+
+            if unknown_cols:
+                msg = (
+                    f"Scenario '{scenario_name}': unknown columns in {t_container_name}.{attr} "
+                    f"under mode='{name_normalization_mode}' not found in reference static index. "
+                    f"Examples: {unknown_cols[:10]}"
+                )
+                if strict_unknown_t:
+                    raise ValueError(msg)
+                if warn_unknown_t:
+                    logger.warning(msg)
+
+            if drop_unknown_columns:
+                df = df.reindex(columns=known_cols)
+
+        return df.astype(np.float32)
+
+    def _validate_static_index_compatibility(
+            net_ref: pypsa.Network,
+            net_i: pypsa.Network,
+            *,
+            scenario_name: str,
+            name_normalization_mode: str = "exact",
+    ) -> None:
+        """
+        Validate that all relevant static component indices match the reference
+        after optional normalization.
+        """
+        norm = _make_name_normalizer(name_normalization_mode)
+
+        for t_container_name in _T_ATTRS_INPUT_ONLY.keys():
+            static_comp = _T_CONTAINER_TO_STATIC_COMP.get(t_container_name)
+            if static_comp is None:
+                continue
+            if not hasattr(net_ref, static_comp) or not hasattr(net_i, static_comp):
+                continue
+
+            df_ref = getattr(net_ref, static_comp, None)
+            df_i = getattr(net_i, static_comp, None)
+            if df_ref is None or df_i is None:
+                continue
+
+            idx_ref = pd.Index([norm(x) for x in df_ref.index])
+            idx_i = pd.Index([norm(x) for x in df_i.index])
+
+            missing = idx_ref.difference(idx_i)
+            extra = idx_i.difference(idx_ref)
+
+            if len(missing) or len(extra):
+                msg = (
+                    f"Static index mismatch in scenario '{scenario_name}' for component "
+                    f"'{static_comp}' under mode='{name_normalization_mode}':\n"
+                )
+                if len(missing):
+                    msg += f"  Missing: {list(missing)[:10]}\n"
+                if len(extra):
+                    msg += f"  Extra:   {list(extra)[:10]}\n"
+                raise ValueError(msg)
+
+    # -------------------------------------------------------------------------
+    # load reference network
+    # -------------------------------------------------------------------------
     logger.info("Loading reference scenario=%s  network=%s", scenario_names[0], scenario_files[0])
     p0 = Path(scenario_files[0])
     if not p0.exists():
         raise FileNotFoundError(f"Scenario network not found: {scenario_files[0]}")
+
     ref = pypsa.Network(str(p0))
 
     if len(ref.snapshots) == 0:
@@ -762,7 +1185,11 @@ def stack_scenarios_to_multisnapshot_network(
 
     base_snaps = _ensure_datetime_snapshots(ref.snapshots)
     n_snaps = len(base_snaps)
+    n_scenarios = len(scenario_names)
 
+    # -------------------------------------------------------------------------
+    # create stacked network skeleton from reference
+    # -------------------------------------------------------------------------
     n = pypsa.Network()
     for comp in _STATIC_COMPONENTS:
         if hasattr(ref, comp):
@@ -776,8 +1203,11 @@ def stack_scenarios_to_multisnapshot_network(
                 logger.warning("Could not copy static component '%s': %s", comp, exc)
 
     period_value = 0
-    if (hasattr(n, "investment_periods") and n.investment_periods is not None
-            and len(n.investment_periods) > 0):
+    if (
+        hasattr(n, "investment_periods")
+        and n.investment_periods is not None
+        and len(n.investment_periods) > 0
+    ):
         period_value = int(list(n.investment_periods)[0])
 
     timestep_labels = [(scen, ts) for scen in scenario_names for ts in base_snaps]
@@ -794,61 +1224,227 @@ def stack_scenarios_to_multisnapshot_network(
             {"objective": 1.0, "generators": 1.0, "stores": 1.0},
             index=base_snaps,
         )
+
     w_np = np.tile(w_base.to_numpy(dtype=np.float32, copy=False), (n_scenarios, 1))
     n.snapshot_weightings = pd.DataFrame(
         w_np, index=stacked_snaps, columns=w_base.columns,
     )
 
+    # -------------------------------------------------------------------------
+    # discover static-name lookup from reference
+    # -------------------------------------------------------------------------
+    static_lookup = _build_static_name_lookup(
+        ref,
+        name_normalization_mode=name_normalization_mode,
+    )
+    # -------------------------------------------------------------------------
+    # optional: warn/error on unknown *_t attrs in each scenario
+    # -------------------------------------------------------------------------
+    if warn_unknown_t or strict_unknown_t:
+        allowed_map = {k: set(v) for k, v in _T_ATTRS_INPUT_ONLY.items()}
+        for t_container_name in allowed_map:
+            if hasattr(ref, t_container_name):
+                t_obj = getattr(ref, t_container_name)
+                found = set(_safe_get_t_attrs(t_obj))
+                unknown = sorted(found.difference(allowed_map[t_container_name]))
+                if unknown:
+                    msg = (
+                        f"Reference network has time-dependent attrs in {t_container_name} "
+                        f"that are not included in stacking allowlist: {unknown}"
+                    )
+                    if strict_unknown_t:
+                        raise ValueError(msg)
+                    logger.warning(msg)
+
+    # -------------------------------------------------------------------------
+    # PASS 1: scan all scenarios, determine which columns are globally constant
+    #         vs scenario/time-dependent
+    # -------------------------------------------------------------------------
+    scan_meta: Dict[str, Dict[str, Dict[str, Dict[str, Any]]]] = defaultdict(
+        lambda: defaultdict(dict)
+    )
+
+    for i_scen, (scen_name, scen_file) in enumerate(zip(scenario_names, scenario_files), start=1):
+        logger.info("Scanning scenario %d/%d: %s  file=%s", i_scen, n_scenarios, scen_name, scen_file)
+
+        p_i = Path(scen_file)
+        if not p_i.exists():
+            raise FileNotFoundError(f"Scenario network not found: {scen_file}")
+
+        net_i = ref if i_scen == 1 else pypsa.Network(str(p_i))
+
+        if len(net_i.snapshots) == 0:
+            raise ValueError(f"Scenario {scen_name}: network has no snapshots.")
+
+        snaps_i = _ensure_datetime_snapshots(net_i.snapshots)
+        if len(snaps_i) != len(base_snaps) or not base_snaps.equals(snaps_i):
+            raise ValueError(
+                f"Snapshot mismatch: scenario[0] vs '{scen_name}'\n"
+                f"  [0]: n={len(base_snaps)}, {base_snaps[0]} ... {base_snaps[-1]}\n"
+                f"  [{i_scen-1}]: n={len(snaps_i)}, {snaps_i[0]} ... {snaps_i[-1]}\n"
+            )
+
+        _validate_static_index_compatibility(
+            ref,
+            net_i,
+            scenario_name=scen_name,
+            name_normalization_mode=name_normalization_mode,
+        )
+        for t_container_name, allowed_attrs in _T_ATTRS_INPUT_ONLY.items():
+            if not allowed_attrs:
+                continue
+
+            if not hasattr(net_i, t_container_name):
+                continue
+
+            net_t_i = getattr(net_i, t_container_name, None)
+            if net_t_i is None:
+                continue
+
+            if warn_unknown_t or strict_unknown_t:
+                found_attrs = set(_safe_get_t_attrs(net_t_i))
+                unknown = sorted(found_attrs.difference(set(allowed_attrs)))
+                if unknown:
+                    msg = (
+                        f"Scenario '{scen_name}' has attrs in {t_container_name} not included "
+                        f"in stacking allowlist: {unknown}"
+                    )
+                    if strict_unknown_t:
+                        raise ValueError(msg)
+                    logger.warning(msg)
+
+            for attr in allowed_attrs:
+                try:
+                    val = getattr(net_t_i, attr, None)
+                except Exception:
+                    val = None
+
+                if val is None:
+                    continue
+                if isinstance(val, pd.Series):
+                    val = val.to_frame()
+                if not isinstance(val, pd.DataFrame) or val.empty:
+                    continue
+
+                df_norm = _normalize_df_columns(
+                    val,
+                    t_container_name=t_container_name,
+                    static_lookup=static_lookup,
+                    scenario_name=scen_name,
+                    attr=attr,
+                    name_normalization_mode=name_normalization_mode,
+                )
+
+                if df_norm.empty:
+                    continue
+
+                arr = df_norm.to_numpy(dtype=np.float32, copy=False)
+
+                col_min = np.nanmin(arr, axis=0)
+                col_max = np.nanmax(arr, axis=0)
+                has_nan = np.isnan(arr).any(axis=0)
+                is_const_this_scen = (~has_nan) & ((col_max - col_min) < CONST_TOL)
+                const_vals_this_scen = arr[0, :]
+
+                for j, canon_col in enumerate(df_norm.columns):
+                    meta = scan_meta[t_container_name][attr].get(canon_col)
+                    if meta is None:
+                        scan_meta[t_container_name][attr][canon_col] = {
+                            "present_count": 1,
+                            "const_all": bool(is_const_this_scen[j]),
+                            "const_value": float(const_vals_this_scen[j]) if bool(is_const_this_scen[j]) else np.nan,
+                        }
+                    else:
+                        meta["present_count"] += 1
+                        same_const = (
+                            meta["const_all"]
+                            and bool(is_const_this_scen[j])
+                            and np.isfinite(meta["const_value"])
+                            and np.isfinite(const_vals_this_scen[j])
+                            and abs(float(meta["const_value"]) - float(const_vals_this_scen[j])) < CONST_TOL
+                        )
+                        meta["const_all"] = bool(same_const)
+                        if not same_const:
+                            meta["const_value"] = np.nan
+
+        if i_scen > 1:
+            del net_i
+            gc.collect()
+
+    # -------------------------------------------------------------------------
+    # build final metadata: variable cols / constant cols per t_container.attr
+    # -------------------------------------------------------------------------
     needed: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
-    for t_container_name, allowed_attrs in _T_ATTRS_INPUT_ONLY.items():
-        if not allowed_attrs or not hasattr(ref, t_container_name):
-            continue
-        ref_t = getattr(ref, t_container_name, None)
-        if ref_t is None:
-            continue
-
-        found_attrs: Dict[str, pd.DataFrame] = {}
-        for attr in allowed_attrs:
-            try:
-                val = getattr(ref_t, attr, None)
-            except Exception:
-                continue
-            if val is None:
-                continue
-            if isinstance(val, pd.Series):
-                val = val.to_frame()
-            if isinstance(val, pd.DataFrame) and not val.empty:
-                found_attrs[attr] = val
-
-        if not found_attrs:
-            continue
-
+    for t_container_name, attrs_meta in scan_meta.items():
         needed[t_container_name] = {}
-        for attr, ref_df in found_attrs.items():
-            ref_aligned = ref_df.reindex(base_snaps).astype(np.float32)
-            ref_arr = ref_aligned.to_numpy()
-            all_cols = ref_aligned.columns
 
-            col_min = np.nanmin(ref_arr, axis=0)
-            col_max = np.nanmax(ref_arr, axis=0)
-            is_constant = (col_max - col_min) < 1e-6
+        static_comp = _get_static_comp_name(t_container_name)
+        static_df = getattr(n, static_comp, None) if static_comp and hasattr(n, static_comp) else None
 
-            variable_mask = ~is_constant
-            variable_cols  = all_cols[variable_mask]
-            constant_cols  = all_cols[is_constant]
-            constant_vals  = ref_arr[0, is_constant].astype(np.float32, copy=False)
-            n_variable = int(variable_mask.sum())
+        norm = _make_name_normalizer(name_normalization_mode)
+
+        static_norm_order: List[str] = []
+        if static_df is not None and len(static_df) > 0:
+            static_norm_order = [norm(x) for x in static_df.index]
+
+        for attr, col_meta in attrs_meta.items():
+            if not col_meta:
+                continue
+
+            all_canon_cols = list(col_meta.keys())
+
+            constant_canon_cols = []
+            constant_vals = []
+
+            variable_canon_cols = []
+
+            for c in all_canon_cols:
+                meta = col_meta[c]
+                globally_constant = (
+                    meta["present_count"] == n_scenarios
+                    and bool(meta["const_all"])
+                    and np.isfinite(meta["const_value"])
+                )
+                if globally_constant:
+                    constant_canon_cols.append(c)
+                    constant_vals.append(np.float32(meta["const_value"]))
+                else:
+                    variable_canon_cols.append(c)
+
+            # stable output order:
+            # first follow static component order, then append any extras
+            variable_canon_cols = sorted(
+                variable_canon_cols,
+                key=lambda x: (
+                    static_norm_order.index(x) if x in static_norm_order else 10**9,
+                    x,
+                ),
+            )
+            constant_canon_cols = sorted(
+                constant_canon_cols,
+                key=lambda x: (
+                    static_norm_order.index(x) if x in static_norm_order else 10**9,
+                    x,
+                ),
+            )
+
+            # map canonical -> actual reference names wherever possible
+            lookup = static_lookup.get(t_container_name, {})
+            variable_actual_cols = pd.Index([lookup.get(c, c) for c in variable_canon_cols])
+            constant_actual_cols = pd.Index([lookup.get(c, c) for c in constant_canon_cols])
 
             needed[t_container_name][attr] = {
-                "all_cols":      all_cols,
-                "variable_cols": variable_cols,
-                "constant_cols": constant_cols,
-                "constant_vals": constant_vals,
-                "has_variable":  n_variable > 0,
-                "ref_arr":       ref_arr[:, variable_mask] if n_variable > 0 else None,
+                "variable_canon_cols": pd.Index(variable_canon_cols),
+                "variable_actual_cols": variable_actual_cols,
+                "constant_cols": constant_actual_cols,
+                "constant_vals": np.asarray(constant_vals, dtype=np.float32),
+                "has_variable": len(variable_canon_cols) > 0,
             }
 
+    # -------------------------------------------------------------------------
+    # allocate arrays for variable columns
+    # -------------------------------------------------------------------------
     arrays: Dict[str, Dict[str, Optional[np.ndarray]]] = {}
     for t_container_name, attrs in needed.items():
         arrays[t_container_name] = {}
@@ -856,87 +1452,83 @@ def stack_scenarios_to_multisnapshot_network(
             if not meta["has_variable"]:
                 arrays[t_container_name][attr] = None
                 continue
-            arr = np.empty(
-                (n_scenarios * n_snaps, len(meta["variable_cols"])), dtype=np.float32,
-            )
-            arr[:n_snaps, :] = meta["ref_arr"]
-            arrays[t_container_name][attr] = arr
-
-    for i_scen in range(1, n_scenarios):
-        scen_name = scenario_names[i_scen]
-        scen_file = scenario_files[i_scen]
-        logger.info("Loading scenario %d/%d: %s  file=%s",
-                    i_scen + 1, n_scenarios, scen_name, scen_file)
-
-        p_i = Path(scen_file)
-        if not p_i.exists():
-            raise FileNotFoundError(f"Scenario network not found: {scen_file}")
-
-        net_i = pypsa.Network(str(p_i))
-        if len(net_i.snapshots) == 0:
-            raise ValueError(f"Scenario {scen_name}: network has no snapshots.")
-
-        missing_buses = n.buses.index.difference(net_i.buses.index)
-        extra_buses   = net_i.buses.index.difference(n.buses.index)
-        if len(missing_buses) or len(extra_buses):
-            msg = f"Bus mismatch in scenario '{scen_name}':\n"
-            if len(missing_buses):
-                msg += f"  Missing: {list(missing_buses)[:10]}\n"
-            if len(extra_buses):
-                msg += f"  Extra:   {list(extra_buses)[:10]}\n"
-            raise ValueError(msg)
-
-        snaps_i = _ensure_datetime_snapshots(net_i.snapshots)
-        if len(snaps_i) != len(base_snaps) or not base_snaps.equals(snaps_i):
-            raise ValueError(
-                f"Snapshot mismatch: scenario[0] vs '{scen_name}'\n"
-                f"  [0]: n={len(base_snaps)}, {base_snaps[0]} ... {base_snaps[-1]}\n"
-                f"  [{i_scen}]: n={len(snaps_i)}, {snaps_i[0]} ... {snaps_i[-1]}\n"
+            arrays[t_container_name][attr] = np.full(
+                (n_scenarios * n_snaps, len(meta["variable_canon_cols"])),
+                np.nan,
+                dtype=np.float32,
             )
 
+    # -------------------------------------------------------------------------
+    # PASS 2: fill variable arrays for every scenario
+    # -------------------------------------------------------------------------
+    for i_scen, (scen_name, scen_file) in enumerate(zip(scenario_names, scenario_files)):
+        logger.info(
+            "Filling stacked arrays for scenario %d/%d: %s  file=%s",
+            i_scen + 1, n_scenarios, scen_name, scen_file,
+        )
+
+        net_i = ref if i_scen == 0 else pypsa.Network(str(Path(scen_file)))
         start = i_scen * n_snaps
-        end   = start + n_snaps
+        end = start + n_snaps
 
         for t_container_name, attrs in needed.items():
             if not hasattr(net_i, t_container_name):
-                for attr, meta in attrs.items():
-                    if meta["has_variable"] and arrays[t_container_name][attr] is not None:
-                        arrays[t_container_name][attr][start:end, :] = np.nan
                 continue
 
-            net_t_i = getattr(net_i, t_container_name)
+            net_t_i = getattr(net_i, t_container_name, None)
+            if net_t_i is None:
+                continue
+
             for attr, meta in attrs.items():
                 if not meta["has_variable"]:
                     continue
-                arr  = arrays[t_container_name][attr]
+
+                arr = arrays[t_container_name][attr]
+                if arr is None:
+                    continue
+
                 df_i = getattr(net_t_i, attr, None)
                 if df_i is None:
-                    arr[start:end, :] = np.nan
                     continue
                 if isinstance(df_i, pd.Series):
                     df_i = df_i.to_frame()
-                # [NAME-FIX] Strip year suffix (e.g. '-2050') from variable_cols
-                # to match prepared_cutout names (e.g. 'AT0 0 0 solar-hsat')
-                # vs base network names ('AT0 0 0 solar-hsat-2050')
-                import re as _re
-                cols_lookup = pd.Index([
-                    _re.sub(r'-\d{4}$', '', c) for c in meta["variable_cols"]
-                ])
-                arr[start:end, :] = (
-                    df_i
-                    .reindex(index=base_snaps, columns=cols_lookup)
-                    .to_numpy(dtype=np.float32)
+                if not isinstance(df_i, pd.DataFrame) or df_i.empty:
+                    continue
+
+                df_norm = _normalize_df_columns(
+                    df_i,
+                    t_container_name=t_container_name,
+                    static_lookup=static_lookup,
+                    scenario_name=scen_name,
+                    attr=attr,
+                    name_normalization_mode=name_normalization_mode,
                 )
 
-        del net_i
-        gc.collect()
+                if df_norm.empty:
+                    continue
 
+                df_block = df_norm.reindex(
+                    index=base_snaps,
+                    columns=meta["variable_canon_cols"],
+                )
+
+                arr[start:end, :] = df_block.to_numpy(dtype=np.float32, copy=False)
+
+        if i_scen > 0:
+            del net_i
+            gc.collect()
+
+    # -------------------------------------------------------------------------
+    # write static constants + stacked variable *_t frames back to network
+    # -------------------------------------------------------------------------
     for t_container_name, attrs in needed.items():
         if not hasattr(n, t_container_name):
             continue
+
         n_t = getattr(n, t_container_name)
 
         for attr, meta in attrs.items():
+            # push globally constant cols into static component table
             _apply_constant_cols_to_static(
                 n,
                 t_container_name=t_container_name,
@@ -945,32 +1537,25 @@ def stack_scenarios_to_multisnapshot_network(
                 constant_vals=meta["constant_vals"],
             )
 
-            if (meta["has_variable"]
-                    and arrays[t_container_name][attr] is not None
-                    and len(meta["variable_cols"]) > 0):
+            # attach variable stacked dataframe
+            if (
+                meta["has_variable"]
+                and arrays[t_container_name][attr] is not None
+                and len(meta["variable_actual_cols"]) > 0
+            ):
                 df_var = pd.DataFrame(
                     arrays[t_container_name][attr],
                     index=stacked_snaps,
-                    columns=meta["variable_cols"],
+                    columns=meta["variable_actual_cols"],
                     copy=False,
                 ).astype(np.float32, copy=False)
-                # [NAME-FIX] Map cols from prepared_cutout names (no year suffix)
-                # to stacked network names (may have year suffix e.g. -2050)
-                import re as _re
-                comp_name = _COMP_FOR_T_CONTAINER.get(t_container_name, "")
-                comp_df = getattr(n, comp_name, None)
-                if comp_df is not None and len(comp_df) > 0:
-                    stripped_to_actual = {}
-                    for nm in comp_df.index:
-                        key = _re.sub(r"-\d{4}$", "", nm)
-                        if key not in stripped_to_actual:
-                            stripped_to_actual[key] = nm
-                    df_var.columns = pd.Index([
-                        stripped_to_actual.get(c, c) for c in df_var.columns
-                    ])
+
                 setattr(n_t, attr, df_var)
                 del arrays[t_container_name][attr]
 
+    # -------------------------------------------------------------------------
+    # cleanup and diagnostics
+    # -------------------------------------------------------------------------
     del ref
     gc.collect()
 
@@ -985,7 +1570,7 @@ def stack_scenarios_to_multisnapshot_network(
                 total_bytes += df.memory_usage(deep=False).sum()
 
     logger.info(
-        "Stacked (MEM-v2+PATCH-A): %d scen × %d ts = %d snaps | "
+        "Stacked (robust): %d scen × %d ts = %d snaps | "
         "buses=%d gens=%d loads=%d links=%d lines=%d su=%d stores=%d | "
         "*_t frames: %.1f MB",
         n_scenarios, n_snaps, len(n.snapshots),
@@ -993,6 +1578,29 @@ def stack_scenarios_to_multisnapshot_network(
         len(n.links), len(n.lines), len(n.storage_units), len(n.stores),
         total_bytes / 1e6,
     )
+
+    # log short summary of constant vs variable classification
+    for t_container_name, attrs in needed.items():
+        for attr, meta in attrs.items():
+            logger.info(
+                "Stack meta %-16s %-20s | constant=%4d | variable=%4d",
+                t_container_name,
+                attr,
+                len(meta["constant_cols"]),
+                len(meta["variable_actual_cols"]),
+            )
+
+
+    # -------------------------------------------------------------------------
+    # post-stacking diagnostics
+    # -------------------------------------------------------------------------
+    try:
+        _debug_log_stacking_overview(
+            n,
+            scenario_names=list(scenario_names),
+        )
+    except Exception as exc:
+        logger.warning("[STACK-DEBUG] post-stacking diagnostics failed: %s", exc)
     return n, list(scenario_names)
 
 
@@ -1019,7 +1627,7 @@ def _scenario_masks_from_snapshots(snapshots: pd.Index) -> Dict[str, np.ndarray]
 
 def _compute_ls_p_nom_per_bus(
         n: pypsa.Network,
-        safety_factor: float = 2.0,
+        safety_factor: float = 1.0,
         floor_mw: float = 100.0,
 ) -> Dict[str, float]:
     """
@@ -1575,8 +2183,6 @@ def _build_operational_cost_expression(
         nonlocal total
         if comp_df is None or len(comp_df) == 0 or "marginal_cost" not in comp_df.columns:
             return
-
-
         var, _ = _get_linopy_var(m, var_names, strict=False)
         if var is None:
             return
@@ -2243,31 +2849,16 @@ def _apply_carrier_max_growth_limits(n: pypsa.Network) -> Dict[str, int]:
     return updated
 
 def _fix_zero_capital_cost_extendables(n: pypsa.Network) -> int:
-    fixed = 0
-    for comp, ext_col in [
-        ("generators",    "p_nom_extendable"),
-        ("links",         "p_nom_extendable"),
-        ("storage_units", "p_nom_extendable"),
-        ("stores",        "e_nom_extendable"),
-        ("lines",         "s_nom_extendable"),
-    ]:
-        df = getattr(n, comp, None)
-        if df is None or len(df) == 0:
-            continue
-        if ext_col not in df.columns or "capital_cost" not in df.columns:
-            continue
-        is_ext  = df[ext_col].fillna(False).astype(bool)
-        is_zero = df.loc[is_ext, "capital_cost"].fillna(0.0).astype(float) == 0.0
-        bad     = df.index[is_ext][is_zero].tolist()
-        if bad:
-            df.loc[bad, "capital_cost"] = 1.0
-            logger.warning(
-                "_fix_zero_capital_cost_extendables: %d extendable %s had "
-                "capital_cost=0 → set to 1 EUR/MW. Examples: %s",
-                len(bad), comp, bad[:3],
-            )
-            fixed += len(bad)
-    return fixed
+    """Backward-compatible wrapper around generic capital-cost validation."""
+    fixed_by_comp = validate_extendable_capital_costs(
+        n,
+        stage="robust_master_pre_solve",
+        strict=False,
+        auto_fix=True,
+        floor_cost=1.0,
+        min_positive=0.0,
+    )
+    return int(sum(fixed_by_comp.values()))
 
 
 def _fix_unbounded_infrastructure(n: pypsa.Network) -> Dict[str, int]:
@@ -2307,14 +2898,32 @@ def _fix_unbounded_infrastructure(n: pypsa.Network) -> Dict[str, int]:
                 "[INFRA-FIX] Fixed %d biomass generators: p_nom_max inf→1e6 MW. "
                 "Examples: %s", count, examples
             )
-        # [BIOGAS-FIX] Biogas auf ENSPRESO-Potential cappen
+        # [BIOMASS-FIX] ENSPRESO speichert Jahrespotenzial in MWh als p_nom (MW)
+        # z.B. DE0: 155e6 MWh -> faelschlich als 155 TW interpretiert
+        # Korrektur: p_nom_MW = p_nom_MWh / 8760
+        solid_mask = n.generators.carrier.str.lower() == "solid biomass"
+        solid_big  = solid_mask & (n.generators.p_nom > 1e5)
+        if solid_big.any():
+            n.generators.loc[solid_big, "p_nom"]     = (n.generators.loc[solid_big, "p_nom"] / 8760.0).clip(upper=1e6)
+            n.generators.loc[solid_big, "p_nom_max"] = n.generators.loc[solid_big, "p_nom"]
+            count_sb = int(solid_big.sum())
+            fixed["generators::solid_biomass_pnom"] = count_sb
+            logger.info("[INFRA-FIX] Converted %d solid biomass p_nom MWh→MW (÷8760). ", count_sb)
+        # [BIOGAS-FIX] Biogas p_nom und p_nom_max cappen
+        # ENSPRESO speichert Energiepotenziale (MWh) faelschlich als p_nom (MW)
+        # z.B. FR0: 7.1e7 MWh -> wird als 71 TW Kapazitaet interpretiert
         bio_gas_mask = n.generators.carrier.str.lower() == 'biogas'
-        bio_gas_big  = bio_gas_mask & (n.generators.p_nom_max > 1e6)
+        bio_gas_big  = bio_gas_mask & (n.generators.p_nom > 1e4)
         if bio_gas_big.any():
-            n.generators.loc[bio_gas_big, 'p_nom_max'] = n.generators.loc[bio_gas_big, 'p_nom'].clip(upper=1e6)
+            n.generators.loc[bio_gas_big, 'p_nom']     = (n.generators.loc[bio_gas_big, 'p_nom'] / 8760.0).clip(upper=1e6)
+            n.generators.loc[bio_gas_big, 'p_nom_max'] = n.generators.loc[bio_gas_big, 'p_nom']
             count_bg = int(bio_gas_big.sum())
             fixed['generators::biogas_cap'] = count_bg
-            logger.info('[INFRA-FIX] Capped %d biogas generators p_nom_max→p_nom (max 1e6 MW)', count_bg)
+            logger.info('[INFRA-FIX] Converted %d biogas generators p_nom MWh->MW (÷8760), capped at 1e6 MW', count_bg)
+        # Auch kleinere biogas mit p_nom_max > p_nom_max-Limit cappen
+        bio_gas_pmax_big = bio_gas_mask & (~bio_gas_big) & (n.generators.p_nom_max > 1e6)
+        if bio_gas_pmax_big.any():
+            n.generators.loc[bio_gas_pmax_big, 'p_nom_max'] = n.generators.loc[bio_gas_pmax_big, 'p_nom'].clip(upper=1e6)
     # Links mit p_nom_max=inf, mc>0, capital_cost≈0
     if hasattr(n, "links") and len(n.links) > 0:
         lk = n.links
@@ -2359,8 +2968,9 @@ def _fix_unbounded_infrastructure(n: pypsa.Network) -> Dict[str, int]:
         default_cap = 1e9  # für alle nicht gelisteten Carrier
 
         inf_mask = n.stores.e_nom_max.fillna(np.inf).apply(np.isinf)
-        mc_mask = n.stores.marginal_cost.fillna(0) > 0
-        to_fix = n.stores.index[inf_mask & mc_mask]
+        # Cap ALL extendable stores with inf e_nom_max, not just mc>0
+        ext_mask = n.stores.e_nom_extendable.fillna(False).astype(bool)
+        to_fix = n.stores.index[inf_mask & ext_mask]
 
         if len(to_fix) > 0:
             for store_name in to_fix:
@@ -2961,14 +3571,45 @@ def solve_aro_master(
             # better than silently dropping the constraint).
             gen_ef, _ = _resolve_gc_emission_factors(n, carrier_attr)
             if gen_ef is not None:
-                neutralized = abs(original) * 1000.0 if abs(original) > 1e-6 else 1e15
-                n.global_constraints.at[gc_name, "constant"] = neutralized
-                logger.info(
-                    "Master: GC '%s' (%s %.3e) → neutralized (%.3e = |orig|×1000). "
-                    "Per-scenario constraints added in extra_master. "
-                    "carrier_attr='%s'.",
-                    gc_name, sense, original, neutralized, carrier_attr,
-                )
+                # Sense-aware neutralization so the native PyPSA GC becomes non-binding
+                # before we add per-scenario replacements in extra_master.
+                #
+                # <= : use very large positive RHS
+                # >= : use very large negative RHS
+                # == : cannot be neutralized with a single RHS shift; keep scaled native GC
+                #      and log a warning.
+                sense_norm = sense.replace(" ", "")
+                if sense_norm in ("<=", "<", "le", "leq"):
+                    # Remove GC entirely — per-scenario replacement added in extra_master
+                    n.global_constraints.drop(gc_name, inplace=True)
+                    logger.info("Master: GC '%s' dropped (per-scenario replacement active).", gc_name)
+                    continue
+                    logger.info(
+                        "Master: GC '%s' (%s %.3e) → neutralized to %.3e (sense-aware, <=). "
+                        "Per-scenario constraints added in extra_master. "
+                        "carrier_attr='%s'.",
+                        gc_name, sense, original, neutralized, carrier_attr,
+                    )
+                elif sense_norm in (">=", ">", "ge", "geq"):
+                    # Remove GC entirely — per-scenario replacement added in extra_master
+                    n.global_constraints.drop(gc_name, inplace=True)
+                    logger.info("Master: GC '%s' dropped (per-scenario replacement active).", gc_name)
+                    continue
+                    logger.info(
+                        "Master: GC '%s' (%s %.3e) → neutralized to %.3e (sense-aware, >=). "
+                        "Per-scenario constraints added in extra_master. "
+                        "carrier_attr='%s'.",
+                        gc_name, sense, original, neutralized, carrier_attr,
+                    )
+                else:
+                    scaled = original / annual_scale
+                    n.global_constraints.at[gc_name, "constant"] = scaled
+                    logger.warning(
+                        "Master: GC '%s' has equality/unknown sense '%s'; "
+                        "cannot neutralize safely. Keeping scaled native GC %.3e and "
+                        "also adding per-scenario constraints.",
+                        gc_name, sense, scaled,
+                    )
             else:
                 scaled = original / annual_scale
                 n.global_constraints.at[gc_name, "constant"] = scaled
@@ -3045,11 +3686,42 @@ def solve_aro_master(
                 w_override_np=w_base_np,
                 annual_scale=annual_scale,
             )
-            # op_cost_s enthält KEINE LS-Kosten mehr (gefiltert in _add_mc)
+            # op_cost_s enthält LS-Kosten (Penalty-Mechanismus für ARO)
+            # [DIAG] Obere Schranke für op_cost_s berechnen
+            try:
+                print('ALL CARRIERS:', network.generators.carrier.value_counts().to_dict())
+                ls_gens = network.generators[network.generators.carrier.isin(['load','load_shedding'])]
+                ls_mc = ls_gens['marginal_cost'].mean() if len(ls_gens) > 0 else 0
+                ls_pnom = ls_gens['p_nom'].sum() if len(ls_gens) > 0 else 0
+                w_sum = float(w_base_np[masks[s]].sum())
+                max_ls = ls_mc * ls_pnom * w_sum
+                logger.info("[DIAG-OPCOST] s=%s  ls_mc=%.2f  ls_pnom=%.3e MW  w_sum=%.1f  max_ls=%.3e",
+                            s, ls_mc, ls_pnom, w_sum, max_ls)
+                # Biomasse als weiterer Treiber
+                bio = network.generators[network.generators.carrier.isin(['solid biomass','biogas'])]
+                bio_mc = bio['marginal_cost'].mean() if len(bio) > 0 else 0
+                bio_pnom = bio['p_nom'].sum() if len(bio) > 0 else 0
+                max_bio = bio_mc * bio_pnom * w_sum
+                logger.info("[DIAG-OPCOST] s=%s  bio_mc=%.2f  bio_pnom=%.3e MW  max_bio=%.3e",
+                            s, bio_mc, bio_pnom, max_bio)
+            except Exception as _e:
+                logger.warning("[DIAG-OPCOST] Fehler: %s", _e)
             m.add_constraints(
                 1.0 * z_theta >= op_cost_s,
                 name=f"robust_op_epigraph::{s}",
             )
+            # DIAG: Evaluiere op_cost_s Terme
+            try:
+                import xarray as _xr
+                _terms = list(getattr(op_cost_s, 'data', {}).items()) if hasattr(op_cost_s, 'data') else []
+                logger.info("[DIAG-OPCOST] op_cost_s terms: %d  type=%s", len(_terms), type(op_cost_s).__name__)
+                # Zähle Koeffizienten
+                if hasattr(op_cost_s, 'coeffs'):
+                    c = op_cost_s.coeffs.values.ravel()
+                    c = c[~np.isnan(c) & (c != 0)]
+                    logger.info("[DIAG-OPCOST] coeffs: n=%d  min=%.3e  max=%.3e  sum=%.3e", len(c), float(c.min()), float(c.max()), float(c.sum()))
+            except Exception as _de:
+                logger.warning("[DIAG-OPCOST] eval failed: %s", _de)
             del op_cost_s
         m.objective = inv_cost + 1.0 * z_theta
 
@@ -3615,12 +4287,17 @@ def run_robust(
     for c, f in zip(cutouts, scenario_files):
         logger.info("  %-35s -> %s", c, f)
 
-    n, scen_names = stack_scenarios_to_multisnapshot_network(
+    n, scen = stack_scenarios_to_multisnapshot_network(
         scenario_files=scenario_files,
         scenario_names=list(cutouts),
         warn_unknown_t=warn_unknown_t,
         strict_unknown_t=strict_unknown_t,
+        name_normalization_mode="exact",
     )
+
+    _drop_orphan_timeseries_columns(n)
+    _debug_timeseries_orphans(n, "after_orphan_drop")
+
     _debug_component_overview(n, "after_stacking")
     _debug_extendables(n, "after_stacking")
     _debug_nonextendable_infinite_assets(n, "after_stacking")
@@ -3640,15 +4317,6 @@ def run_robust(
         ls_penalty=ls_penalty,
     )
 
-    # ------------------------------------------------------------------
-    # Robustness verification: confirm z_theta* ≈ max_s Op(x*, s).
-    # This cross-checks that _build_operational_cost_expression in the
-    # master and the post-solve evaluation agree, catching any mismatch
-    # between the master objective formulation and the actual dispatch
-    # costs (e.g. due to annual_scale divergence or missing components).
-    # Non-fatal: only warns so that a numerically marginal discrepancy
-    # does not abort an otherwise correct solve.
-    # ------------------------------------------------------------------
     try:
         masks_verify    = _scenario_masks_from_snapshots(n.snapshots)
         scenarios_verify = list(masks_verify.keys())
@@ -3664,10 +4332,6 @@ def run_robust(
                 w_override_np=w_base_v,
                 annual_scale=annual_scale_v,
             )
-            # Extract scalar value from a linopy LinearExpression.
-            # The API varies across linopy versions:
-            #   >= 0.4: expr.solution  (xr.DataArray scalar)
-            #   0.3.x:  manually sum variable solution values
             _val = None
             for _attr in ("solution", "value"):
                 try:
@@ -3680,7 +4344,6 @@ def run_robust(
                 except Exception:
                     pass
             if _val is None:
-                # Fallback: evaluate by summing variable solution values
                 try:
                     import xarray as _xr
                     _acc = 0.0
@@ -3726,14 +4389,13 @@ def run_robust(
     Path(out_network).parent.mkdir(parents=True, exist_ok=True)
     Path(out_summary_json).parent.mkdir(parents=True, exist_ok=True)
 
-    # === DIAGNOSE: Master-Ergebnis Sanity Check ===
     z = diag.get("z_theta_star", float("nan"))
     ls_pen = diag.get("ls_penalty", float("nan"))
     n_scen = diag.get("n_scenarios", 1)
     logger.info(
         "[DIAG] Master result: z_theta*=%.3e  ls_penalty=%.4g  "
         "max_realistic_z=%.3e (= ls_penalty × 8760h × peak_load_approx)",
-        z, ls_pen, ls_pen * 8760 * 800e3  # ~800 GW Europa-Peak
+        z, ls_pen, ls_pen * 8760 * 800e3
     )
     if z > ls_pen * 8760 * 1e6:
         logger.error("[DIAG] z_theta* implausibly large — likely still driven by LS or unbounded stores!")
@@ -3741,7 +4403,6 @@ def run_robust(
         logger.warning("[DIAG] z_theta* very small (%.3e) — check if op-cost expression is empty", z)
     else:
         logger.info("[DIAG] z_theta* in plausible range ✓")
-    # === ENDE ===
 
     logger.info("Exporting stacked robust network → %s", out_network)
     _ensure_standard_pypsa_result_frames(n)
@@ -3769,7 +4430,7 @@ def run_robust(
     gc.collect()
 
     payload: Dict[str, Any] = {
-        "scenario_names":    list(scen_names),
+        "scenario_names":    list(scen),
         "scenario_networks": list(map(str, scenario_files)),
         "diagnostics":       diag,
         "capacities":        capacities,

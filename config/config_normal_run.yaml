@@ -28,7 +28,7 @@ remote:
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#run
 run:
   prefix: ""
-  name: "test-aro"
+  name: "test-normal-run"
   scenarios:
     enable: false
     file: config/scenarios.yaml
@@ -39,7 +39,7 @@ run:
   use_shadow_directory: false
 
 workflow:
-  mode: "aro" #must be aro or robust or plain
+  mode: "plain" #must be aro or robust or plain
 
 robust:
   # diskrete Szenarien = manipulierten Cutouts
@@ -80,9 +80,7 @@ robust:
       NodefileDir: "/tmp"
       MemLimit: 600
       DualReductions: 0
-      NumericFocus: 3
-      ObjScale: -0.5
-      ScaleFlag: 2
+      NumericFocus: 1
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#foresight
 foresight: myopic
@@ -1275,7 +1273,7 @@ solving:
     # options that go into the optimize function
     cost_validation:
       strict: false
-      auto_fix: true
+      auto_fix: false
       floor_cost: 1.0
     track_iterations: false
     min_iterations: 2

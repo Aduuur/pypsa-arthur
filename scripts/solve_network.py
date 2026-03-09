@@ -43,6 +43,7 @@ import yaml
 from linopy.remote.oetc import OetcCredentials, OetcHandler, OetcSettings
 from pypsa.descriptors import get_activity_mask
 from pypsa.descriptors import get_switchable_as_dense as get_as_dense
+from scripts.cost_validation import validate_extendable_capital_costs
 
 from scripts._benchmark import memory_logger
 from scripts._helpers import (
@@ -1416,6 +1417,29 @@ def solve_network(
     if not n.lines.s_nom_extendable.any():
         skip_iterations = True
         logger.info("No expandable lines found. Skipping iterative solving.")
+
+    # generic cost validation for all workflows (plain/robust/aro)
+    cost_validation_cfg = cf_solving.get("cost_validation", {}) or {}
+    strict_cost_validation = bool(cost_validation_cfg.get("strict", False))
+    auto_fix_cost_validation = bool(cost_validation_cfg.get("auto_fix", False))
+    floor_cost = float(cost_validation_cfg.get("floor_cost", 1.0))
+    default_ignore = [
+        "co2 sequestered", "urban central heat vent",
+        "urban decentral heat vent", "rural heat vent",
+        "oil primary", "coal", "lignite",
+    ]
+    ignore_carriers = list(cost_validation_cfg.get("ignore_carriers", default_ignore))
+
+    validate_extendable_capital_costs(
+        n,
+        stage=f"{rule_name}_pre_optimize",
+        strict=strict_cost_validation,
+        auto_fix=auto_fix_cost_validation,
+        floor_cost=floor_cost,
+        min_positive=0.0,
+        ignore_carriers=ignore_carriers,
+    )
+
 
     # add to network for extra_functionality
     n.config = config

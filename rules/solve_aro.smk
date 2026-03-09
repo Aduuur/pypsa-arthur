@@ -44,6 +44,8 @@ OUT_SUMMARY = Path(ARO.get("out_summary", str(RESULTS_DIR / "results" / "aro_sum
 # ARO loop controls
 INITIAL = list(ARO.get("initial_scenarios", [CUTOUTS[0]]))
 MAX_ITER = int(ARO.get("max_iter", 5))
+MAX_MASTER_SIZE = int(ARO.get("max_master_size", 3))
+
 
 ARO_CO2_COST_MODE = str(ARO.get("co2_cost_mode", "off"))
 ARO_LS_PENALTY = float(ARO.get("ls_penalty", 1e4))
@@ -190,6 +192,8 @@ rule solve_aro:
         ls_penalty=lambda wc: ARO_LS_PENALTY,
         convergence_tol=lambda wc: ARO_CONVERGENCE_TOL,
         dispatch_workers=lambda wc: ARO_DISPATCH_WORKERS,
+        max_master_size= lambda wc: MAX_MASTER_SIZE,
+
     shell:
         r"""
         set -euo pipefail
@@ -211,6 +215,7 @@ rule solve_aro:
           --ls-penalty {params.ls_penalty} \
           --convergence-tol {params.convergence_tol} \
           --dispatch-workers {params.dispatch_workers} \
+          --max-master-size {params.max_master_size} \
            2>&1 | tee {log}  
         """
 

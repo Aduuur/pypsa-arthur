@@ -200,7 +200,7 @@ def prepare_costs(
     # Do NOT blindly fill investment/fuel/discount rate with zero.
     # ------------------------------------------------------------------
     fill_values = dict(config.get("fill_values", {}))
-    unsafe_keys = {"investment", "fuel", "capital_cost", "marginal_cost", "discount rate"}
+    unsafe_keys = {"investment", "fuel", "capital_cost", "marginal_cost"}
     safe_fill_values = {k: v for k, v in fill_values.items() if k not in unsafe_keys}
 
     if safe_fill_values:
