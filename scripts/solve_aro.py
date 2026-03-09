@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # solve_aro.py
 """
-solve_aro.py — Iterativer ARO-Workflow (Adaptive Robust Optimization via Szenario-Generierung)
+solve_aro.py
 
 Überblick
 ---------
-Iterativer ARO-Loop über eine endliche Menge von Wetter-/Demand-Szenarien ("cutouts").
+Iterativer ARO-Loop über eine endliche Menge von Wetter-/Demand-Szenarien
 In jeder Iteration:
 
   (1) ROBUST-SOLVE:      Robuste Investitionsentscheidung über das aktuelle Szenarioset

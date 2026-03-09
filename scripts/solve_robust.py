@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 # solve_robust.py
 """
-Patched version of the robust solver from ``Aduuur/pypsa-arthur``.
 
-Changelog vs. upstream (February 2026)
 =======================================
 
 [PATCH-1..6]  Various patches (see previous versions)
 
 ================================================================================
-MEM-PATCHES (March 2026)
 ================================================================================
 
 [MEM-PATCH-A]  stack_scenarios_to_multisnapshot_network
@@ -17,7 +14,6 @@ MEM-PATCHES (March 2026)
 [MEM-PATCH-C]  snapshot_weightings stacking float32
 
 ================================================================================
-BUG FIXES (April 2026)
 ================================================================================
 
 [BUG-FIX-1]  cyclic_overrides=e_cyclic_backup in extra_master
@@ -30,7 +26,7 @@ BUG FIXES (April 2026)
 [BUG-FIX-8]  annual_scale passed to cost consistency validator
 
 ================================================================================
-DISPATCH FIXES (May 2026)
+
 ================================================================================
 
 [DISPATCH-FIX-1]  _fix_negative_loads  — methodically correct treatment
@@ -52,7 +48,7 @@ DISPATCH FIXES (May 2026)
     were not pruned. Now pruned consistently in _dispatch_solve.
 
 ================================================================================
-ARO METHODOLOGY FIXES (June 2026)
+
 ================================================================================
 
 [ARO-FIX-1]  _fix_cross_scenario_storage_constraints  — break cross-scenario SOC coupling
