@@ -1,0 +1,4 @@
+https://ec.europa.eu/eurostat/web/energy/data/database
+Energy statistics - quantities
+annual data: energy infrastructure and capacities: electricity production capacities for renewables and wastes
+monthly data: supply, transformation and consumption, net electricity generation

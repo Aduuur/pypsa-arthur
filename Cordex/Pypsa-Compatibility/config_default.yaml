@@ -1,0 +1,207 @@
+# cd2es - covert cordex climate data to energy system input data
+# Copyright (C) 2024 Leonie Sara Plaga
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, version 3.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+# main settings
+
+# file to download the climate data into - careful, those files are quite huge, maybe use an external hard drive
+data_dir: "/mnt/endata/Cordex/Pypsa-Compatibility/path/to/climate_data_storage"
+
+#Select from "Backbone", "PyPSA-Eur" or "Techfiles_only"
+desired_ESM: PyPSA-Eur
+
+
+# settings for run without specified output file
+scenario:
+  # technologies to be calculated
+  # possible technologes: 'csp', 'pv', 'wind' (onshore), 'wind_offshore', 'hydro'
+  # and tpp(CoolingType)_p{Plant} with cooling type in [CL, OT] (closed loop, once through)
+  # and plant in [Nuclear, Coal, CCGT, Biomass, H2]
+  technologies: ['pv', 'wind', 'wind_offshore', 'hydro', 'tppCL_pNuclear','tppOT_pNuclear', 'tppCL_pCoal','tppOT_pCoal', 'tppCL_pCCGT','tppOT_pCCGT', 'tppCL_pBiomass','tppOT_pBiomass', 'tppCL_pH2','tppOT_pH2']
+  # add  'demand' for calculation of demand (only working for Europe)
+  demand: ['demand']
+  # name of climate model
+  # for starters, we recommend using NCC-NorESM1-M
+  model: ['CNRM-CERFACS-CM5']
+  # rcp without decimal separator
+  rcp: ['85']
+  # years
+  year: [2025,2026,2027,2028,2029,2030,2031,2032,2033,2034,2035,2036,2037,2038,2039,2040,2041,2042,2043,2044,2045,2046,2047,2048,2049,2050]
+  # domain
+  # choose from cordex domains (southamerica, centralamerica, northamerica, europe, africa, eastasia, centralasia, southasia, southeastasia, australasia)
+  domain: ["europe"]
+
+
+# enable automatic download of cordex climate data from https://esgf-data.dkrz.de/search/cordex-dkrz/
+# otherwise, the climate data must be present in the data_dir in the following folder: {data_dir}/{domain_name}/original/{model_name}/
+# cordex data will be automatically renamed to the names needed for the workflow, if the original names from esgf are kept
+
+
+download_cordex: False
+cordex_local_dir: "/mnt/endata/Copernicus_CORDEX_data_RCP_2.6"
+
+cordexParameter:
+# to be specified on the available datasets under https://esgf-data.dkrz.de/search/cordex-dkrz/
+# for the combination ensemble: "r1i1p1", institut: "GERICS", RCMModel: "REMO2015", downscalingRealisation: "v1" there is sufficient data for the whole globe for
+# the driving model NCC-NorESM1-M and RCPs 2.6 and 8.5
+  ensemble: "r1i1p1"
+  institute: "GERICS"
+  RCMModel: "REMO2015"
+  downscalingRealisation: "v1"
+# some models use a 360 day calendar - give their names here and it will be dealt with
+360day_models: ['MOHC-HadGEM2-ES']
+
+download_era5: True
+# enable automatic download of era5 data for regression and bias adaption - otherwise the era5 data must be present in the folder
+# {data_dir}/observed with file name {era5 variable name}_era5_{year}.nc (see bias_adaption/climateVariablesDict in this config for names)
+loginDataAsParams: False
+# only necessary when building .cdsapirc in home folder is not possible
+# then, the url and the key for the copernicus data store must be written before the snakemake command in the following manner
+# cdsUrl="yourUrl" cdsKey="yourKey" snakemake -j...
+
+# enable or disable bias adaption
+use_bias_adaption: True
+bias_adaption:
+  yearHistStart: 2011
+  yearHistEnd: 2015
+  climateVariablesDict: # corresponding era5 names to cordex variable names
+    sfcWind: ['v10', 'u10']
+    tas: 't2m'
+    rsds: 'ssr'
+    mrro: 'ro'
+
+# put in custom map in geojson format if desired. Else a map aggregated on country level will be used.
+# To calculate offshore cfs you also need to provide an offshore map.
+# the geojson files must a column "name" with the name of the node and a column "geometry" with the shape of the node
+# for hydro and demand calculation, they must also contain a column with a three letter country code and the name "countryCode"
+use_custom_bus_map: False
+bus_map: "path/to/onshore_map.geojson"
+offshore_map: "path/to/offshore_map.geojson"
+
+geography:
+# how many points in each direction?
+  x_size: 150
+  y_size: 150
+
+# xarray can read the climate data in chunks to preserve memory - more chunks mean less memory usage but slower execution
+numberOfChunks: 10
+
+# parallelized dask calculations tend to get stuck
+# after maxTime passed, rules are killed and restarted
+# for bias adaption (most resource intensive rule) this time is doubled
+maxTime: 600
+
+# renewables are built preferably to locations with high cfs. This can lead to an underestimation, when just aggregating over a whole country.
+# Here, it can be choosen, that only the best x percents of data points per node are aggregated
+choose_only_x_percent_of_country:
+  onwind: 0.05
+  offwind: 0.05
+  pv: 0.3
+
+onwind:
+  hub_height: 100 # in m
+  v_in: 2 # cut in velocity in m/s
+  v_r: 9.5 # rated velocity in m/s
+  v_out: 12 # cut out velocity in m/s
+
+offwind:
+  hub_height: 100 # in m
+  v_in: 0 # cut in velocity in m/s
+  v_r: 13 # rated velocity in m/s
+  v_out: 15 # cut out velocity in m/s
+  max_depth: 50 # maximal water depth
+
+solar:
+# following climix model https://doi.org/10.1016/j.rser.2014.09.041
+  option: 3 # choose option from [1, 2, 3]
+  GStc: 1000 # irradiance at standard testing conditions in W/m^2
+  # if option = 1, everything below is not necesary
+  # give all temperatures in °C
+  c1: 4.3
+  c2: 0.943
+  c3: 0.028
+  c4: -1.528 # only necesarry for option 3
+  TStc: 25  # temperature at standard testing conditions in °C
+  beta: 0.0045 # only necesarry for option 2
+  gamma: -0.005 # !!! something different in option 2 and 3
+
+tpp:
+  # https://doi.org/10.1016/j.rser.2019.06.006
+  OT:
+    OTyearStart: 2011
+    OTyearEnd: 2015
+    # give all temperatures in K
+    nuclear:
+      temp_const: 0.0044 # loss of efficiency per temperature rise in 1/K
+      T_health: 288
+      T_shutdown: 305
+      T_outmax: 305
+      deltaT: 10
+    coal:
+      temp_const: 0.0097 # loss of efficiency per temperature rise in 1/K
+      T_health: 288
+      T_shutdown: 305
+      T_outmax: 305
+      deltaT: 10
+    ccgt:
+      temp_const: 0.0031 # loss of efficiency per temperature rise in 1/K
+      T_health: 288
+      T_shutdown: 305
+      T_outmax: 305
+      deltaT: 10
+  CL:
+    nuclear:
+      temp_const: 0.0044 # loss of efficiency per temperature rise in 1/K
+      T_health: 283 # temperature in K, above which degradation of efficiency starts
+    coal:
+      temp_const: 0.0094 # loss of efficiency per temperature rise in 1/K
+      T_health: 283 # temperature in K, above which degradation of efficiency starts
+    ccgt:
+      temp_const: 0.0030 # loss of efficiency per temperature rise in 1/K
+      T_health: 283 # temperature in K, above which degradation of efficiency starts
+
+hydro:
+  yearStart: 2011
+  yearEnd: 2015
+  factor: 1.9 # hydro power plants reach their rated capacity at factor * average historical runoff
+
+demand:
+  reference_year: 2017
+  yearStart: 2015
+  yearEnd: 2019
+  makePlots: True
+  scaleDemand: False # scale reference demand to meet projections for future before applying cd2es
+  scaleDemandCountries: ["BEL", "BGR", "CZE", "DNK", "DEU", "EST", "IRL", "GRC", "ESP", "FRA", "HRV", "ITA", "LVA", "LTU", "LUX", "HUN", "NLD", "AUT", "POL", "PRT", "ROU", "SVN", "SVK", "FIN", "SWE", "GBR", "NOR", "CHE", "Balkan"]
+  scaleDemandNewLoad: [124.2, 40.9, 90.9, 51.1, 666.2, 11.3, 39.0, 64.8, 334.3, 629.1, 23.6, 453.8, 11.4, 13.4, 13.8, 54.2, 152.6, 95.1, 232.5, 58.6, 71.6, 19.8, 39.3, 110.4, 190.5, 471.5, 147.1, 60.8, 73.4] # given in TWh, based on Pietzcker et al 2021
+
+pypsa:
+  predict_soiltemp: True
+  cutout_template_path: 'resources/pypsa_europe_cutout_height.nc'
+
+# it is possible to directly insert the time series into a backbone (https://doi.org/10.3390/en12173388) model
+# path to backbone file
+backbone_input: "path/to/backbone_input_file.xlsx"
+backbone_tpps:
+  types: ["Nuclear", "Biomass", "H2"] # plants in [Nuclear, Coal, CCGT, Biomass, H2]
+  inv_cost_per_cooling_type: # in €/MW, taken from https://restservice.epri.com/publicdownload/000000000001005358/0/Product
+    once-through: 0
+    closed-loop: 11163
+    dry-cooling: 43005
+  efficiency_drop_per_cooling_type: # given as factors to multiply with given efficiency
+  # taken from http://dx.doi.org/10.1016/j.gloenvcha.2014.01.005 with the assumption, that once-through is the given efficiency
+    once-through: 1
+    closed-loop: 0.9741
+    dry-cooling: 0.9421
+aggregateNodes: False
+nodesToAggregate: {"BL0 0": ["EE6 0", "LT6 0", "LV6 0"], "BK0 0": ["AL1 0", "BA1 0", "HR1 0", "RS1 0", "ME1 0", "MK1 0"], "ES0 0": ["ES1 0", "ES4 0"], "LB0 0": ["BE1 0", "LU1 0"], "DK0 0": ["DK1 0", "DK2 0"], "IT0 0": ["IT1 0", "IT3 0"], "GB1 0": ["GB0 0", "GB5 0"]}

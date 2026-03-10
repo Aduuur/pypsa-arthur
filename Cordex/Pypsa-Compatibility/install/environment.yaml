@@ -1,0 +1,40 @@
+#####################
+# DEPRECATION WARNING
+# This file is deprecated and will be removed in a future release.
+#####################
+
+name: cd2es
+channels:
+- conda-forge
+- bioconda
+- pytorch
+- defaults
+dependencies:
+- python=3.12.5
+
+# Dependencies of the workflow itself
+- openpyxl=3.1.5
+- snakemake-minimal=8.18.1 # at least > 8.0.0
+- yaml=0.2.5
+- numpy=1.26.4 # must be < 2.0
+- pandas=2.2.2
+- geopandas=1.0.1 # at least >=0.11.0
+- xarray=2024.2.0 # must be < 2024.3.0
+- scipy=1.14.0
+- shapely=2.0.6
+- matplotlib=3.9.2
+- esgf-pyclient=0.3.1
+- cftime=1.6.4
+- cdsapi=0.7.1 # at least >=0.7.0
+- netcdf4=1.7.1
+- pip=24.2
+# ML
+- pytorch
+- torchvision
+- torchaudio
+- cpuonly
+- scikit-learn
+
+- pip:
+  - timeout_function_decorator==2.0.0
+  - dask

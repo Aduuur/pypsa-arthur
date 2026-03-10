@@ -1,0 +1,35 @@
+workflow:
+  rules:
+    - when: never
+
+image: continuumio/miniconda3:latest
+
+stages:
+ - initialize
+ - test
+
+make_env: 
+  stage: initialize
+  script:
+    # init bash on the runner
+    - /opt/miniconda3/bin/conda init bash
+    - source ~/.bashrc
+    - cd install
+    - conda env remove --name cd2es -y || true
+    - bash install.sh
+    - python -V
+    - which python
+    - echo "success"
+
+run_for_one_year:
+  stage: test
+  needs: [make_env]
+  script:
+    - source activate cd2es
+    - which python
+    # remove remainders from previous runs
+    - rm -rf results
+    # use the test config file
+    - cp tests/config_test.yaml config.yaml
+    - cdsUrl=$cdsUrl cdsKey=$cdsKey snakemake --cores all --resources mem_mb=8000
+
