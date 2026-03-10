@@ -1,112 +1,162 @@
 """
-Batch-Verarbeitung für mehrere Länder und Szenarien
+Batch-Verarbeitung für mehrere Länder und Szenarien.
+Verwendet master_config.py als Single Source of Truth.
 """
 
-from country_analysis_myopic import MyopicCountryAnalyzer
+from __future__ import annotations
+
 from pathlib import Path
-import yaml
-from typing import Dict, List
+from typing import Dict, List, Optional
+
+from master_config import MasterConfig, PlottingConfig, AROPlottingConfig
+from country_analysis_myopic import MyopicCountryAnalyzer
 
 
 class BatchMyopicAnalyzer:
-    """Batch-Verarbeitung für Myopic-Analysen"""
+    """
+    Batch-Verarbeitung für myopische/normale Analysen über mehrere
+    Szenarien und Länder. Liest Konfiguration aus master_config.py.
+    """
 
-    def __init__(self, config_file: str = "batch_config.yaml"):
-        self.config_file = config_file
-        self.config = self.load_config()
+    def __init__(
+        self,
+        master: Optional[MasterConfig] = None,
+        countries: Optional[List[str]] = None,
+        years: Optional[List[int]] = None,
+        output_base_dir: Optional[str] = None,
+        create_detailed_plots: bool = False,
+        create_comparison_plots: bool = True,
+    ):
+        self.master   = master or MasterConfig()
+        self.plot_cfg = PlottingConfig(master=self.master)
 
-    def load_config(self) -> Dict:
-        """Lädt Konfiguration aus YAML-Datei"""
-        if Path(self.config_file).exists():
-            with open(self.config_file, 'r') as f:
-                return yaml.safe_load(f)
-        else:
-            # Standard-Konfiguration erstellen
-            default_config = {
-                'scenarios': {
-                    'base_scenario': {
-                        'base_path': 'results/networks/base_s_37_',
-                        'description': 'Base scenario with 37 nodes'
-                    }
-                },
-                'countries': ['DE', 'FR', 'ES', 'IT'],
-                'years': [2030, 2040, 2050],
-                'output_base_dir': 'batch_results',
-                'create_detailed_plots': False,
-                'create_comparison_plots': True
-            }
+        self.countries    = countries or self.plot_cfg.get_countries()
+        self.years        = years
+        self.output_base  = Path(output_base_dir or self.plot_cfg.BASE_SAVE_PATH) / "batch_results"
+        self.create_detailed_plots  = create_detailed_plots
+        self.create_comparison_plots = create_comparison_plots
 
-            with open(self.config_file, 'w') as f:
-                yaml.dump(default_config, f, default_flow_style=False)
+    def _get_all_normal_scenarios(self) -> Dict[str, List[str]]:
+        """
+        Gibt alle Szenarien mit run_type='normal' aus dem Registry zurück.
+        Format: {scenario_key: [network_paths]}
+        """
+        reg = self.master.scenarios_registry
+        result = {}
+        for key, entry in reg.items():
+            if self.master.get_run_type(key) == "normal":
+                if isinstance(entry, dict):
+                    result[key] = list(entry.get("networks", []))
+                elif isinstance(entry, list):
+                    result[key] = list(entry)
+        return result
 
-            print(f"Standard-Konfiguration erstellt: {self.config_file}")
-            print("Bitte anpassen und erneut ausführen.")
-            return default_config
+    def run_batch_analysis(self) -> Dict:
+        """Führt Batch-Analyse für alle normalen Szenarien und Länder durch."""
+        scenarios = self._get_all_normal_scenarios()
 
-    def run_batch_analysis(self):
-        """Führt Batch-Analyse für alle konfigurierten Szenarien und Länder durch"""
+        if not scenarios:
+            print("Keine normalen (non-ARO) Szenarien im registry gefunden.")
+            return {}
+
         results = {}
 
-        for scenario_name, scenario_config in self.config['scenarios'].items():
+        for scenario_name, network_paths in scenarios.items():
             print(f"\n{'=' * 60}")
-            print(f"SZENARIO: {scenario_name}")
-            print(f"Beschreibung: {scenario_config.get('description', 'Keine Beschreibung')}")
+            print(f"SZENARIO: {scenario_name}  ({len(network_paths)} Netzwerke)")
             print(f"{'=' * 60}")
 
             scenario_results = {}
 
-            for country in self.config['countries']:
-                print(f"\nAnalysiere {country} für Szenario {scenario_name}...")
+            for country in self.countries:
+                print(f"\n  Analysiere {country} für Szenario {scenario_name}...")
 
+                # Versuche MyopicCountryAnalyzer (multi-year)
+                # Fallback auf CountryAnalyzer pro Netzwerk
                 try:
-                    output_dir = Path(self.config['output_base_dir']) / scenario_name / f"analysis_{country}"
+                    # Gemeinsamer Basispfad ermitteln (für MyopicCountryAnalyzer)
+                    if network_paths:
+                        import re
+                        # Versuche Basispfad herauszufiltern (alles vor dem Jahr)
+                        base_path = re.sub(r"_?(?:base_s_\d+_+)?\d{4}\.nc$", "", network_paths[0])
+                        output_dir = self.output_base / scenario_name / f"analysis_{country}"
 
-                    analyzer = MyopicCountryAnalyzer(
-                        network_base_path=scenario_config['base_path'],
-                        country=country,
-                        years=self.config.get('years'),
-                        output_dir=str(output_dir)
-                    )
+                        analyzer = MyopicCountryAnalyzer(
+                            network_base_path=base_path,
+                            country=country,
+                            years=self.years,
+                            output_dir=str(output_dir),
+                        )
+                        analyzer.generate_all_myopic_plots(save=True)
 
-                    # Myopic-Plots erstellen
-                    analyzer.generate_all_myopic_plots(save=True)
+                        if self.create_detailed_plots:
+                            for year in (self.years or analyzer.years):
+                                analyzer.analyze_single_year(year, create_detailed_plots=True)
 
-                    # Optional: Detailplots für einzelne Jahre
-                    if self.config.get('create_detailed_plots', False):
-                        for year in analyzer.years:
-                            analyzer.analyze_single_year(year, create_detailed_plots=True)
-
-                    scenario_results[country] = analyzer
-                    print(f"✓ {country} erfolgreich analysiert")
+                        scenario_results[country] = analyzer
+                        print(f"  ✓ {country}")
 
                 except Exception as e:
-                    print(f"✗ Fehler bei {country}: {e}")
-                    scenario_results[country] = None
+                    print(f"  ✗ {country} (MyopicCountryAnalyzer): {e}")
+                    # Fallback: einzelne Netzwerke per CountryAnalyzer
+                    from country_analysis import CountryAnalyzer
+                    for net_path in network_paths:
+                        if not Path(net_path).is_file():
+                            continue
+                        try:
+                            import re
+                            m = re.search(r"(\d{4})\.nc$", net_path)
+                            tag = m.group(1) if m else Path(net_path).stem
+                            out_dir = self.output_base / scenario_name / f"analysis_{country}" / tag
+                            ca = CountryAnalyzer(
+                                network_path=net_path,
+                                country=country,
+                                output_dir=str(out_dir),
+                                carrier_colors=self.plot_cfg.CARRIER_COLORS,
+                                default_color=self.plot_cfg.DEFAULT_COLOR,
+                            )
+                            ca.summary_report()
+                            ca.generate_all_plots(save=True)
+                            print(f"  ✓ {country} ({tag}) [Fallback]")
+                        except Exception as e2:
+                            print(f"  ✗ {country} ({net_path}): {e2}")
 
             results[scenario_name] = scenario_results
 
-        # Vergleichsplots zwischen Ländern erstellen
-        if self.config.get('create_comparison_plots', True):
-            self.create_comparison_plots(results)
+        if self.create_comparison_plots:
+            self.create_comparison_plots_fn(results)
 
         return results
 
-    def create_comparison_plots(self, results: Dict):
-        """Erstellt Vergleichsplots zwischen Ländern und Szenarien"""
+    def create_comparison_plots_fn(self, results: Dict):
+        """Erstellt Vergleichsplots zwischen Ländern und Szenarien."""
         print(f"\n{'=' * 40}")
         print("ERSTELLE VERGLEICHSPLOTS")
         print(f"{'=' * 40}")
-
-        # Implementierung folgt...
-        # Hier könnten Sie Plots erstellen, die verschiedene Länder
-        # oder Szenarien miteinander vergleichen
-
+        # Erweiterbar: z.B. installierte Kapazitäten über Szenarien vergleichen
         pass
 
 
 def main():
-    batch_analyzer = BatchMyopicAnalyzer()
-    batch_analyzer.run_batch_analysis()
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--countries", default=None, help="Komma-getrennte Länder")
+    ap.add_argument("--years",     default=None, help="Komma-getrennte Jahre")
+    ap.add_argument("--output",    default=None, help="Output-Verzeichnis")
+    ap.add_argument("--detailed",  action="store_true")
+    args = ap.parse_args()
+
+    countries = [x.strip() for x in args.countries.split(",")] if args.countries else None
+    years     = [int(x)    for x in args.years.split(",")]     if args.years     else None
+
+    analyzer = BatchMyopicAnalyzer(
+        countries=countries,
+        years=years,
+        output_base_dir=args.output,
+        create_detailed_plots=args.detailed,
+    )
+    analyzer.run_batch_analysis()
 
 
 if __name__ == "__main__":
