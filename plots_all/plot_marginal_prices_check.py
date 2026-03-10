@@ -61,11 +61,12 @@ print(f"⚠️ {len(highprice_hours)} Hochpreisstunden gefunden:\n{highprice_hou
 de_loads = n.loads.index[n.loads.bus.isin(de_buses)]
 
 # Last in MW
-load_DE = n.loads_t.p_set[de_loads].sum(axis=1)
-
+de_loads_in_ts = de_loads.intersection(n.loads_t.p_set.columns)
+load_DE = n.loads_t.p_set[de_loads_in_ts].sum(axis=1)
 # Erzeugung (MW)
-gen_DE = n.generators_t.p[n.generators.bus.isin(de_buses)].sum(axis=1)
-
+de_gens = n.generators.index[n.generators.bus.isin(de_buses)]
+de_gens = de_gens.intersection(n.generators_t.p.columns)
+gen_DE = n.generators_t.p[de_gens].sum(axis=1)
 # Speicherstände
 store_DE = n.stores[n.stores.bus.isin(de_buses)]
 storage_states = n.stores_t.state_of_charge[store_DE.index] if not store_DE.empty else pd.DataFrame()

@@ -23,10 +23,25 @@ from config_final import PlottingConfig
 # =====================================================================
 # --- Zeiträume ---
 # =====================================================================
-DETAIL_START = "2005-01-10"
-DETAIL_END   = "2005-02-15"
-YEAR_START   = "2005-01-01"
-YEAR_END     = "2005-12-31"
+# NEU — Konstanten löschen, stattdessen in plot_generation() oben einfügen:
+def plot_generation(df, year_label, country, config: PlottingConfig, network_path: str):
+    if df.empty:
+        print(f"⚠️ Keine Erzeugung für {country} ({year_label})")
+        return
+
+    # ← NEU: Jahr dynamisch aus dem DataFrame-Index
+    sim_year   = df.index[0].year
+    detail_start = f"{sim_year}-01-10"
+    detail_end   = f"{sim_year}-02-15"
+    year_start   = f"{sim_year}-01-01"
+    year_end     = f"{sim_year}-12-31"
+
+    df_detail = df.loc[detail_start:detail_end]
+    if df_detail.empty:
+        print(f"⚠️ Keine Daten im Detailzeitraum für {country} ({year_label}), skip.")
+        return
+
+
 
 # =====================================================================
 # --- Linkfilter & Bus-Erkennung ---
