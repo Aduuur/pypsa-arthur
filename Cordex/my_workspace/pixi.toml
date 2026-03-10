@@ -1,0 +1,10 @@
+[workspace]
+authors = ["arthur <rolfarth@yahoo.de>"]
+channels = ["conda-forge"]
+name = "my_workspace"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]

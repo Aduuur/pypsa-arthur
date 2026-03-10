@@ -660,6 +660,7 @@ def _fix_distribution_grid(n: pypsa.Network) -> None:
         peak = bus_peak.get(bus1, 0.0)
         if peak > 0:
             n.links.at[link_name, "p_nom"] = peak
+            n.links.at[link_name, "p_nom_min"] = peak  # [DIST-GRID-FIX] lower bound for extendable
             fixed += 1
 
     logger.info(

@@ -338,7 +338,7 @@ renewable:
     natura: true
     ship_threshold: 400
     max_depth: 60
-    min_shore_distance: 30000
+    min_shore_distance: 3000
     excluder_resolution: 200
     clip_p_max_pu: 1.e-2
     landfall_length: 30
