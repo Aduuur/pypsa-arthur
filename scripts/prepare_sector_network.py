@@ -6009,6 +6009,134 @@ def lossy_bidirectional_links(n, carrier, efficiencies={}):
             -compression_per_1000km * n.links.loc[carrier_i, "length_original"] / 1e3
         )
 
+def apply_plain_run_biomass_guards(n, config, planning_horizon):
+    """
+    Guardrails für plain-runs:
+    - verhindert, dass Rohstoff-/Brennstoff-Supply-Generatoren als echte Ausbaukapazitäten interpretiert werden
+    - kappt unrealistische e_sum_max-Skalierungen
+    - setzt konservative Grenzen für Biomasse-Supply-Komponenten
+    """
+
+    import numpy as np
+    import pandas as pd
+
+    # nur für plain mode
+    workflow_mode = config.get("workflow", {}).get("mode", "plain")
+    if workflow_mode != "plain":
+        return n
+
+    # Planungshorizont robust lesen
+    try:
+        horizon = int(planning_horizon)
+    except Exception:
+        horizon = None
+
+    biomass_year_cfg = config.get("biomass", {}).get("year", horizon)
+
+    if isinstance(biomass_year_cfg, dict):
+        # YAML-Mapping: keys können int oder str sein
+        if horizon is not None:
+            biomass_year = biomass_year_cfg.get(horizon, biomass_year_cfg.get(str(horizon), horizon))
+        else:
+            biomass_year = horizon
+
+    elif isinstance(biomass_year_cfg, (int, float)):
+        biomass_year = int(biomass_year_cfg)
+
+    elif isinstance(biomass_year_cfg, str):
+        # Falls versehentlich doch als String eingelesen
+        biomass_year_cfg = biomass_year_cfg.strip()
+        if biomass_year_cfg.isdigit():
+            biomass_year = int(biomass_year_cfg)
+        else:
+            logger.warning(
+                "biomass.year was parsed as string '%s'; falling back to planning horizon %s",
+                biomass_year_cfg,
+                horizon,
+            )
+            biomass_year = horizon
+    else:
+        biomass_year = horizon
+
+    # Gewichtete Stunden des Modelljahres
+    hours = float(n.snapshot_weightings.generators.sum())
+    if hours <= 0:
+        hours = 8760.0
+
+    # Brennstoff-/Primärträger, die NICHT als "echte Kraftwerkskapazität" gelesen werden sollen
+    supply_like_carriers = [
+        "solid biomass",
+        "biogas",
+        "oil primary",
+        "coal",
+        "lignite",
+        "gas",
+        "uranium",
+    ]
+
+    if not n.generators.empty and "carrier" in n.generators.columns:
+        mask = n.generators.carrier.isin(supply_like_carriers)
+
+        if mask.any():
+            # 1) Diese Komponenten nicht als echte ausbaubare Kapazitäten behandeln
+            n.generators.loc[mask, "p_nom_extendable"] = False
+
+            # 2) Falls e_sum_max vorhanden ist, daraus eine sinnvolle obere Leistung ableiten
+            if "e_sum_max" in n.generators.columns:
+                emax = n.generators.loc[mask, "e_sum_max"].fillna(np.nan)
+
+                # großzügige Umrechnung von Jahresenergie -> maximale Leistung
+                # Faktor 4 erlaubt gewisse Flexibilität über den Jahresmittelwert hinaus
+                p_nom_guard = (emax / hours) * 4.0
+
+                # fallback, falls e_sum_max fehlt oder kaputt ist
+                p_nom_guard = p_nom_guard.replace([np.inf, -np.inf], np.nan).fillna(1e3)
+
+                # minimale und maximale Schranken
+                p_nom_guard = p_nom_guard.clip(lower=1.0, upper=5e5)
+
+                n.generators.loc[mask, "p_nom"] = p_nom_guard
+                n.generators.loc[mask, "p_nom_min"] = n.generators.loc[mask, "p_nom"]
+                n.generators.loc[mask, "p_nom_max"] = n.generators.loc[mask, "p_nom"]
+
+            # 3) Kapital- und Grenzkosten absichern
+            if "capital_cost" in n.generators.columns:
+                n.generators.loc[mask, "capital_cost"] = n.generators.loc[mask, "capital_cost"].fillna(0.0)
+
+            if "marginal_cost" in n.generators.columns:
+                n.generators.loc[mask, "marginal_cost"] = n.generators.loc[mask, "marginal_cost"].fillna(0.0)
+
+    # Stores für Biomasse ebenfalls absichern
+    if not n.stores.empty and "carrier" in n.stores.columns:
+        store_mask = n.stores.carrier.isin(["biomass"])
+
+        if store_mask.any():
+            # keine unendlichen Energiemengen
+            if "e_nom_max" in n.stores.columns:
+                n.stores.loc[store_mask, "e_nom_max"] = (
+                    n.stores.loc[store_mask, "e_nom_max"]
+                    .replace([np.inf, -np.inf], np.nan)
+                    .fillna(5e6)
+                    .clip(upper=5e6)
+                )
+
+            if "e_nom_extendable" in n.stores.columns:
+                n.stores.loc[store_mask, "e_nom_extendable"] = False
+
+            if "e_nom" in n.stores.columns and "e_nom_max" in n.stores.columns:
+                n.stores.loc[store_mask, "e_nom"] = n.stores.loc[store_mask, "e_nom_max"]
+
+    # Logging
+    try:
+        logger.info(
+            "Applied plain-run biomass guards for planning_horizon=%s, biomass_year=%s",
+            horizon,
+            biomass_year,
+        )
+    except Exception:
+        pass
+
+    return n
 
 def add_enhanced_geothermal(
     n,
@@ -6721,5 +6849,8 @@ if __name__ == "__main__":
 
     sanitize_carriers(n, snakemake.config)
     sanitize_locations(n)
+
+    planning_horizon = snakemake.wildcards.planning_horizons
+    n = apply_plain_run_biomass_guards(n, snakemake.config, planning_horizon)
 
     n.export_to_netcdf(snakemake.output[0])

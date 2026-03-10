@@ -1757,7 +1757,6 @@ def _ensure_load_shedding_generators(
         if load_gens:
             # FIX: Setze p_nom und p_nom_max basierend auf Peak-Load
             p_nom_map = _compute_ls_p_nom_per_bus(n)
-
             for gen in load_gens:
                 bus = n.generators.loc[gen, 'bus']
                 p_nom_bus = p_nom_map.get(str(bus), 100.0)
@@ -1765,7 +1764,6 @@ def _ensure_load_shedding_generators(
                 n.generators.loc[gen, 'p_nom_max'] = p_nom_bus
                 n.generators.loc[gen, 'p_nom_extendable'] = False
                 n.generators.loc[gen, 'marginal_cost'] = marginal_cost
-
             logger.info("Fixed %d existing 'load' generators: set p_nom from peak load.", len(load_gens))
             _ensure_ls_pmax_timeseries(n, load_gens)
             return load_gens
@@ -1792,7 +1790,7 @@ def _ensure_load_shedding_generators(
     )
     ls_names: List[str] = []
     for bus in n.buses.index:
-        name  = f"LS::{bus}"
+        name = f"LS::{bus}"
         p_nom_bus = p_nom_map.get(str(bus), 100.0)
         ls_names.append(name)
         n.add(
@@ -2999,6 +2997,35 @@ def _fix_unbounded_infrastructure(n: pypsa.Network) -> Dict[str, int]:
             count_sb = int(solid_big.sum())
             fixed["generators::solid_biomass_pnom"] = count_sb
             logger.info("[INFRA-FIX] Converted %d solid biomass p_nom MWh→MW (÷8760). ", count_sb)
+
+        # [BIOMASS-STORE-FIX] Solid biomass Stores haben e_nom_max=inf.
+        # e_nom_max = ENSPRESO Jahrespotenzial (MWh) = p_nom_raw der korrespondierenden Gens
+        # (vor der ÷8760 Korrektur). Wir lesen die bereits korrigierten p_nom zurück × 8760.
+        solid_store_mask = n.stores.carrier.str.lower() == "biomass"
+        if solid_store_mask.any():
+            solid_store_inf = solid_store_mask & (n.stores.e_nom_max.fillna(np.inf).apply(np.isinf))
+            if solid_store_inf.any():
+                for store_name in n.stores.index[solid_store_inf]:
+                    region = store_name.replace(" solid biomass Store", "")
+                    matching = n.generators[
+                        n.generators.index.str.startswith(region)
+                        & (n.generators.carrier.str.lower() == "solid biomass")
+                    ]
+                    if len(matching) > 0:
+                        # p_nom wurde bereits ÷8760 korrigiert → ×8760 = Jahrespotenzial MWh
+                        e_nom_max = float(matching.p_nom.sum() * 8760.0)
+                    else:
+                        e_nom_max = 1e9  # Fallback: 1 TWh
+                    n.stores.at[store_name, "e_nom_max"] = e_nom_max
+                count_ss = int(solid_store_inf.sum())
+                fixed["stores::solid_biomass_e_nom_max"] = count_ss
+                logger.info(
+                    "[INFRA-FIX] Set e_nom_max for %d solid biomass Stores "
+                    "from ENSPRESO annual potential. Range: [%.2e, %.2e] MWh.",
+                    count_ss,
+                    n.stores.loc[solid_store_inf, "e_nom_max"].min(),
+                    n.stores.loc[solid_store_inf, "e_nom_max"].max(),
+                )
         # [BIOGAS-FIX] Biogas p_nom und p_nom_max cappen
         # ENSPRESO speichert Energiepotenziale (MWh) faelschlich als p_nom (MW)
         # z.B. FR0: 7.1e7 MWh -> wird als 71 TW Kapazitaet interpretiert

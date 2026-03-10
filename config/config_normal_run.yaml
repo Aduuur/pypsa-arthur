@@ -527,7 +527,15 @@ energy:
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#biomass
 biomass:
-  year: 2030
+  year:
+    2020:2020 
+    2025:2025 
+    2030:2030 
+    2035:2035
+    2040:2040 
+    2045:2045
+    2050:2050
+
   scenario: ENS_Med
   classes:
     solid biomass:
@@ -905,7 +913,7 @@ sector:
   gas_network_connectivity_upgrade: 1
   gas_distribution_grid: true
   gas_distribution_grid_cost_factor: 1.0
-  biomass_spatial: true
+  biomass_spatial: false
   biomass_transport: false
   biogas_upgrading: true
   biogas_upgrading_cc: false
