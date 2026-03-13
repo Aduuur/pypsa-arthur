@@ -179,6 +179,7 @@ rule solve_aro:
         network=str(OUT_NETWORK),
         summary=str(OUT_SUMMARY),
         std_network=str(OUT_NETWORK_STD),
+        dispatch_dir=directory(str(RESULTS_DIR / "networks" / "dispatch")),
     log:
         str(RESULTS_DIR / "logs" / "solve_aro.log"),
     params:
@@ -216,6 +217,7 @@ rule solve_aro:
           --convergence-tol {params.convergence_tol} \
           --dispatch-workers {params.dispatch_workers} \
           --max-master-size {params.max_master_size} \
+          --out-dispatch-dir {output.dispatch_dir} \
            2>&1 | tee {log}  
         """
 

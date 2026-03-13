@@ -33,7 +33,7 @@ def _mkdir(p: Union[str, Path]) -> Path:
 # -----------------------------------------------------------------------------
 # RUN NAME
 # -----------------------------------------------------------------------------
-RUN_NAME: str = _env("RUN_NAME", "test-normal-run-45")  # type: ignore[assignment]
+RUN_NAME: str = _env("RUN_NAME", "test-aro-2")  # type: ignore[assignment]
 
 
 # -----------------------------------------------------------------------------

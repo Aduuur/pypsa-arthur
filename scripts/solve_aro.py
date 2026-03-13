@@ -511,6 +511,8 @@ def parse_args() -> argparse.Namespace:
                    help="[FIX-1] Worst-Case-Dispatch (DatetimeIndex NetCDF).")
     p.add_argument("--dispatch-tmp-dir", default=None,
                    help="Verzeichnis für temporäre Dispatch-Netze.")
+    p.add_argument("--out-dispatch-dir", default=None,
+                   help="Verzeichnis zum Speichern ALLER Dispatch-Netze (final eval). Worst-Case erhält Suffix _worst_case.")
 
     # Cost consistency
     p.add_argument("--cost-consistency-tol", type=float, default=0.01,
@@ -1005,6 +1007,30 @@ def main() -> None:
             )
 
     # =========================================================================
+    # [FIX-DISPATCH] Save ALL final dispatch networks
+    # =========================================================================
+    if args.out_dispatch_dir:
+        import shutil
+        out_d = Path(args.out_dispatch_dir)
+        out_d.mkdir(parents=True, exist_ok=True)
+        for cutout_name, flat_src in final_dispatch_paths.items():
+            std_src = final_dispatch_std_paths.get(cutout_name)
+            suffix = "_worst_case" if cutout_name == worst_final else ""
+            safe_name = cutout_name.replace("/", "_").replace(" ", "_")
+            # flat
+            if flat_src and Path(flat_src).exists():
+                dst = out_d / f"dispatch_{safe_name}{suffix}_flat.nc"
+                shutil.copy2(flat_src, dst)
+                logger.info("[DISPATCH-SAVE] flat: %s -> %s", cutout_name, dst)
+            # std
+            if std_src and Path(std_src).exists():
+                dst = out_d / f"dispatch_{safe_name}{suffix}_std.nc"
+                shutil.copy2(std_src, dst)
+                logger.info("[DISPATCH-SAVE] std:  %s -> %s", cutout_name, dst)
+        logger.info("[DISPATCH-SAVE] Saved %d dispatch networks to %s",
+                    len(final_dispatch_paths), out_d)
+
+    # =========================================================================
     # [FIX-3] Standard-Adapter Portfolio
     # =========================================================================
 
@@ -1022,8 +1048,11 @@ def main() -> None:
     # =========================================================================
     # [OPT-2] Finale Cleanup
     # =========================================================================
-    if dispatch_tmp_final:
+    if dispatch_tmp_final and not args.out_dispatch_dir:
         _cleanup_iter_files(dispatch_tmp_final)
+    elif dispatch_tmp_final and args.out_dispatch_dir:
+        logger.info("[DISPATCH-SAVE] Keeping final tmp dir until after copy: %s", dispatch_tmp_final)
+        _cleanup_iter_files(dispatch_tmp_final)  # cleanup after copy above
     _cleanup_iter_files(dispatch_tmp_base)
 
     # =========================================================================
