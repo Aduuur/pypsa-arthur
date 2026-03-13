@@ -85,49 +85,143 @@ class AROAnalyzer:
         print(f"ARO Summary geladen: {summary_path}")
         print(f"  Iterationen: {iters}  |  Finale Szenarien: {len(self.scenarios)}")
 
+    # ------------------------------------------------------------------
+    # Dispatch-Pfad-Suche (FIX: networks/dispatch/ statt _dispatch_tmp/final/)
+    # ------------------------------------------------------------------
+
+    def _dispatch_dir(self) -> Optional[Path]:
+        """
+        Persistentes Dispatch-Verzeichnis:
+          results/<run>/networks/dispatch/
+        (= Snakemake output.dispatch_dir aus rule solve_aro)
+        Dateibenennung durch solve_aro.py:
+          dispatch_{safe_name}_worst_case_std.nc   <- Worst-Case
+          dispatch_{safe_name}_std.nc              <- alle anderen
+          dispatch_{safe_name}_worst_case_flat.nc
+          dispatch_{safe_name}_flat.nc
+        """
+        base = Path(self.config.BASE_RESULTS_PATH)
+        run_name = self.run_config.get("name", "")
+        if not run_name:
+            return None
+        d = base / run_name / "networks" / "dispatch"
+        return d if d.is_dir() else None
+
+    def _dispatch_tmp_dir(self) -> Optional[Path]:
+        """
+        Fallback: temporäres Verzeichnis (_dispatch_tmp/final/).
+        Nur vorhanden wenn solve_aro noch läuft oder --out-dispatch-dir nicht gesetzt war.
+        """
+        base = Path(self.config.BASE_RESULTS_PATH)
+        run_name = self.run_config.get("name", "")
+        if not run_name:
+            return None
+        d = base / run_name / "networks" / "_dispatch_tmp" / "final"
+        return d if d.is_dir() else None
+
+    def _safe_name(self, scenario_name: str) -> str:
+        """Repliziert die safe_name-Logik aus solve_aro.py."""
+        return scenario_name.replace("/", "_").replace(" ", "_")
+
     def _auto_find_dispatch_for_scenario(self, scenario_name: str) -> Optional[Path]:
         """
-        Sucht Dispatch-Netzwerk für ein bestimmtes Szenario.
-        Erwartet: <aro_results_base>/<run>/ networks/_dispatch_tmp/final/dispatch_<scenario>*.nc
+        Sucht das Dispatch-Netzwerk für ein bestimmtes Szenario.
+
+        Suchpfade (in dieser Reihenfolge):
+        1. results/<run>/networks/dispatch/dispatch_{safe_name}_std.nc       (bevorzugt)
+        2. results/<run>/networks/dispatch/dispatch_{safe_name}_flat.nc
+        3. results/<run>/networks/dispatch/dispatch_{safe_name}*.nc          (glob-Fallback)
+        4. results/<run>/networks/_dispatch_tmp/final/dispatch_{safe_name}*.nc (Rückwärtskompatibilität)
         """
-        base = Path(self.config.BASE_RESULTS_PATH)
-        run_name = self.run_config.get("name", "")
-        if not run_name:
-            return None
-        cand_dir = base / run_name / "networks" / "_dispatch_tmp" / "final"
-        if not cand_dir.is_dir():
-            return None
+        safe = self._safe_name(scenario_name)
 
-        # Suche nach Szenario-Namen im Dateinamen
-        candidates = sorted(cand_dir.glob(f"dispatch_*{scenario_name}*.nc"))
-        if candidates:
-            return candidates[0]
+        # 1+2+3: persistentes dispatch/-Verzeichnis (Snakemake output.dispatch_dir)
+        d = self._dispatch_dir()
+        if d is not None:
+            for suffix in (f"dispatch_{safe}_std.nc", f"dispatch_{safe}_flat.nc"):
+                p = d / suffix
+                if p.is_file():
+                    return p
+            # glob-Fallback (z.B. wenn safe_name leicht abweicht)
+            candidates = sorted(d.glob(f"dispatch_*{safe}*.nc"))
+            # Bevorzuge _std.nc vor _flat.nc
+            std_cands = [c for c in candidates if "_std.nc" in c.name]
+            if std_cands:
+                return std_cands[0]
+            if candidates:
+                return candidates[0]
 
-        # Breitere Suche (scenario_name kann Pfad-Teile enthalten)
-        short = Path(scenario_name).stem if "/" in scenario_name or "\\" in scenario_name else scenario_name
-        candidates = sorted(cand_dir.glob(f"dispatch_*{short}*.nc"))
-        return candidates[0] if candidates else None
+        # 4: temporäres Verzeichnis (Rückwärtskompatibilität)
+        tmp = self._dispatch_tmp_dir()
+        if tmp is not None:
+            short = (
+                Path(scenario_name).stem
+                if ("/" in scenario_name or "\\" in scenario_name)
+                else scenario_name
+            )
+            for pattern in (f"dispatch_*{safe}*.nc", f"dispatch_*{short}*.nc"):
+                candidates = sorted(tmp.glob(pattern))
+                if candidates:
+                    return candidates[0]
+
+        return None
 
     def _auto_find_any_dispatch(self) -> Optional[Path]:
-        """Fallback: letztes Dispatch-Netzwerk im final-Ordner."""
-        base = Path(self.config.BASE_RESULTS_PATH)
-        run_name = self.run_config.get("name", "")
-        if not run_name:
-            return None
-        cand_dir = base / run_name / "networks" / "_dispatch_tmp" / "final"
-        if not cand_dir.is_dir():
-            return None
-        candidates = sorted(cand_dir.glob("dispatch_*.nc"))
-        if not candidates:
-            return None
+        """
+        Fallback: findet das Worst-Case-Dispatch-Netzwerk.
 
-        # Bevorzuge worst_case_cutout aus summary
+        Bevorzugt explizit das _worst_case_std.nc aus networks/dispatch/,
+        dann _worst_case_flat.nc, dann irgend ein dispatch_*.nc.
+        """
         worst = self.aro_summary.get("aro_final_evaluation", {}).get("worst_case_cutout")
-        if worst:
-            for p in candidates:
-                if str(worst) in p.name:
-                    return p
-        return candidates[-1]
+
+        # 1. Persistentes dispatch/-Verzeichnis
+        d = self._dispatch_dir()
+        if d is not None:
+            if worst:
+                safe = self._safe_name(str(worst))
+                for suffix in (
+                    f"dispatch_{safe}_worst_case_std.nc",
+                    f"dispatch_{safe}_worst_case_flat.nc",
+                    f"dispatch_{safe}_std.nc",
+                    f"dispatch_{safe}_flat.nc",
+                ):
+                    p = d / suffix
+                    if p.is_file():
+                        return p
+                # glob-Fallback mit worst_case im Namen
+                candidates = sorted(d.glob(f"dispatch_*{safe}*worst_case*.nc"))
+                if candidates:
+                    return candidates[0]
+
+            # Kein worst_cutout bekannt → nimm irgendeinen worst_case
+            wc_cands = sorted(d.glob("dispatch_*_worst_case_std.nc"))
+            if wc_cands:
+                return wc_cands[0]
+            wc_cands = sorted(d.glob("dispatch_*_worst_case*.nc"))
+            if wc_cands:
+                return wc_cands[0]
+            # Letzter Ausweg: irgendeinen _std.nc
+            all_std = sorted(d.glob("dispatch_*_std.nc"))
+            if all_std:
+                return all_std[-1]
+            all_nc = sorted(d.glob("dispatch_*.nc"))
+            if all_nc:
+                return all_nc[-1]
+
+        # 2. Fallback: temporäres Verzeichnis (Rückwärtskompatibilität)
+        tmp = self._dispatch_tmp_dir()
+        if tmp is not None:
+            candidates = sorted(tmp.glob("dispatch_*.nc"))
+            if not candidates:
+                return None
+            if worst:
+                for p in candidates:
+                    if str(worst) in p.name:
+                        return p
+            return candidates[-1]
+
+        return None
 
     def load_networks(self, auto_find_dispatch: bool = True):
         """
@@ -154,7 +248,7 @@ class AROAnalyzer:
             explicit = _safe_path(dispatch_paths.get(scenario))
             chosen = _first_existing([explicit])
 
-            # 2. Auto-Suche
+            # 2. Auto-Suche (primär in networks/dispatch/)
             if chosen is None and auto_find_dispatch:
                 chosen = self._auto_find_dispatch_for_scenario(scenario)
 
@@ -178,7 +272,7 @@ class AROAnalyzer:
             self.n_worst_case = pypsa.Network(str(chosen_wc))
             print(f"Worst-Case Dispatch geladen: {len(self.n_worst_case.snapshots)} Snapshots ({chosen_wc.name})")
         elif self.scenario_networks:
-            # Fallback: teuerste Szenario als worst case
+            # Fallback: teuerstes Szenario als worst case
             all_costs = self.aro_summary.get("aro_final_evaluation", {}).get("all_costs", {})
             if all_costs:
                 worst_key = max(all_costs, key=lambda k: all_costs[k])
@@ -257,10 +351,10 @@ class AROAnalyzer:
         if isinstance(final_eval, dict):
             all_costs = final_eval.get("all_costs", {})
             if all_costs:
-                costs_list    = list(all_costs.values())
+                costs_list     = list(all_costs.values())
                 scenarios_list = list(all_costs.keys())
-                final_set     = set(self.aro_summary.get("aro_final_scenarios", []))
-                bar_colors    = ["red" if s in final_set else "steelblue" for s in scenarios_list]
+                final_set      = set(self.aro_summary.get("aro_final_scenarios", []))
+                bar_colors     = ["red" if s in final_set else "steelblue" for s in scenarios_list]
                 axes[1, 1].bar(range(len(costs_list)), costs_list, color=bar_colors, tick_label=scenarios_list)
                 worst_total = final_eval.get("worst_case_total_cost")
                 if worst_total is not None:
@@ -292,11 +386,11 @@ class AROAnalyzer:
             print("aro_final_evaluation.all_costs fehlt/leer")
             return
 
-        sorted_costs   = dict(sorted(final_costs.items(), key=lambda x: x[1]))
-        scenarios      = list(sorted_costs.keys())
-        costs          = list(sorted_costs.values())
-        final_set      = set(self.aro_summary.get("aro_final_scenarios", []))
-        bar_colors     = ["red" if s in final_set else "steelblue" for s in scenarios]
+        sorted_costs = dict(sorted(final_costs.items(), key=lambda x: x[1]))
+        scenarios    = list(sorted_costs.keys())
+        costs        = list(sorted_costs.values())
+        final_set    = set(self.aro_summary.get("aro_final_scenarios", []))
+        bar_colors   = ["red" if s in final_set else "steelblue" for s in scenarios]
 
         fig, ax = plt.subplots(figsize=(max(10, len(scenarios) * 0.6), 8))
         ax.bar(range(len(costs)), costs, color=bar_colors)
@@ -311,8 +405,8 @@ class AROAnalyzer:
 
         from matplotlib.patches import Patch
         ax.legend(handles=[
-            Patch(facecolor="red",      label="Im finalen Set"),
-            Patch(facecolor="steelblue",label="Nicht im finalen Set"),
+            Patch(facecolor="red",       label="Im finalen Set"),
+            Patch(facecolor="steelblue", label="Nicht im finalen Set"),
         ])
 
         min_cost, max_cost = min(costs), max(costs)
@@ -377,9 +471,8 @@ class AROAnalyzer:
 
     def plot_scenario_capacity_comparison(self, save=True):
         """
-        NEU: Vergleicht installierte Kapazitäten (aus n_robust) mit den
-        Dispatch-Ergebnissen pro Szenario — zeigt wie das robuste Portfolio
-        unter verschiedenen Klimaszenarien performt.
+        Vergleicht Dispatch-Ergebnisse pro Szenario — zeigt wie das robuste
+        Portfolio unter verschiedenen Klimaszenarien performt.
         """
         if not self.scenario_networks:
             print("Keine Szenario-Netzwerke geladen — plot_scenario_capacity_comparison übersprungen.")
@@ -387,21 +480,18 @@ class AROAnalyzer:
 
         all_costs = self.aro_summary.get("aro_final_evaluation", {}).get("all_costs", {})
 
-        # Sammle Gesamt-Erzeugung pro Szenario und Carrier
         records = []
         for scenario, n in self.scenario_networks.items():
             if n is None:
                 continue
             if "carrier" not in n.generators.columns:
                 continue
-            # Erzeugung: p_t (dispatch) summiert
             if hasattr(n, "generators_t") and hasattr(n.generators_t, "p") and not n.generators_t.p.empty:
                 gen_sum = n.generators_t.p.sum()
                 gen_df  = n.generators[["carrier"]].copy()
                 gen_df["energy_MWh"] = gen_sum
                 by_carrier = gen_df.groupby("carrier")["energy_MWh"].sum()
             else:
-                # Fallback: p_nom_opt * capacity_factor (grobes Schätzverfahren)
                 pcol = "p_nom_opt" if "p_nom_opt" in n.generators.columns else "p_nom"
                 by_carrier = n.generators.groupby("carrier")[pcol].sum()
 
@@ -425,12 +515,10 @@ class AROAnalyzer:
               .index.tolist()
         )
         df_top = df[df["carrier"].isin(top_carriers)]
-
-        pivot = df_top.pivot_table(index="scenario", columns="carrier", values="value", aggfunc="sum").fillna(0)
+        pivot  = df_top.pivot_table(index="scenario", columns="carrier", values="value", aggfunc="sum").fillna(0)
 
         fig, axes = plt.subplots(1, 2, figsize=(18, 7))
 
-        # Gestapeltes Balkendiagramm
         colors = [self.config.CARRIER_COLORS.get(c, "#a9a9a9") for c in pivot.columns]
         pivot.plot(kind="bar", stacked=True, ax=axes[0], color=colors)
         axes[0].set_title(f"Erzeugung/Kapazität pro Szenario — N={len(pivot)}", fontsize=13)
@@ -439,7 +527,6 @@ class AROAnalyzer:
         axes[0].legend(loc="upper right", fontsize=8, ncol=2)
         plt.setp(axes[0].xaxis.get_majorticklabels(), rotation=45, ha="right")
 
-        # Kosten vs. Erzeugung Scatter
         scenario_costs = df.groupby("scenario")["cost"].first().dropna()
         scenario_total = df.groupby("scenario")["value"].sum()
         common = scenario_costs.index.intersection(scenario_total.index)
@@ -484,7 +571,7 @@ class AROAnalyzer:
 
     def analyze_all_scenario_dispatches(self, countries: Optional[List[str]] = None, save=True):
         """
-        NEU: Führt CountryAnalyzer für ALLE geladenen Szenario-Netzwerke durch.
+        Führt CountryAnalyzer für ALLE geladenen Szenario-Netzwerke durch.
         Ermöglicht vollständige Auswertung aller ARO-Szenarien.
         """
         if not self.scenario_networks:
@@ -519,10 +606,10 @@ class AROAnalyzer:
         print(f"\n=== Generiere ARO-Plots für {self.run_config.get('name', '')} ===\n")
 
         plot_functions = [
-            ("ARO Konvergenz",             self.plot_aro_convergence),
-            ("Szenario-Kostenvergleich",    self.plot_scenario_cost_comparison),
-            ("Robuste Kapazitäten",         self.plot_robust_capacity_breakdown),
-            ("Szenario-Kapazitätsvergleich",self.plot_scenario_capacity_comparison),  # NEU
+            ("ARO Konvergenz",              self.plot_aro_convergence),
+            ("Szenario-Kostenvergleich",     self.plot_scenario_cost_comparison),
+            ("Robuste Kapazitäten",          self.plot_robust_capacity_breakdown),
+            ("Szenario-Kapazitätsvergleich", self.plot_scenario_capacity_comparison),
         ]
 
         for name, func in plot_functions:
@@ -560,6 +647,19 @@ class AROAnalyzer:
             cost = all_costs.get(s, 0)
             loaded = "✓" if s in self.scenario_networks else "✗ (nicht geladen)"
             print(f"  {loaded}  {s}: {cost/1e9:.2f} Mrd. €/a")
+
+        # Dispatch-Verzeichnis-Status anzeigen
+        d = self._dispatch_dir()
+        tmp = self._dispatch_tmp_dir()
+        if d:
+            nc_files = list(d.glob("dispatch_*.nc"))
+            print(f"\nDispatch-Verzeichnis: {d}  ({len(nc_files)} Dateien)")
+        elif tmp:
+            nc_files = list(tmp.glob("dispatch_*.nc"))
+            print(f"\nDispatch-Verzeichnis (tmp-Fallback): {tmp}  ({len(nc_files)} Dateien)")
+        else:
+            print(f"\nWARNUNG: Kein Dispatch-Verzeichnis gefunden!")
+            print(f"  Erwartet: results/<run>/networks/dispatch/")
 
         print(f"\nGeladene Dispatch-Netzwerke: {len(self.scenario_networks)} / {len(self.scenarios)}")
 
