@@ -6021,7 +6021,13 @@ def apply_plain_run_biomass_guards(n, config, planning_horizon):
     import pandas as pd
 
     # nur für plain mode
-    workflow_mode = config.get("workflow", {}).get("mode", "plain")
+    workflow_cfg = config.get("workflow", {})
+    if isinstance(workflow_cfg, str):
+        import re as _re
+        _m = _re.search(r'mode[:\s]+([\w]+)', workflow_cfg)
+        workflow_mode = _m.group(1) if _m else "plain"
+    else:
+        workflow_mode = workflow_cfg.get("mode", "plain")
     if workflow_mode != "plain":
         return n
 

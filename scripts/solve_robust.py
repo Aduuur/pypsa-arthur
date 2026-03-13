@@ -2607,6 +2607,32 @@ def _dispatch_solve(
     logger.info("DISPATCH WEIGHT CHECK: min=%.3f max=%.3f sum=%.1f n=%d annual_scale=%.4f",
     w.min(), w.max(), w.sum(), len(w), annual_scale)
 
+    # [ARO-FIX-10b] Convert reversed HP/heat links in dispatch network.
+    _rev_d = n.links[(n.links.p_max_pu == 0.0) & (n.links.p_min_pu < 0.0)].index
+    if len(_rev_d) > 0:
+        _b0d = n.links.loc[_rev_d, "bus0"].copy()
+        _b1d = n.links.loc[_rev_d, "bus1"].copy()
+        n.links.loc[_rev_d, "bus0"] = _b1d.values
+        n.links.loc[_rev_d, "bus1"] = _b0d.values
+        _pmd = n.links.loc[_rev_d, "p_min_pu"].copy()
+        n.links.loc[_rev_d, "p_max_pu"] = (-_pmd).values
+        n.links.loc[_rev_d, "p_min_pu"] = 0.0
+        _ecd = [c for c in _rev_d if c in n.links_t.efficiency.columns]
+        if _ecd:
+            n.links_t.efficiency[_ecd] = 1.0 / n.links_t.efficiency[_ecd]
+        logger.info("[ARO-FIX-10b] Dispatch: converted %d reversed links", len(_rev_d))
+
+    # [ARO-FIX-11b] Align build_year in dispatch network.
+    _cur_d = int(n.investment_periods[0]) if len(n.investment_periods) > 0 else 0
+    for _cn_d in ("links", "generators", "storage_units", "stores", "lines"):
+        _c_d = getattr(n, _cn_d, None)
+        if _c_d is None or "build_year" not in _c_d.columns:
+            continue
+        _wrong_d = _c_d.index[_c_d["build_year"].fillna(_cur_d) != _cur_d]
+        if len(_wrong_d):
+            _c_d.loc[_wrong_d, "build_year"] = _cur_d
+    logger.info("[ARO-FIX-11b] Dispatch: aligned build_year → %d", _cur_d)
+
     n.optimize(
         solver_name=solver_name,
         solver_options=solver_options,
@@ -3764,6 +3790,62 @@ def solve_aro_master(
 
     def extra_master(network: pypsa.Network, snapshots: pd.Index) -> None:
         m = network.model
+
+        # [ARO-FIX-9] Clamp all capacity variable lower bounds to 0.
+        # PyPSA v1.0.4 leaves Link-p_nom / Store-e_nom with lower=-inf when
+        # p_nom_min=0.  With lower=-inf the optimizer sets p_nom < 0, turning
+        # capital_cost into negative revenue → heat capacity built to -inf.
+        for _vname in ("Link-p_nom", "Store-e_nom", "Generator-p_nom",
+                        "StorageUnit-p_nom", "Line-s_nom"):
+            if _vname not in m.variables:
+                continue
+            _var = m.variables[_vname]
+            _lb  = _var.lower.values.copy()
+            _bad = _lb < 0
+            if _bad.any():
+                _lb[_bad] = 0.0
+                import xarray as _xr9
+                import logging as _log9
+                _var.lower = _xr9.DataArray(_lb, dims=_var.lower.dims,
+                                             coords=_var.lower.coords)
+                _log9.getLogger(__name__).warning(
+                    "[ARO-FIX-9] Clamped %d negative lower bounds to 0 for %s",
+                    int(_bad.sum()), _vname)
+
+        # [ARO-FIX-4] Strukturelle Constraints direkt aufrufen (kein config/params nötig).
+        # add_battery_constraints, add_TES_charger_ratio, add_TES_energy_to_power,
+        # add_chp_constraints, add_lossy_bidirectional, add_pipe_retrofit etc.
+        # Ohne diese Constraints baut der Solver z.B. 12 GW Batterie-Discharger
+        # ohne Charger, TES ohne Wärmequelle, und CHP ohne Wärme/Strom-Ratio.
+        try:
+            import sys as _sys, os as _os
+            _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+            from scripts.solve_network import (
+                add_battery_constraints,
+                add_TES_charger_ratio_constraints,
+                add_TES_energy_to_power_ratio_constraints,
+                add_lossy_bidirectional_link_constraints,
+                add_pipe_retrofit_constraint,
+                add_chp_constraints,
+            )
+            add_battery_constraints(network)
+            logger.info("[ARO-FIX-4] add_battery_constraints OK")
+            add_TES_energy_to_power_ratio_constraints(network)
+            logger.info("[ARO-FIX-4] add_TES_energy_to_power_ratio_constraints OK")
+            add_TES_charger_ratio_constraints(network)
+            logger.info("[ARO-FIX-4] add_TES_charger_ratio_constraints OK")
+            add_lossy_bidirectional_link_constraints(network)
+            logger.info("[ARO-FIX-4] add_lossy_bidirectional_link_constraints OK")
+            add_pipe_retrofit_constraint(network)
+            logger.info("[ARO-FIX-4] add_pipe_retrofit_constraint OK")
+        except Exception as _ef_exc:
+            import traceback
+            logger.error(
+                "[ARO-FIX-4] Structural constraints FAILED: %s\n%s",
+                _ef_exc, traceback.format_exc(),
+            )
+            raise
+
         # [BUG-FIX-1] Pass e_cyclic_backup (not {}) so cyclic constraints use
         # the original flags, not the disabled-for-solve False values.
         _add_scenario_boundary_constraints(
@@ -3905,6 +3987,67 @@ def solve_aro_master(
                 comp,
                 ext[cols_show].sort_values("capital_cost").head(25).to_string()
             )
+
+    # [ARO-FIX-10] Convert reversed HP/heat links to normal pypsa convention.
+    # PyPSA v1.0.4 computes Link-p bounds as [p_min_pu*p_nom_init, p_max_pu*p_nom_init].
+    # For extendable links with p_nom_init=0 and p_max_pu=0, this gives [0,0] → variable
+    # is masked as "always zero" → heat pumps completely absent from LP.
+    # Fix: swap bus0/bus1, invert p_min/max_pu, reciprocate efficiency timeseries.
+    _rev = n.links[
+        (n.links.p_max_pu == 0.0) &
+        (n.links.p_min_pu < 0.0) &
+        n.links.p_nom_extendable.fillna(False)
+    ].index
+    if len(_rev) > 0:
+        logger.info("[ARO-FIX-10] Converting %d reversed extendable links to normal convention: %s",
+                    len(_rev), n.links.loc[_rev, "carrier"].value_counts().to_dict())
+        _b0 = n.links.loc[_rev, "bus0"].copy()
+        _b1 = n.links.loc[_rev, "bus1"].copy()
+        n.links.loc[_rev, "bus0"] = _b1.values
+        n.links.loc[_rev, "bus1"] = _b0.values
+        _pmin = n.links.loc[_rev, "p_min_pu"].copy()
+        n.links.loc[_rev, "p_max_pu"] = (-_pmin).values   # e.g. -(-1) = 1
+        n.links.loc[_rev, "p_min_pu"] = 0.0
+        # Reciprocate efficiency timeseries (1/COP → COP)
+        _eff_ts_cols = [c for c in _rev if c in n.links_t.efficiency.columns]
+        if _eff_ts_cols:
+            n.links_t.efficiency[_eff_ts_cols] = 1.0 / n.links_t.efficiency[_eff_ts_cols]
+        # Reciprocate static efficiency for those without timeseries
+        _eff_static = [c for c in _rev if c not in n.links_t.efficiency.columns]
+        if _eff_static:
+            _eff = n.links.loc[_eff_static, "efficiency"].replace(0, np.nan)
+            n.links.loc[_eff_static, "efficiency"] = (1.0 / _eff).fillna(1.0)
+
+    # [ARO-FIX-11] PyPSA v1.0.4 masks dispatch variables for assets with
+    # build_year > investment_period (here period=0). Fix: align build_year
+    # ONLY for extendable assets (not historical non-extendable plants).
+    _cur_period = int(n.investment_periods[0]) if len(n.investment_periods) > 0 else 0
+    for _comp_name, _ext_col in [("links","p_nom_extendable"), ("generators","p_nom_extendable"),
+                                   ("storage_units","p_nom_extendable"), ("stores","e_nom_extendable"),
+                                   ("lines","s_nom_extendable")]:
+        _comp = getattr(n, _comp_name, None)
+        if _comp is None or "build_year" not in _comp.columns:
+            continue
+        _is_ext = _comp.get(_ext_col, False).fillna(False).astype(bool)
+        _wrong = _comp.index[_is_ext & (_comp["build_year"].fillna(_cur_period) != _cur_period)]
+        if len(_wrong) > 0:
+            _comp.loc[_wrong, "build_year"] = _cur_period
+            logger.info("[ARO-FIX-11] Aligned build_year → %d for %d extendable %s",
+                        _cur_period, len(_wrong), _comp_name)
+    # Also fix non-extendable assets that are masked (build_year mismatch)
+    # but keep their p_nom fixed — they should still dispatch
+    for _comp_name, _ext_col in [("links","p_nom_extendable"), ("generators","p_nom_extendable"),
+                                   ("storage_units","p_nom_extendable")]:
+        _comp = getattr(n, _comp_name, None)
+        if _comp is None or "build_year" not in _comp.columns:
+            continue
+        _is_ext = _comp.get(_ext_col, False).fillna(False).astype(bool)
+        _wrong_fixed = _comp.index[(~_is_ext) & (_comp["build_year"].fillna(_cur_period) != _cur_period)
+                                    & (_comp.get("p_nom", _comp.get("e_nom", 0)) > 0)]
+        if len(_wrong_fixed) > 0:
+            _comp.loc[_wrong_fixed, "build_year"] = _cur_period
+            logger.info("[ARO-FIX-11] Aligned build_year → %d for %d non-extendable active %s",
+                        _cur_period, len(_wrong_fixed), _comp_name)
 
     n.optimize(
         solver_name=solver_name,

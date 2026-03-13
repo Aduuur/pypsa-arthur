@@ -11,6 +11,7 @@ ee:
     pp_add_cooling_types: [nuclear, lignite, coal, CCGT, biomass, H2] #[nuclear, lignite, coal, CCGT, biomass, H2] and skipp pp_cooling completely for []
     climatedata_generators_t_p_max_pu: False #Add time dependent CF for thermal power plants (generators_t.p_max.pu) by adding name of climate data file (e.g. MPI-M-MPI-ESM-LR_rcp85_2041). Or False to skip
     climatedata_generators_t_p_max_pu_path: 'path/to/cd2es/results/europe/{model}/techfiles' #path to folder where CF from tpp are stored
+   #climatedata_generators_t_p_max_pu_path: 'path/to/cd2es/results/europe/{model}/techfiles' #path to folder where CF from tpp are stored
     cd2es_mapping: {'nuclear':'Nuclear', 'lignite':'Coal', 'coal':'Coal', 'CCGT':'CCGT', 'biomass':'Biomass','H2':'H2'} #Generators named differently in cd2es and pypsa-eur 
     
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#top-level-configuration
@@ -80,7 +81,7 @@ robust:
       NodefileDir: "/tmp"
       MemLimit: 600
       DualReductions: 0
-      NumericFocus: 3
+      NumericFocus: 1
       ObjScale: -0.5
       ScaleFlag: 2
 

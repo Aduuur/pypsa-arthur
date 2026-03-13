@@ -42,7 +42,7 @@ OUT_NETWORK_STD = Path(ARO.get("out_network_std", str(RESULTS_DIR / "networks" /
 OUT_SUMMARY = Path(ARO.get("out_summary", str(RESULTS_DIR / "results" / "aro_summary.json")))
 
 # ARO loop controls
-INITIAL = list(ARO.get("initial_scenarios", [CUTOUTS[0]]))
+INITIAL = list(ARO.get("initial_cutouts", ARO.get("initial_scenarios", [CUTOUTS[0]])))
 MAX_ITER = int(ARO.get("max_iter", 5))
 MAX_MASTER_SIZE = int(ARO.get("max_master_size", 3))
 
