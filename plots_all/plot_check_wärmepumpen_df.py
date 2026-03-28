@@ -6,7 +6,7 @@ Diagnose-Skript: Fuel-Switch im Wärmesektor (DE 2050)
 Features:
 - Unterscheidung Groß-WP vs. Dezentrale WP
 - High Contrast Colors (Blau vs. Orange/Rot)
-- Zeitraum: 1. Jan - 15. Feb
+- Zeitraum: 7. Jan - 28. Jan
 """
 
 import os
@@ -20,9 +20,6 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from config_final import PlottingConfig
 
-# ==========================================
-# KONFIGURATION ZEITRAUM
-# ==========================================
 REFERENCE_YEAR = 2005
 START_DATE = f"{REFERENCE_YEAR}-01-07"
 END_DATE   = f"{REFERENCE_YEAR}-01-28"
@@ -30,61 +27,56 @@ END_DATE   = f"{REFERENCE_YEAR}-01-28"
 
 def _get_valid_timeslice(n, start: str, end: str):
     """
-    FIX: links_t.p0 hat einen eigenen Snapshot-Index.
-    Ableiten aus n.snapshots ist zuverlässiger als direktes .loc[] auf String-Datum.
-    Gibt (time_slice, warned) zurück.
+    Gibt (valid_start, valid_end) als Timestamps zurück,
+    geclipt auf den tatsächlichen Snapshot-Bereich des Netzes.
     """
     idx = n.snapshots
     ts_start = pd.Timestamp(start)
     ts_end   = pd.Timestamp(end)
-
     valid_start = max(ts_start, idx[0])
     valid_end   = min(ts_end,   idx[-1])
-
-    warned = (ts_start < idx[0]) or (ts_end > idx[-1])
-    if warned:
+    if ts_start < idx[0] or ts_end > idx[-1]:
         print("WARNUNG: Gewünschter Zeitraum nicht vollständig im Modell! Nutze verfügbaren Ausschnitt.")
+    return valid_start, valid_end
 
-    return slice(valid_start, valid_end), warned
 
-
-def _safe_p(df_t, indices, time_slice):
+def _safe_p(df_t, indices, valid_start, valid_end):
     """
-    FIX: Gibt 0-Series zurück, falls keine der indices in df_t.columns sind.
-    Verhindert nan durch fehlende Spalten nach .loc[].
+    Gibt Series/DataFrame für indices im Zeitraum [valid_start, valid_end] zurück.
+    FIX: Nutzt .loc[start:end] statt slice()-Objekt auf DatetimeIndex.
+    Gibt 0-Series zurück wenn keine Spalten vorhanden.
     """
     avail = [i for i in indices if i in df_t.columns]
-    base_idx = df_t.loc[time_slice].index
+    # FIX: Basis-Index sicher über .loc[start:end] auf dem Zeitreihen-DataFrame
+    base_idx = df_t.loc[valid_start:valid_end].index
     if len(avail) == 0:
         return pd.Series(0.0, index=base_idx)
-    return df_t[avail].loc[time_slice].sum(axis=1) / 1000  # MW -> GW
+    return df_t[avail].loc[valid_start:valid_end].sum(axis=1) / 1000  # MW -> GW
 
 
 def analyze_heat_sector(n, country):
     print(f"\n🔍 Analysiere Wärmesektor für {country} ({START_DATE} bis {END_DATE})...")
 
-    # FIX: robuster Timeslice aus n.snapshots (nicht links_t.p0.index, der evtl. leer ist)
-    time_slice, _ = _get_valid_timeslice(n, START_DATE, END_DATE)
+    valid_start, valid_end = _get_valid_timeslice(n, START_DATE, END_DATE)
 
-    # 1. Identifiziere Links
+    # Identifiziere Links
     links_in_country = n.links[n.links.bus0.str.startswith(country)]
 
-    mask_large_hp = (
+    large_hp_links = links_in_country[
         links_in_country.carrier.str.contains("heat pump", case=False) &
         links_in_country.carrier.str.contains("central", case=False)
-    )
-    mask_small_hp = (
+    ].index
+
+    small_hp_links = links_in_country[
         links_in_country.carrier.str.contains("heat pump", case=False) &
         ~links_in_country.carrier.str.contains("central", case=False)
-    )
-
-    large_hp_links = links_in_country[mask_large_hp].index
-    small_hp_links = links_in_country[mask_small_hp].index
+    ].index
 
     res_links = links_in_country[
         links_in_country.carrier.str.contains("resistive heater", case=False)
     ].index
 
+    # Kessel: bus1 im Land (Wärmeoutput)
     links_heat_output = n.links[n.links.bus1.str.startswith(country)]
     boiler_links = links_heat_output[
         links_heat_output.carrier.str.contains("boiler", case=False)
@@ -96,37 +88,44 @@ def analyze_heat_sector(n, country):
     print(f"  - Heizstäbe:                   {len(res_links)}")
     print(f"  - Kessel (Boiler):             {len(boiler_links)}")
 
-    # 2. Stromverbrauch (p0) – FIX: _safe_p statt direktes loc[]
-    p_elec = pd.DataFrame(index=n.snapshots[time_slice])
-    p_elec["Groß-WP"]      = _safe_p(n.links_t.p0, large_hp_links, time_slice)
-    p_elec["Dezentrale WP"] = _safe_p(n.links_t.p0, small_hp_links, time_slice)
-    p_elec["Heizstäbe"]    = _safe_p(n.links_t.p0, res_links,      time_slice)
+    # Stromverbrauch (p0)
+    # FIX: _safe_p bekommt valid_start/valid_end statt slice-Objekt
+    p0 = n.links_t.p0
+    p_elec = pd.DataFrame(index=_safe_p(p0, large_hp_links, valid_start, valid_end).index)
+    p_elec["Groß-WP"]      = _safe_p(p0, large_hp_links, valid_start, valid_end).values
+    p_elec["Dezentrale WP"] = _safe_p(p0, small_hp_links,  valid_start, valid_end).values
+    p_elec["Heizstäbe"]    = _safe_p(p0, res_links,        valid_start, valid_end).values
 
     print(f"\n📊 Stromverbrauch (Mittelwert im Zeitraum):")
     print(f"  Groß-WP:       {p_elec['Groß-WP'].mean():.2f} GW")
     print(f"  Dezentrale WP: {p_elec['Dezentrale WP'].mean():.2f} GW")
 
-    # 3. Wärmeerzeugung (p1)
+    # Wärmeerzeugung (p1)
+    p1 = n.links_t.p1
     q_heat = pd.DataFrame(index=p_elec.index)
 
     if len(large_hp_links) > 0:
-        q_heat["Groß-WP (Fernw.)"] = _safe_p(n.links_t.p1, large_hp_links, time_slice).abs()
+        q_heat["Groß-WP (Fernw.)"] = _safe_p(p1, large_hp_links, valid_start, valid_end).abs().values
     if len(small_hp_links) > 0:
-        q_heat["Dezentrale WP"]    = _safe_p(n.links_t.p1, small_hp_links, time_slice).abs()
+        q_heat["Dezentrale WP"]     = _safe_p(p1, small_hp_links,  valid_start, valid_end).abs().values
     if len(res_links) > 0:
-        q_heat["Heizstäbe"]        = _safe_p(n.links_t.p1, res_links,      time_slice).abs()
+        q_heat["Heizstäbe"]         = _safe_p(p1, res_links,        valid_start, valid_end).abs().values
 
     for link in boiler_links:
         carrier = n.links.at[link, "carrier"]
-        if "gas"    in carrier: label = "Gas-Kessel"
-        elif "oil"  in carrier: label = "Öl-Kessel"
+        if "gas"     in carrier: label = "Gas-Kessel"
+        elif "oil"   in carrier: label = "Öl-Kessel"
         elif "biomass" in carrier: label = "Biomasse-Kessel"
         else: label = "Sonstige Kessel"
 
-        if link not in n.links_t.p1.columns:
+        if link not in p1.columns:
             continue
-        val = n.links_t.p1[link].loc[time_slice].abs() / 1000
-        q_heat[label] = q_heat.get(label, 0) + val
+        val = p1[link].loc[valid_start:valid_end].abs() / 1000
+        # FIX: q_heat.get() funktioniert nicht für DataFrames — direkte Spaltenprüfung
+        if label in q_heat.columns:
+            q_heat[label] = q_heat[label].values + val.values
+        else:
+            q_heat[label] = val.values
 
     return p_elec, q_heat
 
@@ -151,37 +150,30 @@ def summarize_heat_energy(q_heat, country):
 def get_installed_heat_capacities(n, country):
     links = n.links.copy()
     if country != "ALL":
-        mask_country = (
+        links = links[
             links.bus0.str.startswith(country) |
             links.bus1.str.startswith(country)
-        )
-        links = links[mask_country]
+        ]
 
     def filter_cap(mask):
         subset = links[mask]
         if subset.empty: return 0.0
         col = "p_nom_opt" if "p_nom_opt" in subset.columns else "p_nom"
-        return subset[col].sum() / 1000  # MW -> GW
+        return subset[col].sum() / 1000
 
-    caps = {}
-    caps["Groß-WP"]      = filter_cap(
-        links.carrier.str.contains("heat pump", case=False) &
-        links.carrier.str.contains("central", case=False)
-    )
-    caps["Dezentrale WP"] = filter_cap(
-        links.carrier.str.contains("heat pump", case=False) &
-        ~links.carrier.str.contains("central", case=False)
-    )
-    caps["Heizstäbe"]    = filter_cap(links.carrier.str.contains("resistive heater", case=False))
-    caps["Gas-Kessel"]   = filter_cap(links.carrier.str.contains("gas boiler",      case=False))
-    caps["Öl-Kessel"]    = filter_cap(links.carrier.str.contains("oil boiler",      case=False))
-    caps["Biomasse"]     = filter_cap(links.carrier.str.contains("biomass boiler",  case=False))
-    caps["TOTAL"]        = sum(v for k, v in caps.items() if k != "TOTAL")
+    caps = {
+        "Groß-WP":      filter_cap(links.carrier.str.contains("heat pump", case=False) & links.carrier.str.contains("central", case=False)),
+        "Dezentrale WP": filter_cap(links.carrier.str.contains("heat pump", case=False) & ~links.carrier.str.contains("central", case=False)),
+        "Heizstäbe":    filter_cap(links.carrier.str.contains("resistive heater", case=False)),
+        "Gas-Kessel":   filter_cap(links.carrier.str.contains("gas boiler",      case=False)),
+        "Öl-Kessel":    filter_cap(links.carrier.str.contains("oil boiler",      case=False)),
+        "Biomasse":     filter_cap(links.carrier.str.contains("biomass boiler",  case=False)),
+    }
+    caps["TOTAL"] = sum(caps.values())
     return caps
 
 
 def plot_diagnosis(p_elec, q_heat, country, target_year, scenario_name, save_dir):
-    """FIX: save_dir wird jetzt von main() übergeben (kein hardcoded /shared_endata)."""
     config = PlottingConfig()
     font_sizes = {k: v + 4 for k, v in config.FONT_SIZES.items()}
 
@@ -198,10 +190,10 @@ def plot_diagnosis(p_elec, q_heat, country, target_year, scenario_name, save_dir
         "Sonstige Kessel": "#7f7f7f"
     }
 
-    # --- PLOT 1: Stromverbrauch ---
+    # PLOT 1: Stromverbrauch
     ax1 = axes[0]
     elec_cols = [c for c in ["Groß-WP", "Dezentrale WP", "Heizstäbe"] if c in p_elec.columns]
-    if not p_elec.empty and p_elec[elec_cols].sum().sum() > 0:
+    if not p_elec.empty and len(elec_cols) > 0 and p_elec[elec_cols].sum().sum() > 0:
         ax1.stackplot(
             p_elec.index,
             *[p_elec[c] for c in elec_cols],
@@ -212,16 +204,18 @@ def plot_diagnosis(p_elec, q_heat, country, target_year, scenario_name, save_dir
         ax1.legend(loc="upper left", fontsize=font_sizes['legend'], frameon=True, framealpha=0.9)
     else:
         ax1.text(0.5, 0.5, "Kein relevanter Stromverbrauch",
-                 ha='center', va='center', transform=ax1.transAxes)
+                 ha='center', va='center', transform=ax1.transAxes,
+                 fontsize=font_sizes.get('label', 12))
     ax1.set_ylabel("Stromverbrauch [GW]", fontsize=font_sizes['label'])
     ax1.set_title(f"Stromverbrauch für Wärme ({country} {target_year})", fontsize=font_sizes['title'])
     ax1.grid(True, alpha=0.4, linestyle='--')
 
-    # --- PLOT 2: Wärmeerzeugung ---
+    # PLOT 2: Wärmeerzeugung
     ax2 = axes[1]
     plot_cols = [c for c in q_heat.columns if q_heat[c].sum() > 0.01]
     if len(plot_cols) > 0:
-        priority = ["Groß-WP (Fernw.)", "Dezentrale WP", "Biomasse-Kessel", "Heizstäbe", "Gas-Kessel", "Öl-Kessel"]
+        priority = ["Groß-WP (Fernw.)", "Dezentrale WP", "Biomasse-Kessel",
+                    "Heizstäbe", "Gas-Kessel", "Öl-Kessel"]
         plot_cols.sort(key=lambda x: priority.index(x) if x in priority else 99)
         ax2.stackplot(
             q_heat.index,
@@ -230,10 +224,12 @@ def plot_diagnosis(p_elec, q_heat, country, target_year, scenario_name, save_dir
             colors=[colors.get(c, "#777777") for c in plot_cols],
             alpha=0.9
         )
-        ax2.legend(loc="upper left", fontsize=font_sizes['legend'], ncol=2, frameon=True, framealpha=0.9)
+        ax2.legend(loc="upper left", fontsize=font_sizes['legend'],
+                   ncol=2, frameon=True, framealpha=0.9)
     else:
         ax2.text(0.5, 0.5, "Keine Wärmeerzeugung gefunden",
-                 ha='center', va='center', transform=ax2.transAxes)
+                 ha='center', va='center', transform=ax2.transAxes,
+                 fontsize=font_sizes.get('label', 12))
 
     ax2.set_ylabel("Wärmeerzeugung [GW$_{th}$]", fontsize=font_sizes['label'])
     ax2.set_title("Wärmebereitstellung nach Technologie", fontsize=font_sizes['title'])
@@ -243,10 +239,10 @@ def plot_diagnosis(p_elec, q_heat, country, target_year, scenario_name, save_dir
 
     plt.tight_layout()
 
-    fname = f"diagnose_fuelswitch_HIGH_CONTRAST_{scenario_name}_{country}_{target_year}_NUR_DF.png"
+    fname = f"diagnose_fuelswitch_{scenario_name}_{country}_{target_year}.png"
     out_path = os.path.join(save_dir, fname)
     plt.savefig(out_path, dpi=150, bbox_inches='tight')
-    print(f"✅ Plot gespeichert (High Contrast): {out_path}")
+    print(f"✅ Plot gespeichert: {out_path}")
     plt.close()
 
 
@@ -255,9 +251,9 @@ def main():
     networks = config.get_networks()
     countries = config.get_countries()
 
-    # FIX: save_dir aus config.BASE_SAVE_PATH (kein hardcoded /shared_endata)
     save_dir = os.path.join(config.BASE_SAVE_PATH, "heat_diagnosis")
     os.makedirs(save_dir, exist_ok=True)
+    print(f"📁 Speichere Plots nach: {save_dir}")
 
     if not isinstance(networks, dict):
         networks = {config.SCENARIO_SELECTION: networks}
@@ -267,7 +263,8 @@ def main():
             paths = [paths]
         for path in paths:
             match = re.search(r'_(\d{4})\.nc$', path)
-            if not match: continue
+            if not match:
+                continue
             target_year = match.group(1)
 
             if not os.path.exists(path):
@@ -287,14 +284,19 @@ def main():
                     print(f"❌ FEHLER get_installed_heat_capacities: {e}")
 
             for country in countries:
-                if country == "ALL": continue
+                if country == "ALL":
+                    continue
                 try:
                     p_elec, q_heat = analyze_heat_sector(n, country)
                     if country == "DE":
                         summarize_heat_energy(q_heat, country)
+                    # FIX: plot_diagnosis wird IMMER aufgerufen (auch wenn Werte 0).
+                    # Vorher wurde bei leerem q_heat kein Plot erstellt.
                     plot_diagnosis(p_elec, q_heat, country, target_year, scenario_name, save_dir)
                 except Exception as e:
                     print(f"Fehler {country}: {e}")
+                    import traceback
+                    traceback.print_exc()
 
 
 if __name__ == "__main__":
