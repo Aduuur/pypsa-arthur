@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-Diagnose-Skript: Fuel-Switch im Wärmesektor (DE 2050)
+Diagnose-Skript: Fuel-Switch im Wärmesektor
 Features:
 - Unterscheidung Groß-WP vs. Dezentrale WP
-- High Contrast Colors (Blau vs. Orange/Rot)
-- Zeitraum: 7. Jan - 28. Jan
+- Filterung über n.links.index (carrier + country-Tag), NICHT bus0.startswith
+- Zeitreihen-Lookup direkt über links_t.p0 / links_t.p1
 """
 
 import os
@@ -26,90 +26,153 @@ END_DATE   = f"{REFERENCE_YEAR}-01-28"
 
 
 def _get_valid_timeslice(n, start: str, end: str):
-    """
-    Gibt (valid_start, valid_end) als Timestamps zurück,
-    geclipt auf den tatsächlichen Snapshot-Bereich des Netzes.
-    """
     idx = n.snapshots
     ts_start = pd.Timestamp(start)
     ts_end   = pd.Timestamp(end)
     valid_start = max(ts_start, idx[0])
     valid_end   = min(ts_end,   idx[-1])
     if ts_start < idx[0] or ts_end > idx[-1]:
-        print("WARNUNG: Gewünschter Zeitraum nicht vollständig im Modell! Nutze verfügbaren Ausschnitt.")
+        print("WARNUNG: Gewünschter Zeitraum nicht vollständig im Modell!")
     return valid_start, valid_end
+
+
+def _links_for_country(n, country):
+    """
+    Gibt alle Links für ein Land zurück.
+    Strategie (robuster als bus0.startswith):
+      1. Versuche n.links[n.links.index.str.contains(country)] -- Link-Name enthält Landcode
+      2. Fallback: bus0 oder bus1 startswith country
+    Gibt den gefilterten links-DataFrame zurück.
+    """
+    # Strategie 1: Link-Index enthält Länderkürzel (PyPSA-Eur Standard)
+    by_name = n.links[n.links.index.str.startswith(country + " ") |
+                      n.links.index.str.startswith(country + "0") |
+                      n.links.index.str.startswith(country + "1")]
+    if not by_name.empty:
+        return by_name
+    # Fallback: bus0 oder bus1
+    return n.links[
+        n.links.bus0.str.startswith(country) |
+        n.links.bus1.str.startswith(country)
+    ]
 
 
 def _safe_p(df_t, indices, valid_start, valid_end):
     """
-    Gibt Series/DataFrame für indices im Zeitraum [valid_start, valid_end] zurück.
-    FIX: Nutzt .loc[start:end] statt slice()-Objekt auf DatetimeIndex.
-    Gibt 0-Series zurück wenn keine Spalten vorhanden.
+    Summiert Zeitreihen für alle indices die in df_t.columns vorhanden sind.
+    Gibt 0-Series zurück wenn keine vorhanden.
+    Nutzt .loc[start:end] (DatetimeIndex-kompatibel).
     """
     avail = [i for i in indices if i in df_t.columns]
-    # FIX: Basis-Index sicher über .loc[start:end] auf dem Zeitreihen-DataFrame
     base_idx = df_t.loc[valid_start:valid_end].index
-    if len(avail) == 0:
+    if not avail:
         return pd.Series(0.0, index=base_idx)
     return df_t[avail].loc[valid_start:valid_end].sum(axis=1) / 1000  # MW -> GW
 
 
+def _debug_links_t(n, links_idx, label):
+    """Gibt aus, wie viele der gefundenen Links tatsächlich in links_t.p0/p1 vorhanden sind."""
+    in_p0 = [l for l in links_idx if l in n.links_t.p0.columns]
+    in_p1 = [l for l in links_idx if l in n.links_t.p1.columns]
+    print(f"  [{label}] {len(links_idx)} Links gefunden, "
+          f"davon {len(in_p0)} in links_t.p0, {len(in_p1)} in links_t.p1")
+    if not in_p0 and not in_p1 and len(links_idx) > 0:
+        print(f"    ⚠️  KEINE Zeitreihen! Beispiel-Link: '{links_idx[0]}'")
+        print(f"    bus0='{n.links.at[links_idx[0], 'bus0']}' | "
+              f"carrier='{n.links.at[links_idx[0], 'carrier']}'")
+
+
 def analyze_heat_sector(n, country):
     print(f"\n🔍 Analysiere Wärmesektor für {country} ({START_DATE} bis {END_DATE})...")
-
     valid_start, valid_end = _get_valid_timeslice(n, START_DATE, END_DATE)
 
-    # Identifiziere Links
-    links_in_country = n.links[n.links.bus0.str.startswith(country)]
+    links = _links_for_country(n, country)
 
-    large_hp_links = links_in_country[
-        links_in_country.carrier.str.contains("heat pump", case=False) &
-        links_in_country.carrier.str.contains("central", case=False)
+    large_hp_links = links[
+        links.carrier.str.contains("heat pump", case=False) &
+        links.carrier.str.contains("central", case=False)
     ].index
 
-    small_hp_links = links_in_country[
-        links_in_country.carrier.str.contains("heat pump", case=False) &
-        ~links_in_country.carrier.str.contains("central", case=False)
+    small_hp_links = links[
+        links.carrier.str.contains("heat pump", case=False) &
+        ~links.carrier.str.contains("central", case=False)
     ].index
 
-    res_links = links_in_country[
-        links_in_country.carrier.str.contains("resistive heater", case=False)
+    res_links = links[
+        links.carrier.str.contains("resistive heater", case=False)
     ].index
 
-    # Kessel: bus1 im Land (Wärmeoutput)
-    links_heat_output = n.links[n.links.bus1.str.startswith(country)]
-    boiler_links = links_heat_output[
-        links_heat_output.carrier.str.contains("boiler", case=False)
+    # Kessel: carrier enthält "boiler" -- bus1 Strategie als zusätzlicher Fallback
+    boiler_links = links[
+        links.carrier.str.contains("boiler", case=False)
     ].index
+    if len(boiler_links) == 0:
+        # Fallback: alle Links deren bus1 im Land liegt
+        boiler_links = n.links[
+            n.links.bus1.str.startswith(country) &
+            n.links.carrier.str.contains("boiler", case=False)
+        ].index
 
-    print(f"Gefunden:")
-    print(f"  - Großwärmepumpen (Fernwärme): {len(large_hp_links)}")
-    print(f"  - Dezentrale Wärmepumpen:      {len(small_hp_links)}")
-    print(f"  - Heizstäbe:                   {len(res_links)}")
-    print(f"  - Kessel (Boiler):             {len(boiler_links)}")
+    print(f"  Großwärmepumpen (Fernwärme): {len(large_hp_links)}")
+    print(f"  Dezentrale Wärmepumpen:      {len(small_hp_links)}")
+    print(f"  Heizstäbe:                   {len(res_links)}")
+    print(f"  Kessel (Boiler):             {len(boiler_links)}")
 
-    # Stromverbrauch (p0)
-    # FIX: _safe_p bekommt valid_start/valid_end statt slice-Objekt
+    # Diagnose: tatsächlich in links_t vorhanden?
+    _debug_links_t(n, large_hp_links,  "Groß-WP")
+    _debug_links_t(n, small_hp_links,  "Dez-WP")
+    _debug_links_t(n, res_links,       "Heizstab")
+    _debug_links_t(n, boiler_links,    "Boiler")
+
     p0 = n.links_t.p0
-    p_elec = pd.DataFrame(index=_safe_p(p0, large_hp_links, valid_start, valid_end).index)
-    p_elec["Groß-WP"]      = _safe_p(p0, large_hp_links, valid_start, valid_end).values
-    p_elec["Dezentrale WP"] = _safe_p(p0, small_hp_links,  valid_start, valid_end).values
-    p_elec["Heizstäbe"]    = _safe_p(p0, res_links,        valid_start, valid_end).values
-
-    print(f"\n📊 Stromverbrauch (Mittelwert im Zeitraum):")
-    print(f"  Groß-WP:       {p_elec['Groß-WP'].mean():.2f} GW")
-    print(f"  Dezentrale WP: {p_elec['Dezentrale WP'].mean():.2f} GW")
-
-    # Wärmeerzeugung (p1)
     p1 = n.links_t.p1
+
+    # Stromverbrauch: primär aus p0
+    # Falls p0 leer: elektrischer Input = Wärmeoutput (p1) / COP (efficiency)
+    def get_elec_input(link_idx):
+        in_p0 = [l for l in link_idx if l in p0.columns]
+        if in_p0:
+            return _safe_p(p0, in_p0, valid_start, valid_end)
+        # Fallback via p1 / efficiency
+        in_p1 = [l for l in link_idx if l in p1.columns]
+        if in_p1:
+            result = pd.Series(0.0, index=p1.loc[valid_start:valid_end].index)
+            for l in in_p1:
+                eff = n.links.at[l, "efficiency"] if "efficiency" in n.links.columns else 1.0
+                if eff == 0:
+                    eff = 1.0
+                result += p1[l].loc[valid_start:valid_end].abs() / eff / 1000
+            return result
+        return pd.Series(0.0, index=p1.loc[valid_start:valid_end].index
+                         if not p1.empty else pd.DatetimeIndex([]))
+
+    base_idx_series = get_elec_input(large_hp_links
+                                     if len(large_hp_links) > 0 else small_hp_links
+                                     if len(small_hp_links) > 0 else res_links)
+    if len(base_idx_series) == 0:
+        # Letzter Fallback: direkt aus Snapshot-Index
+        base_idx = n.snapshots[
+            (n.snapshots >= valid_start) & (n.snapshots <= valid_end)
+        ]
+        base_idx_series = pd.Series(0.0, index=base_idx)
+
+    p_elec = pd.DataFrame(index=base_idx_series.index)
+    p_elec["Groß-WP"]      = get_elec_input(large_hp_links).reindex(p_elec.index, fill_value=0.0)
+    p_elec["Dezentrale WP"] = get_elec_input(small_hp_links).reindex(p_elec.index, fill_value=0.0)
+    p_elec["Heizstäbe"]    = get_elec_input(res_links).reindex(p_elec.index, fill_value=0.0)
+
+    print(f"  Groß-WP Mittelwert:     {p_elec['Groß-WP'].mean():.3f} GW")
+    print(f"  Dezentrale WP Mittelwert: {p_elec['Dezentrale WP'].mean():.3f} GW")
+
+    # Wärmeerzeugung aus p1
     q_heat = pd.DataFrame(index=p_elec.index)
 
     if len(large_hp_links) > 0:
-        q_heat["Groß-WP (Fernw.)"] = _safe_p(p1, large_hp_links, valid_start, valid_end).abs().values
+        q_heat["Groß-WP (Fernw.)"] = _safe_p(p1, large_hp_links, valid_start, valid_end).abs().reindex(p_elec.index, fill_value=0.0)
     if len(small_hp_links) > 0:
-        q_heat["Dezentrale WP"]     = _safe_p(p1, small_hp_links,  valid_start, valid_end).abs().values
+        q_heat["Dezentrale WP"]     = _safe_p(p1, small_hp_links,  valid_start, valid_end).abs().reindex(p_elec.index, fill_value=0.0)
     if len(res_links) > 0:
-        q_heat["Heizstäbe"]         = _safe_p(p1, res_links,        valid_start, valid_end).abs().values
+        q_heat["Heizstäbe"]         = _safe_p(p1, res_links,        valid_start, valid_end).abs().reindex(p_elec.index, fill_value=0.0)
 
     for link in boiler_links:
         carrier = n.links.at[link, "carrier"]
@@ -121,25 +184,23 @@ def analyze_heat_sector(n, country):
         if link not in p1.columns:
             continue
         val = p1[link].loc[valid_start:valid_end].abs() / 1000
-        # FIX: q_heat.get() funktioniert nicht für DataFrames — direkte Spaltenprüfung
         if label in q_heat.columns:
-            q_heat[label] = q_heat[label].values + val.values
+            q_heat[label] = q_heat[label].values + val.reindex(p_elec.index, fill_value=0.0).values
         else:
-            q_heat[label] = val.values
+            q_heat[label] = val.reindex(p_elec.index, fill_value=0.0).values
 
     return p_elec, q_heat
 
 
 def summarize_heat_energy(q_heat, country):
     print(f"\n🔥 Wärmebereitstellung während DF ({country}):")
-    dt_hours = 1.0
     all_labels = [
         "Groß-WP (Fernw.)", "Dezentrale WP", "Heizstäbe",
         "Gas-Kessel", "Öl-Kessel", "Biomasse-Kessel", "Sonstige Kessel"
     ]
     for col in all_labels:
         if col in q_heat.columns:
-            energy_twh = (q_heat[col].sum() * dt_hours) / 1000
+            energy_twh = q_heat[col].sum() / 1000
             peak_gw    = q_heat[col].max()
         else:
             energy_twh = 0.0
@@ -148,12 +209,7 @@ def summarize_heat_energy(q_heat, country):
 
 
 def get_installed_heat_capacities(n, country):
-    links = n.links.copy()
-    if country != "ALL":
-        links = links[
-            links.bus0.str.startswith(country) |
-            links.bus1.str.startswith(country)
-        ]
+    links = _links_for_country(n, country)
 
     def filter_cap(mask):
         subset = links[mask]
@@ -190,10 +246,9 @@ def plot_diagnosis(p_elec, q_heat, country, target_year, scenario_name, save_dir
         "Sonstige Kessel": "#7f7f7f"
     }
 
-    # PLOT 1: Stromverbrauch
     ax1 = axes[0]
     elec_cols = [c for c in ["Groß-WP", "Dezentrale WP", "Heizstäbe"] if c in p_elec.columns]
-    if not p_elec.empty and len(elec_cols) > 0 and p_elec[elec_cols].sum().sum() > 0:
+    if not p_elec.empty and elec_cols and p_elec[elec_cols].sum().sum() > 0:
         ax1.stackplot(
             p_elec.index,
             *[p_elec[c] for c in elec_cols],
@@ -210,10 +265,9 @@ def plot_diagnosis(p_elec, q_heat, country, target_year, scenario_name, save_dir
     ax1.set_title(f"Stromverbrauch für Wärme ({country} {target_year})", fontsize=font_sizes['title'])
     ax1.grid(True, alpha=0.4, linestyle='--')
 
-    # PLOT 2: Wärmeerzeugung
     ax2 = axes[1]
     plot_cols = [c for c in q_heat.columns if q_heat[c].sum() > 0.01]
-    if len(plot_cols) > 0:
+    if plot_cols:
         priority = ["Groß-WP (Fernw.)", "Dezentrale WP", "Biomasse-Kessel",
                     "Heizstäbe", "Gas-Kessel", "Öl-Kessel"]
         plot_cols.sort(key=lambda x: priority.index(x) if x in priority else 99)
@@ -274,12 +328,24 @@ def main():
             print(f"\n📂 Lade {path} ...")
             n = pypsa.Network(path)
 
+            # Einmalige Diagnose: zeige Beispiel-Links und ob Zeitreihen vorhanden
+            print(f"  links_t.p0 Spalten: {len(n.links_t.p0.columns)} | "
+                  f"links_t.p1 Spalten: {len(n.links_t.p1.columns)}")
+            hp_all = n.links[n.links.carrier.str.contains("heat pump", case=False)]
+            print(f"  Alle WP-Links im Netz: {len(hp_all)}")
+            if not hp_all.empty:
+                ex = hp_all.index[0]
+                print(f"  Beispiel WP-Link: '{ex}' | bus0='{n.links.at[ex,'bus0']}' | "
+                      f"carrier='{n.links.at[ex,'carrier']}'")
+                print(f"  In links_t.p0: {ex in n.links_t.p0.columns} | "
+                      f"In links_t.p1: {ex in n.links_t.p1.columns}")
+
             if int(target_year) in [2030, 2040, 2050]:
-                print(f"--- Kapazitäten {target_year} ---")
                 try:
                     caps = get_installed_heat_capacities(n, "DE")
+                    print(f"--- Kapazitäten {target_year} (DE) ---")
                     for k, v in caps.items():
-                        print(f"{k:15s}: {v:.2f} GW")
+                        print(f"  {k:15s}: {v:.2f} GW")
                 except Exception as e:
                     print(f"❌ FEHLER get_installed_heat_capacities: {e}")
 
@@ -290,8 +356,6 @@ def main():
                     p_elec, q_heat = analyze_heat_sector(n, country)
                     if country == "DE":
                         summarize_heat_energy(q_heat, country)
-                    # FIX: plot_diagnosis wird IMMER aufgerufen (auch wenn Werte 0).
-                    # Vorher wurde bei leerem q_heat kein Plot erstellt.
                     plot_diagnosis(p_elec, q_heat, country, target_year, scenario_name, save_dir)
                 except Exception as e:
                     print(f"Fehler {country}: {e}")
