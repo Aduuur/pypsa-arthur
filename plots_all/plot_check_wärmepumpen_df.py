@@ -22,11 +22,6 @@ from config_final import PlottingConfig
 
 
 def _resolve_snapshots(n):
-    """
-    Gibt (ts_index, is_multiindex) zurück.
-    - myopic: n.snapshots ist DatetimeIndex -> direkt
-    - perfect-foresight: n.snapshots ist MultiIndex -> links_t.p0.index nutzen
-    """
     snap = n.snapshots
     if isinstance(snap, pd.MultiIndex):
         if not n.links_t.p0.empty:
@@ -38,18 +33,12 @@ def _resolve_snapshots(n):
 
 
 def _get_valid_mask(ts_index, start: str, end: str):
-    """
-    Boolean-Maske über ts_index für [start, end].
-    Funktioniert für DatetimeIndex und MultiIndex (innerer Level wird verwendet).
-    """
     ts_start = pd.Timestamp(start)
     ts_end   = pd.Timestamp(end)
-
     if isinstance(ts_index, pd.MultiIndex):
         inner = pd.DatetimeIndex(ts_index.get_level_values(-1))
     else:
         inner = pd.DatetimeIndex(ts_index)
-
     mask = (inner >= ts_start) & (inner <= ts_end)
     if not mask.any():
         print(f"  ⚠️  Kein Zeitraum {start}–{end} im Modell!")
@@ -75,6 +64,64 @@ def _debug_links_t(n, links_idx, label):
     in_p0 = sum(1 for l in links_idx if l in n.links_t.p0.columns)
     in_p1 = sum(1 for l in links_idx if l in n.links_t.p1.columns)
     print(f"  [{label}] {len(links_idx)} Links, {in_p0} in p0, {in_p1} in p1")
+
+
+def _cop_check(n, links_idx, label, p0, p1, mask):
+    """
+    COP-Konsistenz für eine Gruppe von Links.
+    Gibt effektiven COP = sum(|p1|) / sum(|p0|) aus.
+    Zeigt außerdem: wird p1 überhaupt befüllt? Welcher bus1?
+    """
+    if len(links_idx) == 0:
+        return
+    print(f"\n  🔎 COP-Check [{label}] ({len(links_idx)} Links)")
+
+    # Zeige bus0/bus1 für ersten Link
+    ex = links_idx[0]
+    bus0 = n.links.at[ex, "bus0"] if "bus0" in n.links.columns else "?"
+    bus1 = n.links.at[ex, "bus1"] if "bus1" in n.links.columns else "?"
+    eff  = n.links.at[ex, "efficiency"] if "efficiency" in n.links.columns else float("nan")
+    print(f"     Beispiel-Link: '{ex}'")
+    print(f"     bus0={bus0}  bus1={bus1}  efficiency={eff:.3f}")
+
+    # Alle Links die auch in p0/p1 vorhanden sind
+    in_p0 = [l for l in links_idx if l in p0.columns]
+    in_p1 = [l for l in links_idx if l in p1.columns]
+    print(f"     In links_t.p0: {len(in_p0)}/{len(links_idx)}")
+    print(f"     In links_t.p1: {len(in_p1)}/{len(links_idx)}")
+
+    if not in_p0:
+        print("     ❌ Kein p0 verfügbar -> überspringe")
+        return
+
+    sum_p0 = p0[in_p0].loc[mask].abs().sum().sum()
+    print(f"     Sum |p0| im Fenster: {sum_p0/1000:.2f} GW*h")
+
+    if in_p1:
+        sum_p1 = p1[in_p1].loc[mask].abs().sum().sum()
+        print(f"     Sum |p1| im Fenster: {sum_p1/1000:.2f} GW*h")
+        if sum_p0 > 0:
+            eff_cop = sum_p1 / sum_p0
+            print(f"     => Effektiver COP (p1/p0): {eff_cop:.3f}")
+            if eff_cop < 0.5:
+                print(f"     ⚠️  COP < 0.5 -> p1 wird möglicherweise am falschen Bus gelesen!")
+            elif eff_cop > 5.0:
+                print(f"     ⚠️  COP > 5.0 -> Einheitenproblem oder falscher Bus?")
+            else:
+                print(f"     ✅  COP plausibel")
+    else:
+        print("     ❌ Kein p1 verfügbar -> Wärmeerzeugung wird 0 sein!")
+
+    # Variabilitäts-Check für p0
+    ts_p0 = p0[in_p0].loc[mask].abs().sum(axis=1)
+    std_p0  = ts_p0.std()
+    mean_p0 = ts_p0.mean()
+    cv = std_p0 / mean_p0 if mean_p0 > 0 else 0
+    print(f"     p0 Variationskoeffizient CV = {cv:.3f}  (std={std_p0/1000:.3f} GW, mean={mean_p0/1000:.3f} GW)")
+    if cv < 0.02:
+        print(f"     ⚠️  CV sehr klein -> WP läuft konstant auf Nennleistung (kein echter Dispatch?)")
+    else:
+        print(f"     ✅  WP zeigt sinnvolle Variabilität")
 
 
 def analyze_heat_sector(n, country, ts_index, mask):
@@ -105,6 +152,12 @@ def analyze_heat_sector(n, country, ts_index, mask):
     p0 = n.links_t.p0
     p1 = n.links_t.p1
 
+    # COP + Variabilitäts-Check nur für DE (weniger Output-Spam)
+    if country == "DE":
+        _cop_check(n, large_hp, "Groß-WP",  p0, p1, mask)
+        _cop_check(n, small_hp, "Dez-WP",    p0, p1, mask)
+        _cop_check(n, res,      "Heizstab",  p0, p1, mask)
+
     # Plot-Index: immer DatetimeIndex
     if isinstance(ts_index, pd.MultiIndex):
         plot_idx = pd.DatetimeIndex(ts_index.get_level_values(-1)[mask])
@@ -120,8 +173,6 @@ def analyze_heat_sector(n, country, ts_index, mask):
         return sub
 
     p_elec = pd.DataFrame(index=plot_idx)
-    # .abs(): p0 ist in PyPSA per Konvention NEGATIV für den Input-Bus
-    # (Strom wird dem Bus entnommen -> negativer Fluss aus Bus-Sicht)
     p_elec["Groß-WP"]      = get_series(p0, large_hp).abs()
     p_elec["Dezentrale WP"] = get_series(p0, small_hp).abs()
     p_elec["Heizstäbe"]    = get_series(p0, res).abs()
@@ -140,10 +191,10 @@ def analyze_heat_sector(n, country, ts_index, mask):
 
     for link in boilers:
         carrier = n.links.at[link, "carrier"]
-        if "gas"      in carrier: label = "Gas-Kessel"
-        elif "oil"    in carrier: label = "Öl-Kessel"
+        if "gas"       in carrier: label = "Gas-Kessel"
+        elif "oil"     in carrier: label = "Öl-Kessel"
         elif "biomass" in carrier: label = "Biomasse-Kessel"
-        else: label = "Sonstige Kessel"
+        else:                      label = "Sonstige Kessel"
         if link not in p1.columns:
             continue
         val = p1[[link]].loc[mask].iloc[:, 0].abs() / 1000
@@ -173,12 +224,12 @@ def get_installed_heat_capacities(n, country):
         return sub[col].sum() / 1000
 
     caps = {
-        "Groß-WP":      cap(links.carrier.str.contains("heat pump", case=False) & links.carrier.str.contains("central", case=False)),
-        "Dezentrale WP": cap(links.carrier.str.contains("heat pump", case=False) & ~links.carrier.str.contains("central", case=False)),
-        "Heizstäbe":    cap(links.carrier.str.contains("resistive heater", case=False)),
-        "Gas-Kessel":   cap(links.carrier.str.contains("gas boiler",      case=False)),
-        "Öl-Kessel":    cap(links.carrier.str.contains("oil boiler",       case=False)),
-        "Biomasse":     cap(links.carrier.str.contains("biomass boiler",  case=False)),
+        "Groß-WP":       cap(links.carrier.str.contains("heat pump", case=False) & links.carrier.str.contains("central", case=False)),
+        "Dezentrale WP":  cap(links.carrier.str.contains("heat pump", case=False) & ~links.carrier.str.contains("central", case=False)),
+        "Heizstäbe":     cap(links.carrier.str.contains("resistive heater", case=False)),
+        "Gas-Kessel":    cap(links.carrier.str.contains("gas boiler",      case=False)),
+        "Öl-Kessel":     cap(links.carrier.str.contains("oil boiler",       case=False)),
+        "Biomasse":      cap(links.carrier.str.contains("biomass boiler",  case=False)),
     }
     caps["TOTAL"] = sum(caps.values())
     return caps
