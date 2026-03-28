@@ -70,6 +70,20 @@ MASTER_CONFIG: Dict[str, Any] = {
     },
 
     # =======================================================================
+    # DARK SKY / DUNKELFLAUTE ANALYSIS PERIOD
+    # Zeitraum für Wärmesektor-Analysen und Dunkelflaute-Plots.
+    # Das Referenzjahr entspricht dem meteorologischen Jahr im Modell (cutout).
+    # start/end: MM-DD (wird mit reference_year kombiniert).
+    # Kann per Umgebungsvariable überschrieben werden:
+    #   DARK_SKY_YEAR=2012  DARK_SKY_START=01-07  DARK_SKY_END=01-28
+    # =======================================================================
+    "dark_sky_period": {
+        "reference_year": int(_env("DARK_SKY_YEAR", "2005")),
+        "start_mmdd":     _env("DARK_SKY_START", "01-07"),
+        "end_mmdd":       _env("DARK_SKY_END",   "01-28"),
+    },
+
+    # =======================================================================
     # PLOT STYLE
     # =======================================================================
     "plotting": {
@@ -112,29 +126,18 @@ MASTER_CONFIG: Dict[str, Any] = {
     # SCENARIO REGISTRY (deterministic / myopic / normal)
     # =======================================================================
     "scenarios": {
-        # "selection" kann ein einzelner Key, "both" oder "all" sein.
-        # "all" iteriert über alle Einträge im registry.
         "selection": _env("SCENARIO_SELECTION", RUN_NAME),
 
         "registry": {
-            # run_type: "normal"  -> deterministischer/myopischer Lauf
-            # run_type: "aro"     -> ARO-Lauf  (wird auch in aro.runs referenziert)
             RUN_NAME: {
-                "run_type": "normal",   # <-- NEU: "normal" | "aro"
+                "run_type": "normal",
                 "description": "Normaler Vergleichs-Run",
                 "networks": [
                     f"/home/endata/PycharmProjects/pypsa-ee/results/{RUN_NAME}/networks/base_s_24___2050.nc",
                 ],
             },
-            # Beispiel für einen ARO-Run (selber Key wie in aro.runs):
-            # "compare-robust-aro": {
-            #     "run_type": "aro",
-            #     "description": "ARO Run v1",
-            #     "networks": [],   # wird aus aro.runs befüllt
-            # },
         },
 
-        # Für selection == "both": genau zwei Szenarien vergleichen
         "both_mapping": {
             "average":       "new_avg",
             "dunkelflaute":  "dunkelflaute_neu_2",
@@ -174,8 +177,6 @@ MASTER_CONFIG: Dict[str, Any] = {
             "capacity_comparison":  True,
         },
 
-        # Beliebig viele ARO-Runs eintragbar.
-        # "scenarios": [] -> wird auto-befüllt aus aro_summary.json falls leer.
         "runs": {
             RUN_NAME: {
                 "name":                    RUN_NAME,
@@ -184,8 +185,6 @@ MASTER_CONFIG: Dict[str, Any] = {
                 "robust_network_std":      f"{{aro_results_base}}/{RUN_NAME}/networks/aro_robust__std.nc",
                 "worst_case_dispatch":     None,
                 "worst_case_dispatch_std": None,
-                # Leer = wird aus aro_summary.json gelesen (aro_final_scenarios).
-                # Kann manuell vorbelegt werden: ["cutout_rcp45_2050", "cutout_rcp26_2050"]
                 "scenarios": [],
             },
         },
@@ -220,6 +219,25 @@ class MasterConfig:
     @property
     def aro_plots_base(self) -> str:
         return self.paths["aro_plots_base"]
+
+    # ---------- DARK SKY PERIOD ----------
+    @property
+    def dark_sky_period(self) -> Dict[str, Any]:
+        return self.raw["dark_sky_period"]
+
+    @property
+    def dark_sky_reference_year(self) -> int:
+        return int(self.dark_sky_period["reference_year"])
+
+    @property
+    def dark_sky_start(self) -> str:
+        """Gibt 'YYYY-MM-DD' zurück."""
+        return f"{self.dark_sky_reference_year}-{self.dark_sky_period['start_mmdd']}"
+
+    @property
+    def dark_sky_end(self) -> str:
+        """Gibt 'YYYY-MM-DD' zurück."""
+        return f"{self.dark_sky_reference_year}-{self.dark_sky_period['end_mmdd']}"
 
     # ---------- COUNTRIES ----------
     @property
@@ -290,25 +308,17 @@ class MasterConfig:
     # ---------- Helpers ----------
 
     def get_run_type(self, run_key: Optional[str] = None) -> str:
-        """
-        Gibt 'aro' oder 'normal' zurück für einen gegebenen Szenario-Key.
-        Falls run_key None, wird scenario_selection verwendet.
-        Falls der Key in aro.runs liegt, ist der Typ automatisch 'aro'.
-        """
         key = run_key or self.scenario_selection
-        # Explizites run_type im scenarios.registry
         reg_entry = self.scenarios_registry.get(key, {})
         if isinstance(reg_entry, dict):
             t = reg_entry.get("run_type", "").lower()
             if t in ("aro", "normal"):
                 return t
-        # Fallback: wenn Key in aro.runs vorhanden -> aro
         if key in self.aro_runs:
             return "aro"
         return "normal"
 
     def resolve_template(self, s: Optional[str]) -> Optional[str]:
-        """Löst Platzhalter wie {aro_results_base} in Run-Configs auf."""
         if s is None:
             return None
         return s.format(**self.paths)
@@ -317,13 +327,6 @@ class MasterConfig:
         self,
         run_key: Optional[str] = None,
     ) -> Union[List[str], Dict[str, List[str]], None]:
-        """
-        Gibt Netzwerk-Pfade zurück.
-
-        - selection == "all"  -> dict {key: [paths]} für ALLE registry-Einträge
-        - selection == "both" -> dict {out_key: [paths]}
-        - selection == key    -> list [paths]
-        """
         sel = run_key or self.scenario_selection
         reg = self.scenarios_registry
 
@@ -371,16 +374,11 @@ class MasterConfig:
         return []
 
     def get_aro_scenarios_for_run(self, run_key: str) -> List[str]:
-        """
-        Gibt die Szenarien-Liste für einen ARO-Run zurück.
-        Falls leer/nicht gesetzt: wird aus aro_summary.json gelesen (lazy).
-        """
         run_conf = self.aro_runs.get(run_key, {})
         scenarios = run_conf.get("scenarios", [])
         if scenarios:
             return list(scenarios)
 
-        # Auto-Lesen aus summary JSON
         summary_path = self.resolve_template(run_conf.get("summary_json"))
         if summary_path and Path(summary_path).is_file():
             try:
@@ -389,7 +387,6 @@ class MasterConfig:
                 from_json = summary.get("aro_final_scenarios", [])
                 if from_json:
                     return list(from_json)
-                # Fallback: keys aus aro_final_evaluation.all_costs
                 all_costs = summary.get("aro_final_evaluation", {}).get("all_costs", {})
                 if all_costs:
                     return list(all_costs.keys())
@@ -406,9 +403,9 @@ class PlottingConfig:
 
     def __init__(self, master: Optional[MasterConfig] = None):
         self.master = master or MasterConfig()
-        self.BASE_NETWORK_PATH = self.master.pypsa_results_base
-        self.BASE_SAVE_PATH    = self.master.plots_base
-        self.PLOT_OUTPUT_PATH  = str(_mkdir(Path(self.BASE_SAVE_PATH) / "plots_combined"))
+        self.BASE_NETWORK_PATH  = self.master.pypsa_results_base
+        self.BASE_SAVE_PATH     = self.master.plots_base
+        self.PLOT_OUTPUT_PATH   = str(_mkdir(Path(self.BASE_SAVE_PATH) / "plots_combined"))
         self.SCENARIO_SELECTION = self.master.scenario_selection
         self.COUNTRIES_TO_PLOT  = self.master.get_countries(self.master.default_countries_to_plot)
         self.FONT_SIZES         = self.master.font_sizes
@@ -417,6 +414,9 @@ class PlottingConfig:
         self.SCENARIOS          = self.master.scenarios_registry
         self.PLOTS_TO_RUN       = self.master.plots_selection
         self.AVAILABLE_PLOTS    = self.master.available_plots
+        # Dark sky period — direkt als fertige Strings verfügbar
+        self.DARK_SKY_START     = self.master.dark_sky_start
+        self.DARK_SKY_END       = self.master.dark_sky_end
 
     def get_networks(self):
         return self.master.get_networks()
@@ -433,15 +433,15 @@ class AROPlottingConfig:
 
     def __init__(self, master: Optional[MasterConfig] = None):
         self.master = master or MasterConfig()
-        self.BASE_RESULTS_PATH   = self.master.aro_results_base
-        self.PLOT_OUTPUT_PATH    = self.master.aro_plots_base
-        self.ARO_RUNS            = self.master.aro_runs
-        self.SELECTED_RUN        = self.master.aro_selected_run
+        self.BASE_RESULTS_PATH    = self.master.aro_results_base
+        self.PLOT_OUTPUT_PATH     = self.master.aro_plots_base
+        self.ARO_RUNS             = self.master.aro_runs
+        self.SELECTED_RUN         = self.master.aro_selected_run
         self.COUNTRIES_TO_ANALYZE = self.master.aro_countries_to_analyze
-        self.FONT_SIZES          = self.master.font_sizes
-        self.CARRIER_COLORS      = self.master.carrier_colors
-        self.DEFAULT_COLOR       = self.master.default_color
-        self.ARO_PLOTS           = self.master.aro_plot_toggles
+        self.FONT_SIZES           = self.master.font_sizes
+        self.CARRIER_COLORS       = self.master.carrier_colors
+        self.DEFAULT_COLOR        = self.master.default_color
+        self.ARO_PLOTS            = self.master.aro_plot_toggles
 
     def get_current_run_config(self) -> Dict[str, Any]:
         cfg = dict(self.ARO_RUNS[self.SELECTED_RUN])
@@ -449,7 +449,6 @@ class AROPlottingConfig:
                   "worst_case_dispatch", "worst_case_dispatch_std"]:
             if k in cfg:
                 cfg[k] = self.master.resolve_template(cfg[k])
-        # Szenarien auto-befüllen
         if not cfg.get("scenarios"):
             cfg["scenarios"] = self.master.get_aro_scenarios_for_run(self.SELECTED_RUN)
         return cfg
@@ -482,7 +481,6 @@ def validate_config(master: Optional[MasterConfig] = None, strict: bool = False)
     def warn(msg): report["warnings"].append(msg)
     def info(msg): report["infos"].append(msg)
 
-    # --- Paths ---
     for k in ["pypsa_results_base", "aro_results_base", "plots_base", "aro_plots_base"]:
         v = master.paths.get(k)
         if v is None:
@@ -490,38 +488,32 @@ def validate_config(master: Optional[MasterConfig] = None, strict: bool = False)
         elif not _exists_dir(v):
             warn(f"Verzeichnis existiert nicht: paths.{k}={v}")
 
-    # --- Plot settings ---
     plotting = master.plotting
     if not isinstance(plotting.get("dpi"), int) or plotting["dpi"] <= 0:
         err(f"plotting.dpi ungültig: {plotting.get('dpi')}")
     if "font_sizes" not in plotting or not isinstance(plotting["font_sizes"], dict):
         err("plotting.font_sizes fehlt oder ist nicht dict.")
 
-    # --- Colors ---
     colors = master.carrier_colors
     if not colors:
         err("colors.carriers ist leer.")
 
-    # --- Countries ---
     if "ALL" not in master.default_countries_to_plot:
         warn("countries.default_countries_to_plot enthält kein 'ALL'.")
 
-    # --- Scenario registry: run_type check ---
     reg = master.scenarios_registry
     for k, v in reg.items():
         if isinstance(v, dict):
             rt = v.get("run_type", "")
             if rt not in ("normal", "aro", ""):
-                warn(f"scenarios.registry['{k}'].run_type='{rt}' unbekannt (erwartet 'normal' oder 'aro').")
+                warn(f"scenarios.registry['{k}'].run_type='{rt}' unbekannt.")
         elif not isinstance(v, list):
             warn(f"scenarios.registry['{k}'] sollte dict oder list sein.")
 
-    # --- Scenario selection ---
     sel = master.scenario_selection
     if sel not in ("both", "all") and sel not in reg:
         warn(f"scenarios.selection='{sel}' ist nicht im scenarios.registry vorhanden.")
 
-    # --- Network path existence ---
     networks = master.get_networks()
     def check_paths(paths_list, ctx):
         missing = sum(1 for p in paths_list if not Path(p).is_file())
@@ -534,7 +526,6 @@ def validate_config(master: Optional[MasterConfig] = None, strict: bool = False)
         for k, v in networks.items():
             check_paths(v, f"scenario '{k}'")
 
-    # --- ARO runs ---
     aro_sel = master.aro_selected_run
     aro_runs = master.aro_runs
     if aro_sel not in aro_runs:
@@ -549,12 +540,20 @@ def validate_config(master: Optional[MasterConfig] = None, strict: bool = False)
                 elif resolved and key in ("summary_json", "robust_network") and not Path(resolved).is_file():
                     warn(f"ARO '{aro_sel}': Datei fehlt: {key}={resolved}")
 
-        # Szenarien-Check
         scenarios = master.get_aro_scenarios_for_run(aro_sel)
         if not scenarios:
-            warn(f"ARO '{aro_sel}': Keine Szenarien gefunden (scenarios leer und kein summary_json lesbar).")
+            warn(f"ARO '{aro_sel}': Keine Szenarien gefunden.")
         else:
-            info(f"ARO '{aro_sel}': {len(scenarios)} Szenarien gefunden: {scenarios[:5]}{'...' if len(scenarios)>5 else ''}")
+            info(f"ARO '{aro_sel}': {len(scenarios)} Szenarien: {scenarios[:5]}{'...' if len(scenarios)>5 else ''}")
+
+    # Dark sky period check
+    try:
+        import pandas as pd
+        pd.Timestamp(master.dark_sky_start)
+        pd.Timestamp(master.dark_sky_end)
+        info(f"dark_sky_period: {master.dark_sky_start} -- {master.dark_sky_end}")
+    except Exception as e:
+        err(f"dark_sky_period ungültig: {e}")
 
     if strict and not report["ok"]:
         raise ValueError("MasterConfig validation failed:\n" + "\n".join(report["errors"]))

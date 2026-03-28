@@ -3,9 +3,9 @@
 
 """
 Diagnose-Skript: Fuel-Switch im Wärmesektor
+- Analysezeitraum wird aus config.DARK_SKY_START / DARK_SKY_END gelesen
 - Unterstützt PyPSA perfect-foresight (MultiIndex snapshots) UND myopic (DatetimeIndex)
 - Filterung über n.links.index (Link-Name enthält Länderkürzel)
-- Zeitraum: REFERENCE_YEAR Jan 7-28
 """
 
 import os
@@ -19,74 +19,44 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from config_final import PlottingConfig
 
-REFERENCE_YEAR = 2005
-START_DATE = f"{REFERENCE_YEAR}-01-07"
-END_DATE   = f"{REFERENCE_YEAR}-01-28"
-
 
 def _resolve_snapshots(n):
     """
-    Gibt den tatsächlichen Zeitreihen-Index zurück der in links_t verwendet wird.
-    - Bei myopic / single-year: n.snapshots ist DatetimeIndex -> direkt verwenden
-    - Bei perfect-foresight: n.snapshots ist MultiIndex (period, timestep)
-      -> links_t.p0.index ist der innere Timestep-Index (DatetimeIndex)
-    Gibt (index, is_multiindex) zurück.
+    Gibt (ts_index, is_multiindex) zurück.
+    - myopic: n.snapshots ist DatetimeIndex -> direkt
+    - perfect-foresight: n.snapshots ist MultiIndex -> links_t.p0.index nutzen
     """
     snap = n.snapshots
     if isinstance(snap, pd.MultiIndex):
-        # Perfect-foresight: innerer Index aus links_t direkt lesen
         if not n.links_t.p0.empty:
             return n.links_t.p0.index, True
         if not n.links_t.p1.empty:
             return n.links_t.p1.index, True
-        # Fallback: zweite Ebene des MultiIndex
         return snap.get_level_values(1), True
     return snap, False
 
 
 def _get_valid_mask(ts_index, start: str, end: str):
     """
-    Gibt eine Boolean-Maske für ts_index im Bereich [start, end] zurück.
-    Funktioniert für DatetimeIndex und MultiIndex-innere-Ebene.
+    Boolean-Maske über ts_index für [start, end].
+    Funktioniert für DatetimeIndex und MultiIndex (innerer Level wird verwendet).
     """
     ts_start = pd.Timestamp(start)
     ts_end   = pd.Timestamp(end)
 
-    # Falls ts_index ein MultiIndex ist: nach innerem Level filtern
     if isinstance(ts_index, pd.MultiIndex):
-        inner = ts_index.get_level_values(-1)
+        inner = pd.DatetimeIndex(ts_index.get_level_values(-1))
     else:
-        inner = ts_index
+        inner = pd.DatetimeIndex(ts_index)
 
-    # Sicherstellen dass inner ein DatetimeIndex ist
-    inner = pd.DatetimeIndex(inner)
     mask = (inner >= ts_start) & (inner <= ts_end)
-
     if not mask.any():
-        print(f"WARNUNG: Kein Zeitraum {start}--{end} im Modell gefunden!")
-        print(f"  Verfügbarer Bereich: {inner[0]} -- {inner[-1]}")
+        print(f"  ⚠️  Kein Zeitraum {start}–{end} im Modell!")
+        print(f"     Verfügbar: {inner[0]} – {inner[-1]}")
     return mask
 
 
-def _safe_p(df_t, indices, mask):
-    """
-    Summiert Zeitreihen für indices im Bereich der Boolean-Maske.
-    Gibt 0-Series zurück wenn keine Spalten vorhanden.
-    MW -> GW Konversion.
-    """
-    avail = [i for i in indices if i in df_t.columns]
-    base_idx = df_t.index[mask]
-    if not avail:
-        return pd.Series(0.0, index=base_idx)
-    sub = df_t[avail].loc[mask]
-    return sub.sum(axis=1) / 1000  # MW -> GW
-
-
 def _links_for_country(n, country):
-    """
-    Filtert Links für ein Land über den Link-Index (PyPSA-Eur-Standard: Link-Name startet mit Länderkürzel).
-    Fallback: bus0 oder bus1 startswith country.
-    """
     by_name = n.links[
         n.links.index.str.startswith(country + " ") |
         n.links.index.str.startswith(country + "0") |
@@ -101,79 +71,71 @@ def _links_for_country(n, country):
 
 
 def _debug_links_t(n, links_idx, label):
-    in_p0 = [l for l in links_idx if l in n.links_t.p0.columns]
-    in_p1 = [l for l in links_idx if l in n.links_t.p1.columns]
-    print(f"  [{label}] {len(links_idx)} Links, {len(in_p0)} in p0, {len(in_p1)} in p1")
+    in_p0 = sum(1 for l in links_idx if l in n.links_t.p0.columns)
+    in_p1 = sum(1 for l in links_idx if l in n.links_t.p1.columns)
+    print(f"  [{label}] {len(links_idx)} Links, {in_p0} in p0, {in_p1} in p1")
 
 
 def analyze_heat_sector(n, country, ts_index, mask):
-    print(f"\n🔍 {country}...")
-
+    print(f"  🔍 {country}")
     links = _links_for_country(n, country)
 
-    large_hp_links = links[
+    large_hp = links[
         links.carrier.str.contains("heat pump", case=False) &
         links.carrier.str.contains("central", case=False)
     ].index
-    small_hp_links = links[
+    small_hp = links[
         links.carrier.str.contains("heat pump", case=False) &
         ~links.carrier.str.contains("central", case=False)
     ].index
-    res_links = links[
-        links.carrier.str.contains("resistive heater", case=False)
-    ].index
-    boiler_links = links[
-        links.carrier.str.contains("boiler", case=False)
-    ].index
-    if len(boiler_links) == 0:
-        boiler_links = n.links[
+    res = links[links.carrier.str.contains("resistive heater", case=False)].index
+    boilers = links[links.carrier.str.contains("boiler", case=False)].index
+    if len(boilers) == 0:
+        boilers = n.links[
             n.links.bus1.str.startswith(country) &
             n.links.carrier.str.contains("boiler", case=False)
         ].index
 
-    print(f"  WP-zentral: {len(large_hp_links)} | WP-dez: {len(small_hp_links)} "
-          f"| Heizstab: {len(res_links)} | Boiler: {len(boiler_links)}")
-    _debug_links_t(n, large_hp_links, "Groß-WP")
-    _debug_links_t(n, small_hp_links, "Dez-WP")
-    _debug_links_t(n, res_links,      "Heizstab")
-    _debug_links_t(n, boiler_links,   "Boiler")
+    _debug_links_t(n, large_hp, "Groß-WP")
+    _debug_links_t(n, small_hp, "Dez-WP")
+    _debug_links_t(n, res,      "Heizstab")
+    _debug_links_t(n, boilers,  "Boiler")
 
     p0 = n.links_t.p0
     p1 = n.links_t.p1
-    base_idx = ts_index[mask]
 
-    # Timestamps für Plot-Index: innerer Level falls MultiIndex
-    if isinstance(base_idx, pd.MultiIndex):
-        plot_idx = pd.DatetimeIndex(base_idx.get_level_values(-1))
+    # Plot-Index: immer DatetimeIndex
+    if isinstance(ts_index, pd.MultiIndex):
+        plot_idx = pd.DatetimeIndex(ts_index.get_level_values(-1)[mask])
     else:
-        plot_idx = pd.DatetimeIndex(base_idx)
+        plot_idx = pd.DatetimeIndex(ts_index[mask])
 
     def get_series(df, idx_list):
         avail = [l for l in idx_list if l in df.columns]
         if not avail:
             return pd.Series(0.0, index=plot_idx)
-        sub = df[avail].loc[mask].sum(axis=1) / 1000
+        sub = df[avail].loc[mask].sum(axis=1) / 1000  # MW -> GW
         sub.index = plot_idx
         return sub
 
     p_elec = pd.DataFrame(index=plot_idx)
-    p_elec["Groß-WP"]      = get_series(p0, large_hp_links)
-    p_elec["Dezentrale WP"] = get_series(p0, small_hp_links)
-    p_elec["Heizstäbe"]    = get_series(p0, res_links)
+    p_elec["Groß-WP"]      = get_series(p0, large_hp)
+    p_elec["Dezentrale WP"] = get_series(p0, small_hp)
+    p_elec["Heizstäbe"]    = get_series(p0, res)
 
-    print(f"  Groß-WP Ø: {p_elec['Groß-WP'].mean():.3f} GW | "
-          f"Dez-WP Ø: {p_elec['Dezentrale WP'].mean():.3f} GW | "
-          f"Heizstab Ø: {p_elec['Heizstäbe'].mean():.3f} GW")
+    print(f"    Groß-WP Ø {p_elec['Groß-WP'].mean():.3f} GW | "
+          f"Dez-WP Ø {p_elec['Dezentrale WP'].mean():.3f} GW | "
+          f"Heizstab Ø {p_elec['Heizstäbe'].mean():.3f} GW")
 
     q_heat = pd.DataFrame(index=plot_idx)
-    if len(large_hp_links) > 0:
-        q_heat["Groß-WP (Fernw.)"] = get_series(p1, large_hp_links).abs()
-    if len(small_hp_links) > 0:
-        q_heat["Dezentrale WP"]     = get_series(p1, small_hp_links).abs()
-    if len(res_links) > 0:
-        q_heat["Heizstäbe"]         = get_series(p1, res_links).abs()
+    if len(large_hp) > 0:
+        q_heat["Groß-WP (Fernw.)"] = get_series(p1, large_hp).abs()
+    if len(small_hp) > 0:
+        q_heat["Dezentrale WP"]     = get_series(p1, small_hp).abs()
+    if len(res) > 0:
+        q_heat["Heizstäbe"]         = get_series(p1, res).abs()
 
-    for link in boiler_links:
+    for link in boilers:
         carrier = n.links.at[link, "carrier"]
         if "gas"      in carrier: label = "Gas-Kessel"
         elif "oil"    in carrier: label = "Öl-Kessel"
@@ -183,47 +145,44 @@ def analyze_heat_sector(n, country, ts_index, mask):
             continue
         val = p1[[link]].loc[mask].iloc[:, 0].abs() / 1000
         val.index = plot_idx
-        if label in q_heat.columns:
-            q_heat[label] += val
-        else:
-            q_heat[label] = val
+        q_heat[label] = q_heat[label] + val if label in q_heat.columns else val
 
     return p_elec, q_heat
 
 
 def summarize_heat_energy(q_heat, country):
-    print(f"\n🔥 Wärme {country}:")
+    print(f"\n  🔥 Wärme {country}:")
     for col in ["Groß-WP (Fernw.)", "Dezentrale WP", "Heizstäbe",
                 "Gas-Kessel", "Öl-Kessel", "Biomasse-Kessel", "Sonstige Kessel"]:
         if col in q_heat.columns:
-            print(f"  {col:20s}: {q_heat[col].sum()/1000:6.2f} TWh | "
-                  f"Peak: {q_heat[col].max():6.1f} GW_th")
+            print(f"    {col:20s}: {q_heat[col].sum()/1000:6.2f} TWh | Peak: {q_heat[col].max():6.1f} GW")
         else:
-            print(f"  {col:20s}:   0.00 TWh | Peak:    0.0 GW_th")
+            print(f"    {col:20s}:   0.00 TWh | Peak:    0.0 GW")
 
 
 def get_installed_heat_capacities(n, country):
     links = _links_for_country(n, country)
 
-    def filter_cap(mask):
-        subset = links[mask]
-        if subset.empty: return 0.0
-        col = "p_nom_opt" if "p_nom_opt" in subset.columns else "p_nom"
-        return subset[col].sum() / 1000
+    def cap(mask):
+        sub = links[mask]
+        if sub.empty: return 0.0
+        col = "p_nom_opt" if "p_nom_opt" in sub.columns else "p_nom"
+        return sub[col].sum() / 1000
 
     caps = {
-        "Groß-WP":       filter_cap(links.carrier.str.contains("heat pump", case=False) & links.carrier.str.contains("central", case=False)),
-        "Dezentrale WP":  filter_cap(links.carrier.str.contains("heat pump", case=False) & ~links.carrier.str.contains("central", case=False)),
-        "Heizstäbe":     filter_cap(links.carrier.str.contains("resistive heater", case=False)),
-        "Gas-Kessel":    filter_cap(links.carrier.str.contains("gas boiler",       case=False)),
-        "Öl-Kessel":     filter_cap(links.carrier.str.contains("oil boiler",        case=False)),
-        "Biomasse":      filter_cap(links.carrier.str.contains("biomass boiler",   case=False)),
+        "Groß-WP":      cap(links.carrier.str.contains("heat pump", case=False) & links.carrier.str.contains("central", case=False)),
+        "Dezentrale WP": cap(links.carrier.str.contains("heat pump", case=False) & ~links.carrier.str.contains("central", case=False)),
+        "Heizstäbe":    cap(links.carrier.str.contains("resistive heater", case=False)),
+        "Gas-Kessel":   cap(links.carrier.str.contains("gas boiler",      case=False)),
+        "Öl-Kessel":    cap(links.carrier.str.contains("oil boiler",       case=False)),
+        "Biomasse":     cap(links.carrier.str.contains("biomass boiler",  case=False)),
     }
     caps["TOTAL"] = sum(caps.values())
     return caps
 
 
-def plot_diagnosis(p_elec, q_heat, country, target_year, scenario_name, save_dir):
+def plot_diagnosis(p_elec, q_heat, country, target_year, scenario_name, save_dir,
+                  start_date, end_date):
     config = PlottingConfig()
     font_sizes = {k: v + 4 for k, v in config.FONT_SIZES.items()}
     fig, axes = plt.subplots(2, 1, figsize=(15, 12), sharex=True)
@@ -246,13 +205,15 @@ def plot_diagnosis(p_elec, q_heat, country, target_year, scenario_name, save_dir
         ax1.text(0.5, 0.5, "Kein relevanter Stromverbrauch",
                  ha='center', va='center', transform=ax1.transAxes)
     ax1.set_ylabel("Stromverbrauch [GW]", fontsize=font_sizes['label'])
-    ax1.set_title(f"Stromverbrauch für Wärme ({country} {target_year})", fontsize=font_sizes['title'])
+    ax1.set_title(f"Stromverbrauch für Wärme ({country} {target_year}, {start_date}–{end_date})",
+                  fontsize=font_sizes['title'])
     ax1.grid(True, alpha=0.4, linestyle='--')
 
     ax2 = axes[1]
     plot_cols = [c for c in q_heat.columns if q_heat[c].abs().sum() > 0.01]
     if plot_cols:
-        priority = ["Groß-WP (Fernw.)", "Dezentrale WP", "Biomasse-Kessel", "Heizstäbe", "Gas-Kessel", "Öl-Kessel"]
+        priority = ["Groß-WP (Fernw.)", "Dezentrale WP", "Biomasse-Kessel",
+                    "Heizstäbe", "Gas-Kessel", "Öl-Kessel"]
         plot_cols.sort(key=lambda x: priority.index(x) if x in priority else 99)
         ax2.stackplot(q_heat.index, *[q_heat[c] for c in plot_cols],
                       labels=plot_cols,
@@ -271,18 +232,23 @@ def plot_diagnosis(p_elec, q_heat, country, target_year, scenario_name, save_dir
     fname = f"diagnose_fuelswitch_{scenario_name}_{country}_{target_year}.png"
     out_path = os.path.join(save_dir, fname)
     plt.savefig(out_path, dpi=150, bbox_inches='tight')
-    print(f"✅ Plot gespeichert: {out_path}")
+    print(f"  ✅ {out_path}")
     plt.close()
 
 
 def main():
     config = PlottingConfig()
-    networks = config.get_networks()
+    networks  = config.get_networks()
     countries = config.get_countries()
+
+    # Zeitraum aus Config lesen
+    start_date = config.DARK_SKY_START  # z.B. "2005-01-07"
+    end_date   = config.DARK_SKY_END    # z.B. "2005-01-28"
+    print(f"📅 Analysezeitraum: {start_date} bis {end_date}")
 
     save_dir = os.path.join(config.BASE_SAVE_PATH, "heat_diagnosis")
     os.makedirs(save_dir, exist_ok=True)
-    print(f"📁 Speichere Plots nach: {save_dir}")
+    print(f"📁 Plots → {save_dir}")
 
     if not isinstance(networks, dict):
         networks = {config.SCENARIO_SELECTION: networks}
@@ -299,40 +265,33 @@ def main():
                 print(f"Fehlt: {path}")
                 continue
 
-            print(f"\n📂 Lade {path} ...")
+            print(f"\n📂 {path}")
             n = pypsa.Network(path)
 
-            # Snapshot-Index auflösen (DatetimeIndex vs. MultiIndex)
             ts_index, is_multi = _resolve_snapshots(n)
-            print(f"  Snapshot-Typ: {'MultiIndex (perfect-foresight)' if is_multi else 'DatetimeIndex (myopic)'}")
-            print(f"  links_t.p0: {len(n.links_t.p0.columns)} Spalten | "
-                  f"links_t.p1: {len(n.links_t.p1.columns)} Spalten")
+            print(f"  Snapshots: {'MultiIndex (perfect-foresight)' if is_multi else 'DatetimeIndex (myopic)'}")
+            print(f"  links_t.p0: {len(n.links_t.p0.columns)} | links_t.p1: {len(n.links_t.p1.columns)}")
 
-            # Zeitraum-Maske einmal berechnen
-            mask = _get_valid_mask(ts_index, START_DATE, END_DATE)
-            n_steps = mask.sum()
-            print(f"  Zeitschritte im Fenster ({START_DATE} bis {END_DATE}): {n_steps}")
-
+            mask = _get_valid_mask(ts_index, start_date, end_date)
+            n_steps = int(mask.sum())
+            print(f"  Zeitschritte im Fenster: {n_steps}")
             if n_steps == 0:
-                print(f"  ⚠️ Keine Zeitschritte im Fenster — überspringe {path}")
+                print(f"  ⚠️  Kein Zeitfenster → überspringe")
                 continue
 
-            # WP-Diagnose
             hp_all = n.links[n.links.carrier.str.contains("heat pump", case=False)]
-            print(f"  Alle WP-Links: {len(hp_all)}")
             if not hp_all.empty:
                 ex = hp_all.index[0]
-                print(f"  Beispiel: '{ex}' | bus0='{n.links.at[ex,'bus0']}' | "
-                      f"p0: {ex in n.links_t.p0.columns} | p1: {ex in n.links_t.p1.columns}")
+                print(f"  Beispiel WP: '{ex}' | p0: {ex in n.links_t.p0.columns}")
 
             if int(target_year) in [2030, 2040, 2050]:
                 try:
                     caps = get_installed_heat_capacities(n, "DE")
-                    print(f"  --- Kapazitäten DE {target_year} ---")
+                    print(f"  Kapazitäten DE {target_year}:")
                     for k, v in caps.items():
                         print(f"    {k:15s}: {v:.2f} GW")
                 except Exception as e:
-                    print(f"❌ Kapazitäten: {e}")
+                    print(f"  ❌ Kapazitäten: {e}")
 
             for country in countries:
                 if country == "ALL":
@@ -341,9 +300,10 @@ def main():
                     p_elec, q_heat = analyze_heat_sector(n, country, ts_index, mask)
                     if country == "DE":
                         summarize_heat_energy(q_heat, country)
-                    plot_diagnosis(p_elec, q_heat, country, target_year, scenario_name, save_dir)
+                    plot_diagnosis(p_elec, q_heat, country, target_year,
+                                   scenario_name, save_dir, start_date, end_date)
                 except Exception as e:
-                    print(f"Fehler {country}: {e}")
+                    print(f"  Fehler {country}: {e}")
                     import traceback
                     traceback.print_exc()
 
