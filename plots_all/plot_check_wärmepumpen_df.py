@@ -6,6 +6,7 @@ Diagnose-Skript: Fuel-Switch im Wärmesektor
 - Analysezeitraum wird aus config.DARK_SKY_START / DARK_SKY_END gelesen
 - Unterstützt PyPSA perfect-foresight (MultiIndex snapshots) UND myopic (DatetimeIndex)
 - Filterung über n.links.index (Link-Name enthält Länderkürzel)
+- p0 wird mit .abs() gelesen: in PyPSA ist p0 des Input-Bus negativ (Entnahme aus Bus)
 """
 
 import os
@@ -119,9 +120,11 @@ def analyze_heat_sector(n, country, ts_index, mask):
         return sub
 
     p_elec = pd.DataFrame(index=plot_idx)
-    p_elec["Groß-WP"]      = get_series(p0, large_hp)
-    p_elec["Dezentrale WP"] = get_series(p0, small_hp)
-    p_elec["Heizstäbe"]    = get_series(p0, res)
+    # .abs(): p0 ist in PyPSA per Konvention NEGATIV für den Input-Bus
+    # (Strom wird dem Bus entnommen -> negativer Fluss aus Bus-Sicht)
+    p_elec["Groß-WP"]      = get_series(p0, large_hp).abs()
+    p_elec["Dezentrale WP"] = get_series(p0, small_hp).abs()
+    p_elec["Heizstäbe"]    = get_series(p0, res).abs()
 
     print(f"    Groß-WP Ø {p_elec['Groß-WP'].mean():.3f} GW | "
           f"Dez-WP Ø {p_elec['Dezentrale WP'].mean():.3f} GW | "
@@ -241,9 +244,8 @@ def main():
     networks  = config.get_networks()
     countries = config.get_countries()
 
-    # Zeitraum aus Config lesen
-    start_date = config.DARK_SKY_START  # z.B. "2005-01-07"
-    end_date   = config.DARK_SKY_END    # z.B. "2005-01-28"
+    start_date = config.DARK_SKY_START
+    end_date   = config.DARK_SKY_END
     print(f"📅 Analysezeitraum: {start_date} bis {end_date}")
 
     save_dir = os.path.join(config.BASE_SAVE_PATH, "heat_diagnosis")
