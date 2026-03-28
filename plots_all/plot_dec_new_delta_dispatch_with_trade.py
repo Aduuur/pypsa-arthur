@@ -35,8 +35,8 @@ CARRIER_TRANSLATION = {
     "offwind-ac": "Wind Offshore",
     "offwind-dc": "Wind Offshore",
     "ror": "Laufwasser",
-    "hydro": "Wasserkraft",  # Reservoir Hydro
-    "PHS": "Pumpspeicher",  # Pumped Hydro
+    "hydro": "Wasserkraft",
+    "PHS": "Pumpspeicher",
     "nuclear": "Kernkraft",
     "lignite": "Braunkohle",
     "coal": "Steinkohle",
@@ -89,7 +89,6 @@ def get_generation_timeseries(n: pypsa.Network, country_code: str):
 
     # --- 1. GENERATORS (Wind, Solar, Laufwasser, Gas, etc.) ---
     gens = n.generators[n.generators.bus.str.startswith(country_code)]
-    # Filter auf elektrische Busse
     gens = gens[gens.bus.map(lambda b: n.buses.at[b, "carrier"] in electric_carriers)]
 
     if not gens.empty:
@@ -100,24 +99,21 @@ def get_generation_timeseries(n: pypsa.Network, country_code: str):
         gen_ts = pd.DataFrame(index=n.snapshots)
 
     # --- 2. STORAGE UNITS (Wasserkraft Reservoirs, PHS) ---
-    # Das fehlte vorher! Hydro Reservoirs sind StorageUnits.
     sus = n.storage_units[n.storage_units.bus.str.startswith(country_code)]
     sus = sus[sus.bus.map(lambda b: n.buses.at[b, "carrier"] in electric_carriers)]
 
     if not sus.empty:
-        # p_dispatch ist die Erzeugung (Turbinieren)
         p_su = n.storage_units_t.p_dispatch[sus.index].copy()
         p_su.columns = sus.carrier.values
         su_ts = p_su.groupby(axis=1, level=0).sum()
     else:
         su_ts = pd.DataFrame(index=n.snapshots)
 
-    # --- 3. LINKS (Batterien Discharger, Interkonnektoren die als Generatoren wirken) ---
+    # --- 3. LINKS ---
     links = n.links[
         (n.links.bus0.str.startswith(country_code) | n.links.bus1.str.startswith(country_code))
         & ~n.links.carrier.str.contains(LINK_BLACKLIST_PAT)
         ]
-    # AC/DC Links filtern wir hier raus, die machen wir separat über Import/Export Funktion
     links = links[~links.carrier.str.contains("Electrolysis|DC|AC", case=False, na=False)]
 
     link_data = {}
@@ -128,22 +124,9 @@ def get_generation_timeseries(n: pypsa.Network, country_code: str):
         c0 = n.buses.at[row.bus0, "carrier"]
         c1 = n.buses.at[row.bus1, "carrier"]
 
-        # Logik: Wir suchen Links, die in das Stromnetz einspeisen (wie Generatoren)
         val = None
-
-        # Fall 1: Link endet im Land (bus1) -> Einspeisung ist p1 (positiv definiert?)
-        # PyPSA Konvention: p1 ist Leistung am Bus1. Wenn positiv -> Einspeisung in Bus.
-        # Aber bei Dischargern ist oft p0 positiv (Entnahme aus Store) und p1 = -p0 * eff (negativ am Bus? oder positiv?)
-        # Wir prüfen p1. Normalerweise: p1 ist negativ bei Entnahme aus Link.
-        # Aber wir nehmen hier an: Wir wollen POSITIVE Erzeugung sehen.
-
         if b1_loc == country_code and c1 in electric_carriers:
-            # Energie kommt am Bus1 an. In PyPSA ist p1 oft negativ (Entnahme aus Link).
-            # Wir nehmen -p1 und clippen auf positiv.
             val = (-n.links_t.p1[name]).clip(lower=0)
-
-        # Fall 2: Link startet im Land (bus0) -> Einspeisung in Bus0?
-        # Unwahrscheinlich für "Generation", meistens Verbraucher (P2G). Ignorieren wir hier meistens.
         elif b0_loc == country_code and c0 in electric_carriers:
             continue
         else:
@@ -208,7 +191,6 @@ def plot_difference_with_trade(
 ):
     """Erstellt den Differenz-Plot mit fester Geometrie."""
 
-    # 1. Daten Slicen & Resampling
     d_base = df_base.loc[period_slice]
     d_df = df_df.loc[period_slice]
     i_base = imp_base.loc[period_slice]
@@ -234,7 +216,6 @@ def plot_difference_with_trade(
         cols = ["Nettohandel"] + sorted(cols)
     diff_gen = diff_gen[cols]
 
-    # --- PLOT SETUP ---
     fig, ax = plt.subplots(figsize=(14, 7))
 
     pos = diff_gen.clip(lower=0)
@@ -262,7 +243,6 @@ def plot_difference_with_trade(
     ax.stackplot(x, neg.T, colors=colors, alpha=0.9)
     ax.axhline(0, color="black", lw=1.5, zorder=5)
 
-    # Titel & Labels
     title_period = "Januar" if period_label == "Januar" else "Jahr"
     ax.set_title(
         f"Delta Dispatch: {country} {year}\n"
@@ -271,7 +251,6 @@ def plot_difference_with_trade(
     )
     ax.set_ylabel("Leistungsdifferenz [GW]\n(Positiv = Mehr in Dunkelflaute)", fontsize=16)
 
-    # X-Achse
     if period_label == "Januar":
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%d.%m.'))
         ax.xaxis.set_major_locator(mdates.DayLocator(interval=4))
@@ -281,7 +260,6 @@ def plot_difference_with_trade(
 
     ax.tick_params(axis='both', labelsize=14)
 
-    # Legende
     handles, labels = ax.get_legend_handles_labels()
     ax.legend(
         reversed(handles), reversed(labels),
@@ -289,11 +267,8 @@ def plot_difference_with_trade(
         title="Technologie", fontsize=14, title_fontsize=14
     )
     ax.grid(axis="y", linestyle="--", alpha=0.3)
-
-    # --- FESTES LAYOUT ---
     plt.subplots_adjust(left=0.10, right=0.80, top=0.88, bottom=0.12)
 
-    # Speichern
     path = os.path.join(config.PLOT_OUTPUT_PATH, "dispatch_difference")
     os.makedirs(path, exist_ok=True)
     fname = f"DiffDispatch_{country}_{year}_{period_label}.png"
@@ -315,9 +290,24 @@ def main():
 
     cfg.SCENARIO_SELECTION = "both"
     networks = cfg.get_networks()
+
+    # FIX: get_networks() gibt bei einem einzelnen Szenario eine Liste zurück.
+    # Für dec_delta_dispatch brauchen wir zwingend 2 Szenarien ("both"-Modus).
+    # Falls eine Liste zurückkommt, geben wir eine hilfreiche Warnung aus.
+    if isinstance(networks, list):
+        print(
+            "⚠️  dec_delta_dispatch: get_networks() lieferte eine Liste statt einem Dict.\n"
+            "    Dieser Plot benötigt 'both_mapping' mit genau 2 Szenarien in master_config.\n"
+            "    Bitte SCENARIO_SELECTION='both' und 'both_mapping' konfigurieren. Skip."
+        )
+        return
+    if not isinstance(networks, dict):
+        print("⚠️  dec_delta_dispatch: Unerwartetes Format von get_networks(), skip.")
+        return
+
     keys = list(networks.keys())
     if len(keys) != 2:
-        print("Fehler: Modus 'both' muss genau 2 Szenarien liefern.")
+        print(f"⚠️  dec_delta_dispatch: Modus 'both' muss genau 2 Szenarien liefern, got {len(keys)}. Skip.")
         return
 
     base_key = keys[0]

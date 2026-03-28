@@ -21,25 +21,6 @@ import matplotlib.pyplot as plt
 from config_final import PlottingConfig
 
 # =====================================================================
-# --- Zeiträume ---
-# =====================================================================
-def plot_consumption(df, year_label, country, config: PlottingConfig, network_path: str):
-    if df.empty:
-        print(f"⚠️ Kein Verbrauch für {country} ({year_label})")
-        return
-
-    sim_year     = df.index[0].year
-    detail_start = f"{sim_year}-01-10"
-    detail_end   = f"{sim_year}-02-15"
-    year_start   = f"{sim_year}-01-01"
-    year_end     = f"{sim_year}-12-31"
-
-    df_detail = df.loc[detail_start:detail_end]
-    if df_detail.empty:
-        print(f"⚠️ Skip {country} ({year_label}): kein Detailzeitraum.")
-        return
-
-# =====================================================================
 # --- Linkfilter & Bus-Erkennung ---
 # =====================================================================
 LINK_BLACKLIST_PAT = re.compile(
@@ -108,6 +89,18 @@ def plot_consumption(df, year_label, country, config: PlottingConfig, network_pa
         print(f"⚠️ Kein Verbrauch für {country} ({year_label})")
         return
 
+    # FIX: Zeitgrenzen dynamisch aus dem Netz-Index ableiten (kein hardcoded globaler Name)
+    sim_year     = df.index[0].year
+    DETAIL_START = f"{sim_year}-01-10"
+    DETAIL_END   = f"{sim_year}-02-15"
+    YEAR_START   = f"{sim_year}-01-01"
+    YEAR_END     = f"{sim_year}-12-31"
+
+    df_detail = df.loc[DETAIL_START:DETAIL_END]
+    if df_detail.empty:
+        print(f"⚠️ Skip {country} ({year_label}): kein Detailzeitraum.")
+        return
+
     # gewünschte Reihenfolge (unten nach oben)
     order = [
         "load", "battery charger", "H2 Electrolysis", "methanation", "Haber-Bosch",
@@ -122,7 +115,6 @@ def plot_consumption(df, year_label, country, config: PlottingConfig, network_pa
     os.makedirs(save_dir, exist_ok=True)
 
     # === 1️⃣ Detailansicht: Januar–Februar (stundenweise) ===
-    df_detail = df.loc[DETAIL_START:DETAIL_END]
     fig, ax = plt.subplots(figsize=(13, 5))
     (-df_detail).plot.area(
         ax=ax,
@@ -137,20 +129,18 @@ def plot_consumption(df, year_label, country, config: PlottingConfig, network_pa
     ax.set_title(
         f"Zeitverlauf des Stromverbrauchs – {title_country} ({year_label})",
         fontsize=config.FONT_SIZES["title"],
-        fontweight="normal",  # nicht fett
+        fontweight="normal",
     )
     ax.grid(axis="y", linestyle="--", alpha=0.3)
     ax.set_axisbelow(True)
     ax.tick_params(axis="x", labelsize=config.FONT_SIZES["tick"])
     ax.tick_params(axis="y", labelsize=config.FONT_SIZES["tick"])
-
     ax.legend(
         bbox_to_anchor=(1.02, 1),
         loc="upper left",
         fontsize=config.FONT_SIZES["legend"],
         title="Sektor / Technologie",
     )
-
     fig.tight_layout()
     save_path_detail = os.path.join(save_dir, f"consumption_timeline_detail_{country}_{year_label}.png")
     plt.savefig(save_path_detail, dpi=300)
@@ -173,20 +163,18 @@ def plot_consumption(df, year_label, country, config: PlottingConfig, network_pa
     ax.set_title(
         f"Jahresverlauf des Stromverbrauchs – {title_country} ({year_label})",
         fontsize=config.FONT_SIZES["title"],
-        fontweight="normal",  # nicht fett
+        fontweight="normal",
     )
     ax.grid(axis="y", linestyle="--", alpha=0.3)
     ax.set_axisbelow(True)
     ax.tick_params(axis="x", labelsize=config.FONT_SIZES["tick"])
     ax.tick_params(axis="y", labelsize=config.FONT_SIZES["tick"])
-
     ax.legend(
         bbox_to_anchor=(1.02, 1),
         loc="upper left",
         fontsize=config.FONT_SIZES["legend"],
         title="Sektor / Technologie",
     )
-
     fig.tight_layout()
     save_path_year = os.path.join(save_dir, f"consumption_timeline_year_{country}_{year_label}.png")
     plt.savefig(save_path_year, dpi=300)

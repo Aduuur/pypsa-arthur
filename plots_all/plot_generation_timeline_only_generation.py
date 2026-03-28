@@ -21,32 +21,8 @@ import matplotlib.pyplot as plt
 from config_final import PlottingConfig
 
 # =====================================================================
-# --- Zeiträume ---
-# =====================================================================
-# NEU — Konstanten löschen, stattdessen in plot_generation() oben einfügen:
-def plot_generation(df, year_label, country, config: PlottingConfig, network_path: str):
-    if df.empty:
-        print(f"⚠️ Keine Erzeugung für {country} ({year_label})")
-        return
-
-    # ← NEU: Jahr dynamisch aus dem DataFrame-Index
-    sim_year   = df.index[0].year
-    detail_start = f"{sim_year}-01-10"
-    detail_end   = f"{sim_year}-02-15"
-    year_start   = f"{sim_year}-01-01"
-    year_end     = f"{sim_year}-12-31"
-
-    df_detail = df.loc[detail_start:detail_end]
-    if df_detail.empty:
-        print(f"⚠️ Keine Daten im Detailzeitraum für {country} ({year_label}), skip.")
-        return
-
-
-
-# =====================================================================
 # --- Linkfilter & Bus-Erkennung ---
 # =====================================================================
-import re
 LINK_BLACKLIST_PAT = re.compile(
     r"distribution|AC|DC|heat|boiler|pump|battery charger|storage charger|"
     r"pipeline|hydrogen network|H2 pipeline|industry|resistive|"
@@ -124,6 +100,13 @@ def plot_generation(df, year_label, country, config: PlottingConfig, network_pat
         print(f"⚠️ Keine Erzeugung für {country} ({year_label})")
         return
 
+    # FIX: Zeitgrenzen dynamisch aus dem Netz-Index ableiten (kein hardcoded globaler Name)
+    sim_year = df.index[0].year
+    DETAIL_START = f"{sim_year}-01-10"
+    DETAIL_END   = f"{sim_year}-02-15"
+    YEAR_START   = f"{sim_year}-01-01"
+    YEAR_END     = f"{sim_year}-12-31"
+
     # Reihenfolge der Technologien
     order = [
          "H2 Fuel Cell", "H2 turbine", "H2 OCGT", "battery discharger",
@@ -143,6 +126,10 @@ def plot_generation(df, year_label, country, config: PlottingConfig, network_pat
 
     # === 1️⃣ Detailansicht: Januar–Februar (stundenweise) ===
     df_detail = df.loc[DETAIL_START:DETAIL_END]
+    if df_detail.empty:
+        print(f"⚠️ Keine Daten im Detailzeitraum für {country} ({year_label}), skip.")
+        return
+
     fig, ax = plt.subplots(figsize=(13, 5))
     df_detail.plot.area(
         ax=ax,
@@ -156,13 +143,12 @@ def plot_generation(df, year_label, country, config: PlottingConfig, network_pat
     ax.set_title(
         f"Zeitverlauf der Stromerzeugung – {title_country} ({year_label})",
         fontsize=config.FONT_SIZES["title"],
-        fontweight="normal",  # nicht fett
+        fontweight="normal",
     )
     ax.grid(axis="y", linestyle="--", alpha=0.3)
     ax.set_axisbelow(True)
     ax.tick_params(axis="x", labelsize=config.FONT_SIZES["tick"])
     ax.tick_params(axis="y", labelsize=config.FONT_SIZES["tick"])
-
     ax.legend(
         bbox_to_anchor=(1.02, 1),
         loc="upper left",
@@ -190,13 +176,12 @@ def plot_generation(df, year_label, country, config: PlottingConfig, network_pat
     ax.set_title(
         f"Jahresverlauf der Stromerzeugung – {title_country} ({year_label})",
         fontsize=config.FONT_SIZES["title"],
-        fontweight="normal",  # nicht fett
+        fontweight="normal",
     )
     ax.grid(axis="y", linestyle="--", alpha=0.3)
     ax.set_axisbelow(True)
     ax.tick_params(axis="x", labelsize=config.FONT_SIZES["tick"])
     ax.tick_params(axis="y", labelsize=config.FONT_SIZES["tick"])
-
     ax.legend(
         bbox_to_anchor=(1.02, 1),
         loc="upper left",
