@@ -2608,19 +2608,77 @@ def _dispatch_solve(
     w.min(), w.max(), w.sum(), len(w), annual_scale)
 
     # [ARO-FIX-10b] Convert reversed HP/heat links in dispatch network.
-    _rev_d = n.links[(n.links.p_max_pu == 0.0) & (n.links.p_min_pu < 0.0)].index
+    # Case 1: p_min_pu<0, p_max_pu=0 (classic reversed convention)
+    # Case 2: bus0=heat bus, p_max_pu=0 (blocked HP with wrong bus convention)
+    _hp_carriers = n.links.carrier.str.contains("heat pump", case=False)
+    _heat_bus0 = n.links.bus0.str.contains("heat", case=False)
+    _blocked = (n.links.p_max_pu == 0.0)
+    _rev_d = n.links[
+        _hp_carriers & (_blocked | (n.links.p_min_pu < 0.0)) &
+        (_heat_bus0 | (n.links.p_min_pu < 0.0))
+    ].index
     if len(_rev_d) > 0:
         _b0d = n.links.loc[_rev_d, "bus0"].copy()
         _b1d = n.links.loc[_rev_d, "bus1"].copy()
         n.links.loc[_rev_d, "bus0"] = _b1d.values
         n.links.loc[_rev_d, "bus1"] = _b0d.values
         _pmd = n.links.loc[_rev_d, "p_min_pu"].copy()
-        n.links.loc[_rev_d, "p_max_pu"] = (-_pmd).values
+        # p_max_pu: use -p_min if negative, else 1.0 for blocked HPs
+        _new_pmax = (-_pmd).where(_pmd < 0, 1.0)
+        n.links.loc[_rev_d, "p_max_pu"] = _new_pmax.values
         n.links.loc[_rev_d, "p_min_pu"] = 0.0
         _ecd = [c for c in _rev_d if c in n.links_t.efficiency.columns]
         if _ecd:
             n.links_t.efficiency[_ecd] = 1.0 / n.links_t.efficiency[_ecd]
-        logger.info("[ARO-FIX-10b] Dispatch: converted %d reversed links", len(_rev_d))
+        # Reciprocate static efficiency for those without timeseries
+        _eff_static_d = [c for c in _rev_d if c not in n.links_t.efficiency.columns]
+        if _eff_static_d:
+            _eff_d = n.links.loc[_eff_static_d, "efficiency"].replace(0, np.nan)
+            n.links.loc[_eff_static_d, "efficiency"] = (1.0 / _eff_d).fillna(1.0)
+        logger.info("[ARO-FIX-10b] Dispatch: converted %d reversed/blocked HP links "
+                    "(bus0-heat: %d, p_min<0: %d)",
+                    len(_rev_d),
+                    int((_heat_bus0 & _blocked)[_rev_d].sum()),
+                    int((n.links.p_min_pu < 0)[_rev_d].sum() if len(_rev_d) else 0))
+
+    # [NUM-FIX-0b] Cap H2 Store e_nom_max for dispatch
+    _h2_inf_d = n.stores[
+        (n.stores.carrier.str.contains("H2", case=False)) &
+        n.stores.e_nom_extendable.fillna(False) &
+        (n.stores.e_nom_max >= 1e14)
+    ].index
+    if len(_h2_inf_d) > 0:
+        n.stores.loc[_h2_inf_d, "e_nom_max"] = 1e8
+        logger.info("[NUM-FIX-0b] Dispatch: H2 Store e_nom_max=1e8 MWh (%d)", len(_h2_inf_d))
+
+    # [NUM-FIX-1b/2b/3b] Numerical conditioning fixes for dispatch
+    _co2seq_d = n.links[
+        (n.links.carrier == "co2 sequestered") &
+        n.links.p_nom_extendable.fillna(False) &
+        (n.links.p_nom_max >= 1e14)
+    ].index
+    if len(_co2seq_d) > 0:
+        _gc_d = n.global_constraints
+        _lim_d = abs(float(_gc_d.loc["co2_sequestration_limit","constant"]))             if "co2_sequestration_limit" in _gc_d.index else 2.5e8
+        _max_d = _lim_d / max(len(_co2seq_d), 1) / 8760 * 1e6
+        n.links.loc[_co2seq_d, "p_nom_max"] = _max_d
+        logger.info("[NUM-FIX-1b] Dispatch: co2 sequestered p_nom_max=%.2e MW", _max_d)
+    _tanks_d = n.links[
+        n.links.carrier.str.contains("water tanks", case=False) &
+        n.links.p_nom_extendable.fillna(False) &
+        (n.links.capital_cost <= 10.0)
+    ].index
+    if len(_tanks_d) > 0:
+        n.links.loc[_tanks_d, "capital_cost"] = 100.0
+        logger.info("[NUM-FIX-2b] Dispatch: water tanks capital_cost=100 EUR/MW (%d)", len(_tanks_d))
+    _nuc_d = n.generators[
+        (n.generators.carrier.str.contains("nuclear", case=False)) &
+        (~n.generators.p_nom_extendable.fillna(False)) &
+        (n.generators.p_nom_max >= 1e14)
+    ].index
+    if len(_nuc_d) > 0:
+        n.generators.loc[_nuc_d, "p_nom_max"] = n.generators.loc[_nuc_d, "p_nom"]
+        logger.info("[NUM-FIX-3b] Dispatch: nuclear p_nom_max capped (%d)", len(_nuc_d))
 
     # [ARO-FIX-11b] Align build_year in dispatch network.
     _cur_d = int(n.investment_periods[0]) if len(n.investment_periods) > 0 else 0
@@ -3993,11 +4051,15 @@ def solve_aro_master(
     # For extendable links with p_nom_init=0 and p_max_pu=0, this gives [0,0] → variable
     # is masked as "always zero" → heat pumps completely absent from LP.
     # Fix: swap bus0/bus1, invert p_min/max_pu, reciprocate efficiency timeseries.
-    _rev = n.links[
-        (n.links.p_max_pu == 0.0) &
-        (n.links.p_min_pu < 0.0) &
-        n.links.p_nom_extendable.fillna(False)
-    ].index
+    # Case 1: classic reversed (p_min_pu<0, p_max_pu=0)
+    # Case 2: blocked HP (bus0=heat bus, p_max_pu=0, p_min_pu=0) — new prepared networks
+    _hp_mask = n.links.carrier.str.contains("heat pump", case=False)
+    _ext_mask = n.links.p_nom_extendable.fillna(False)
+    _blocked = (n.links.p_max_pu == 0.0)
+    _classic_rev = _blocked & (n.links.p_min_pu < 0.0) & _ext_mask
+    _heat_bus0 = n.links.bus0.str.contains("heat", case=False)
+    _new_rev = _hp_mask & _blocked & _heat_bus0 & _ext_mask
+    _rev = n.links[_classic_rev | _new_rev].index
     if len(_rev) > 0:
         logger.info("[ARO-FIX-10] Converting %d reversed extendable links to normal convention: %s",
                     len(_rev), n.links.loc[_rev, "carrier"].value_counts().to_dict())
@@ -4006,7 +4068,8 @@ def solve_aro_master(
         n.links.loc[_rev, "bus0"] = _b1.values
         n.links.loc[_rev, "bus1"] = _b0.values
         _pmin = n.links.loc[_rev, "p_min_pu"].copy()
-        n.links.loc[_rev, "p_max_pu"] = (-_pmin).values   # e.g. -(-1) = 1
+        # For classic reversed: -p_min_pu; for blocked HPs (p_min=0): set to 1.0
+        n.links.loc[_rev, "p_max_pu"] = (-_pmin).where(_pmin < 0, 1.0).values
         n.links.loc[_rev, "p_min_pu"] = 0.0
         # Reciprocate efficiency timeseries (1/COP → COP)
         _eff_ts_cols = [c for c in _rev if c in n.links_t.efficiency.columns]
@@ -4017,6 +4080,67 @@ def solve_aro_master(
         if _eff_static:
             _eff = n.links.loc[_eff_static, "efficiency"].replace(0, np.nan)
             n.links.loc[_eff_static, "efficiency"] = (1.0 / _eff).fillna(1.0)
+
+    # [NUM-FIX-0] Cap H2 Store e_nom_max to finite value
+    # e_nom_max=inf creates unbounded investment variables → poor Barrier conditioning
+    _h2_inf = n.stores[
+        (n.stores.carrier.str.contains("H2", case=False)) &
+        n.stores.e_nom_extendable.fillna(False) &
+        (n.stores.e_nom_max >= 1e14)
+    ].index
+    if len(_h2_inf) > 0:
+        # 1e8 MWh = 100 TWh per node — physically plausible upper bound
+        n.stores.loc[_h2_inf, "e_nom_max"] = 1e8
+        logger.info("[NUM-FIX-0] H2 Store e_nom_max capped to 1e8 MWh (%d stores)", len(_h2_inf))
+
+    # [NUM-FIX-0c] Cap gas/methanol stores to finite max
+    _gas_inf = n.stores[
+        (n.stores.carrier.isin(["gas", "methanol", "oil", "ammonia store"])) &
+        n.stores.e_nom_extendable.fillna(False) &
+        (n.stores.e_nom_max >= 5e7)
+    ].index
+    if len(_gas_inf) > 0:
+        n.stores.loc[_gas_inf, "e_nom_max"] = 5e7
+        logger.info("[NUM-FIX-0c] gas/methanol/oil stores e_nom_max capped to 5e7 MWh (%d)", len(_gas_inf))
+
+    # [NUM-FIX-1] Set finite p_nom_max for co2 sequestered links
+    # Prevents unbounded LP variables → improves Barrier conditioning
+    _co2seq = n.links[
+        (n.links.carrier == "co2 sequestered") &
+        n.links.p_nom_extendable.fillna(False) &
+        (n.links.p_nom_max >= 1e14)
+    ].index
+    if len(_co2seq) > 0:
+        # Derive from global constraint: total limit / n_nodes / 8760h
+        _gc = n.global_constraints
+        _seq_limit = abs(float(_gc.loc["co2_sequestration_limit", "constant"]))             if "co2_sequestration_limit" in _gc.index else 2.5e8
+        _max_per_node = _seq_limit / max(len(_co2seq), 1) / 8760 * 1e6  # tCO2/h → MW
+        n.links.loc[_co2seq, "p_nom_max"] = _max_per_node
+        logger.info("[NUM-FIX-1] co2 sequestered p_nom_max set to %.2e MW (%d links)",
+                    _max_per_node, len(_co2seq))
+
+    # [NUM-FIX-2] Raise water tank charger/discharger capital_cost floor
+    # capital_cost=1.0 EUR/MW creates 1e6 ratio vs DAC → poor Objective conditioning
+    _tanks = n.links[
+        n.links.carrier.str.contains("water tanks", case=False) &
+        n.links.p_nom_extendable.fillna(False) &
+        (n.links.capital_cost <= 10.0)
+    ].index
+    if len(_tanks) > 0:
+        n.links.loc[_tanks, "capital_cost"] = 100.0  # EUR/MW — numerically neutral
+        logger.info("[NUM-FIX-2] water tanks capital_cost floor set to 100 EUR/MW (%d links)",
+                    len(_tanks))
+
+    # [NUM-FIX-3] Cap nuclear p_nom_max to actual p_nom for non-extendable
+    _nuc_inf = n.generators[
+        (n.generators.carrier.str.contains("nuclear", case=False)) &
+        (~n.generators.p_nom_extendable.fillna(False)) &
+        (n.generators.p_nom_max >= 1e14)
+    ].index
+    if len(_nuc_inf) > 0:
+        n.generators.loc[_nuc_inf, "p_nom_max"] = n.generators.loc[_nuc_inf, "p_nom"]
+        logger.info("[NUM-FIX-3] nuclear p_nom_max capped to p_nom (%d generators)",
+                    len(_nuc_inf))
 
     # [ARO-FIX-11] PyPSA v1.0.4 masks dispatch variables for assets with
     # build_year > investment_period (here period=0). Fix: align build_year

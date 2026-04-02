@@ -193,6 +193,7 @@ rule solve_aro:
         ls_penalty=lambda wc: ARO_LS_PENALTY,
         convergence_tol=lambda wc: ARO_CONVERGENCE_TOL,
         dispatch_workers=lambda wc: ARO_DISPATCH_WORKERS,
+        dispatch_solver_opts=lambda wc: json.dumps(ARO.get('dispatch_solver_options', {})) if ARO.get('dispatch_solver_options') else SOLVER_OPTIONS_JSON,
         max_master_size= lambda wc: MAX_MASTER_SIZE,
 
     shell:
@@ -216,6 +217,7 @@ rule solve_aro:
           --ls-penalty {params.ls_penalty} \
           --convergence-tol {params.convergence_tol} \
           --dispatch-workers {params.dispatch_workers} \
+          --dispatch-solver-options-json '{params.dispatch_solver_opts}' \
           --max-master-size {params.max_master_size} \
           --out-dispatch-dir {output.dispatch_dir} \
            2>&1 | tee {log}  

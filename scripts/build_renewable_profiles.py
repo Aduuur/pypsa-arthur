@@ -328,4 +328,7 @@ if __name__ == "__main__":
     ds.to_netcdf(snakemake.output.profile)
 
     if client is not None:
-        client.shutdown()
+        try:
+            client.shutdown()
+        except Exception:
+            pass  # Dask shutdown timeout auf großen Maschinen ignorieren

@@ -501,6 +501,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--solver-name", default="gurobi")
     p.add_argument("--solver-options-json", default=None,
                    help="JSON-String mit Solver-Optionen.")
+    p.add_argument("--dispatch-solver-options-json", default=None,
+                   help="JSON-String mit Solver-Optionen speziell fuer Dispatch (ueberschreibt --solver-options-json fuer Dispatch).")
 
     # Outputs
     p.add_argument("--out-std-network", default=None,
@@ -617,6 +619,10 @@ def main() -> None:
     solver_options: Optional[Dict] = None
     if args.solver_options_json:
         solver_options = json.loads(args.solver_options_json)
+    dispatch_solver_options: Optional[Dict] = solver_options
+    if args.dispatch_solver_options_json:
+        dispatch_solver_options = json.loads(args.dispatch_solver_options_json)
+        logger.info("[CONFIG] dispatch_solver_options overrides: %s", dispatch_solver_options)
 
     initial = list(dict.fromkeys(args.initial_scenarios))
     unknown = [x for x in initial if x not in set(cutouts)]
@@ -708,7 +714,7 @@ def main() -> None:
             cutouts=cutouts,
             scenario_template=scenario_template,
             solver_name=solver_name,
-            solver_options=solver_options,
+            solver_options=dispatch_solver_options,
             dispatch_tmp_dir=dispatch_tmp_iter,
             cost_consistency_tol=args.cost_consistency_tol,
             co2_cost_mode=co2_cost_mode,
@@ -957,7 +963,7 @@ def main() -> None:
             cutouts=cutouts,
             scenario_template=scenario_template,
             solver_name=solver_name,
-            solver_options=solver_options,
+            solver_options=dispatch_solver_options,
             dispatch_tmp_dir=dispatch_tmp_final,
             cost_consistency_tol=args.cost_consistency_tol,
             co2_cost_mode=co2_cost_mode,

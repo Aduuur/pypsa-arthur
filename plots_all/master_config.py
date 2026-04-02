@@ -33,7 +33,7 @@ def _mkdir(p: Union[str, Path]) -> Path:
 # -----------------------------------------------------------------------------
 # RUN NAME
 # -----------------------------------------------------------------------------
-RUN_NAME: str = _env("RUN_NAME", "test-aro-2")  # type: ignore[assignment]
+RUN_NAME: str = _env("RUN_NAME", "big-aro-run-2")  # type: ignore[assignment]
 
 
 # -----------------------------------------------------------------------------
@@ -78,7 +78,7 @@ MASTER_CONFIG: Dict[str, Any] = {
     #   DARK_SKY_YEAR=2012  DARK_SKY_START=01-07  DARK_SKY_END=01-28
     # =======================================================================
     "dark_sky_period": {
-        "reference_year": int(_env("DARK_SKY_YEAR", "2005")),
+        "reference_year": int(_env("DARK_SKY_YEAR", "2028")),
         "start_mmdd":     _env("DARK_SKY_START", "01-07"),
         "end_mmdd":       _env("DARK_SKY_END",   "01-28"),
     },

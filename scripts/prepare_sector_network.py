@@ -6859,4 +6859,70 @@ if __name__ == "__main__":
     planning_horizon = snakemake.wildcards.planning_horizons
     n = apply_plain_run_biomass_guards(n, snakemake.config, planning_horizon)
 
+    # =========================================================================
+    # [OFFWIND-FIX] Remove technical potential cap + set p_nom_min from installed
+    # capacity data. Activated via config: electricity.offwind_policy.enable
+    # =========================================================================
+    offwind_policy = (snakemake.config.get("electricity", {})
+                      .get("offwind_policy", {}) or {})
+    if offwind_policy.get("enable", False):
+
+
+        # 1. Remove p_nom_max cap for all offwind generators
+        _offwind_idx = n.generators.index[
+            n.generators.carrier.str.contains("offwind", case=False) &
+            n.generators.p_nom_extendable.fillna(False)
+        ]
+        if len(_offwind_idx):
+            n.generators.loc[_offwind_idx, "p_nom_max"] = float("inf")
+            logger.info("[OFFWIND-FIX] Set p_nom_max=inf for %d offwind generators",
+                        len(_offwind_idx))
+
+        # 2. Set p_nom_min from installed capacity CSV
+        _min_file = offwind_policy.get("p_nom_min_file", "")
+        if _min_file and os.path.exists(_min_file):
+            _min_df = pd.read_csv(_min_file, index_col=0)  # index = country code
+            # Choose column based on policy mode
+            _use_policy = offwind_policy.get("use_policy_targets", False)
+            _min_col = "p_nom_min_policy_mw" if _use_policy else "p_nom_min_mw"
+            # Fallback to p_nom_min_mw if policy column missing
+            if _min_col not in _min_df.columns:
+                _min_col = "p_nom_min_mw"
+                logger.warning("[OFFWIND-FIX] Column '%s' not found, using p_nom_min_mw",
+                               "p_nom_min_policy_mw")
+            logger.info("[OFFWIND-FIX] Using column '%s' (use_policy_targets=%s)",
+                        _min_col, _use_policy)
+
+            for _carrier in ["offwind-ac", "offwind-dc"]:
+                _gens = n.generators[
+                    (n.generators.carrier == _carrier) &
+                    n.generators.p_nom_extendable.fillna(False)
+                ]
+                if len(_gens) == 0:
+                    continue
+                for _country, _row in _min_df.iterrows():
+                    _min_mw = float(_row.get(_min_col, 0))
+                    if _min_mw <= 0:
+                        continue
+                    _mask = _gens.index.str.startswith(_country)
+                    _country_gens = _gens[_mask]
+                    if len(_country_gens) == 0:
+                        continue
+                    # Distribute proportional to p_nom_max, equal split if all inf
+                    _pmaxs = n.generators.loc[_country_gens.index, "p_nom_max"]
+                    _finite = _pmaxs[_pmaxs < 1e15]
+                    if len(_finite) > 0:
+                        _weights = _finite / _finite.sum()
+                    else:
+                        _weights = pd.Series(
+                            1.0 / len(_country_gens), index=_country_gens.index
+                        )
+                    for _gen_idx, _w in _weights.items():
+                        _val = _min_mw * _w
+                        n.generators.loc[_gen_idx, "p_nom_min"] = max(
+                            n.generators.loc[_gen_idx, "p_nom_min"], _val
+                        )
+            logger.info("[OFFWIND-FIX] p_nom_min set from %s (column: %s)",
+                        _min_file, _min_col)
+
     n.export_to_netcdf(snakemake.output[0])

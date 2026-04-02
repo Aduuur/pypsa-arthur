@@ -209,7 +209,21 @@ rule build_base_network_per_cutout:
         # ------------------------------------------------------------------
         # Dynamic renewable techfile override (cutout-specific techfiles)
         # ------------------------------------------------------------------
-        token = cutout[7:] if cutout.startswith("cutout_") else cutout
+        # Extract stress token and model prefix from cutout name
+        # Cutout:   cutout_<model>_stress_NN_from_<date>.nc
+        # Techfile: <prefix>_<model>_notAgg_pypsa__stress_NN.nc
+        import re as _re
+        _stress_match = _re.search(r"(stress_[0-9]+)", cutout)
+        _model_match  = _re.search(r"cutout_(.+?)(?:[.]nc)?_stress_[0-9]+", cutout)
+        if _stress_match and _model_match:
+            _stress_token     = _stress_match.group(1)
+            _model_token      = _model_match.group(1)
+            _use_stress_naming = True
+        else:
+            _stress_token     = None
+            _model_token      = cutout[7:] if cutout.startswith("cutout_") else cutout
+            _use_stress_naming = False
+        token = _model_token  # fallback compat
 
         techs = {
             "onwind": ("turbine", "wind"),
@@ -229,8 +243,12 @@ rule build_base_network_per_cutout:
                 continue
 
             base_dir = os.path.dirname(orig_path)
-            new_file = f"{prefix}_{token}_notAgg_pypsa.nc"
-            new_path = os.path.join(base_dir, new_file)
+            if _use_stress_naming:
+                new_file = f"{prefix}_{_model_token}_notAgg_pypsa__{_stress_token}.nc"
+                new_path = os.path.join("/home/endata/techfiles_manipulated/d", new_file)
+            else:
+                new_file = f"{prefix}_{token}_notAgg_pypsa.nc"
+                new_path = os.path.join(base_dir, new_file)
 
             if not os.path.exists(new_path):
                 missing.append((tech, res_key, orig_path, new_path))
