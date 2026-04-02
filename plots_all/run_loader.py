@@ -21,6 +21,14 @@ Verwendung:
 
 Das Modul importiert KEINE Matplotlib-Funktionen, ist also
 für Berechnungen rein in sich geschlossen.
+
+BUGFIXES (2026-04):
+  - _resolve_aro_scenario_paths: Dispatch-Netze werden jetzt korrekt aus
+    results/<run>/networks/dispatch/ geladen (dispatch_<safe_name>_std.nc)
+    statt des alten Pfads results/<run>/networks/<sc>.nc  [BUG-1]
+  - _safe_name-Logik kongruent mit solve_aro.py (replace '/', ' ') [BUG-2]
+  - Glob-Fallback für Worst-Case (_worst_case_std.nc vor _std.nc) [BUG-3]
+  - RunSpec.load() gibt nun auch bei leerem scenario-Set das robuste Netz zurück [BUG-4]
 """
 
 from __future__ import annotations
@@ -51,6 +59,129 @@ def _tag_from_path(p: str) -> str:
     return Path(p).stem
 
 
+def _safe_name(scenario_name: str) -> str:
+    """
+    Repliziert die safe_name-Logik aus solve_aro.py:
+      cutout_name.replace("/", "_").replace(" ", "_")
+    """
+    return scenario_name.replace("/", "_").replace(" ", "_")
+
+
+def _find_dispatch_for_scenario(
+    dispatch_dir: Optional[Path],
+    dispatch_tmp_dir: Optional[Path],
+    scenario_name: str,
+) -> Optional[Path]:
+    """
+    Sucht das Dispatch-Netzwerk für ein bestimmtes Szenario.
+
+    Suchpfade (in dieser Reihenfolge):
+    1. dispatch_dir / dispatch_{safe_name}_std.nc             (bevorzugt, persistentes dir)
+    2. dispatch_dir / dispatch_{safe_name}_worst_case_std.nc
+    3. dispatch_dir / dispatch_{safe_name}_flat.nc
+    4. dispatch_dir / dispatch_{safe_name}*.nc                (glob-Fallback)
+    5. dispatch_tmp_dir / dispatch_{safe_name}*.nc            (Rückwärtskompatibilität)
+
+    Dateibenennungsschema aus solve_aro.py (Zeile 1025-1035):
+      safe_name = cutout_name.replace("/", "_").replace(" ", "_")
+      suffix = "_worst_case" if cutout_name == worst_final else ""
+      dst = out_d / f"dispatch_{safe_name}{suffix}_std.nc"
+    -> d.h. normales Szenario: dispatch_{safe_name}_std.nc
+    -> worst case:             dispatch_{safe_name}_worst_case_std.nc
+    """
+    safe = _safe_name(scenario_name)
+
+    # 1-4: persistentes dispatch/-Verzeichnis (Snakemake output.dispatch_dir)
+    if dispatch_dir is not None and dispatch_dir.is_dir():
+        # Direkte Treffer bevorzugen (ohne und mit _worst_case)
+        for candidate_name in (
+            f"dispatch_{safe}_std.nc",
+            f"dispatch_{safe}_worst_case_std.nc",
+            f"dispatch_{safe}_flat.nc",
+            f"dispatch_{safe}_worst_case_flat.nc",
+        ):
+            p = dispatch_dir / candidate_name
+            if p.is_file():
+                return p
+        # Glob-Fallback: _std.nc vor _flat.nc
+        std_cands = sorted(dispatch_dir.glob(f"dispatch_*{safe}*_std.nc"))
+        if std_cands:
+            return std_cands[0]
+        all_cands = sorted(dispatch_dir.glob(f"dispatch_*{safe}*.nc"))
+        if all_cands:
+            return all_cands[0]
+
+    # 5: temporäres Verzeichnis (Rückwärtskompatibilität: _dispatch_tmp/final/)
+    if dispatch_tmp_dir is not None and dispatch_tmp_dir.is_dir():
+        for pattern in (f"dispatch_*{safe}*_std.nc", f"dispatch_*{safe}*.nc"):
+            candidates = sorted(dispatch_tmp_dir.glob(pattern))
+            if candidates:
+                return candidates[0]
+
+    return None
+
+
+def _find_any_worst_case_dispatch(
+    dispatch_dir: Optional[Path],
+    dispatch_tmp_dir: Optional[Path],
+    worst_cutout: Optional[str] = None,
+) -> Optional[Path]:
+    """
+    Fallback: findet irgendeinen Worst-Case-Dispatch.
+    Bevorzugt _worst_case_std.nc, dann _std.nc, dann alles.
+    """
+    if dispatch_dir is not None and dispatch_dir.is_dir():
+        if worst_cutout:
+            p = _find_dispatch_for_scenario(dispatch_dir, None, worst_cutout)
+            if p:
+                return p
+
+        # Explizit _worst_case_std.nc suchen
+        wc_std = sorted(dispatch_dir.glob("dispatch_*_worst_case_std.nc"))
+        if wc_std:
+            return wc_std[0]
+        wc_flat = sorted(dispatch_dir.glob("dispatch_*_worst_case_flat.nc"))
+        if wc_flat:
+            return wc_flat[0]
+        # Letzter Ausweg: irgendeinen _std.nc
+        all_std = sorted(dispatch_dir.glob("dispatch_*_std.nc"))
+        if all_std:
+            return all_std[-1]
+        all_nc = sorted(dispatch_dir.glob("dispatch_*.nc"))
+        if all_nc:
+            return all_nc[-1]
+
+    if dispatch_tmp_dir is not None and dispatch_tmp_dir.is_dir():
+        candidates = sorted(dispatch_tmp_dir.glob("dispatch_*.nc"))
+        if worst_cutout:
+            safe = _safe_name(worst_cutout)
+            for p in candidates:
+                if safe in p.name:
+                    return p
+        if candidates:
+            return candidates[-1]
+
+    return None
+
+
+def _resolve_dispatch_dirs(
+    master: MasterConfig,
+    run_key: str,
+) -> tuple[Optional[Path], Optional[Path]]:
+    """
+    Gibt (dispatch_dir, dispatch_tmp_dir) zurück.
+    dispatch_dir      = results/<run>/networks/dispatch/
+    dispatch_tmp_dir  = results/<run>/networks/_dispatch_tmp/final/
+    """
+    base = Path(master.aro_results_base)
+    dispatch_dir = base / run_key / "networks" / "dispatch"
+    dispatch_tmp = base / run_key / "networks" / "_dispatch_tmp" / "final"
+    return (
+        dispatch_dir if dispatch_dir.is_dir() else None,
+        dispatch_tmp if dispatch_tmp.is_dir() else None,
+    )
+
+
 def _resolve_aro_scenario_paths(
     master: MasterConfig,
     run_key: str,
@@ -60,22 +191,51 @@ def _resolve_aro_scenario_paths(
     """
     Gibt Pfade für einen ARO-Run zurück.
     Keys: "robust" + aro_scenario-Namen (z.B. "cutout_rcp45_2050")
+
+    BUG-FIX: Szenario-Dispatch-Pfade zeigen jetzt auf
+      results/<run>/networks/dispatch/dispatch_<safe_name>_std.nc
+    statt auf den falschen Pfad
+      results/<run>/networks/<sc>.nc    <- das war der Bug
     """
     paths: Dict[str, str] = {}
     run_conf = master.aro_runs.get(run_key, {})
 
+    # ---- Robustes Portfolio ----
     robust_raw = run_conf.get("robust_network")
     if include_robust and robust_raw:
         robust_path = master.resolve_template(robust_raw)
         if robust_path:
             paths["robust"] = robust_path
 
+    # ---- Szenario-Dispatch-Netzwerke ----
     if include_scenarios:
         scenarios = master.get_aro_scenarios_for_run(run_key)
-        results_base = Path(master.aro_results_base)
+        dispatch_dir, dispatch_tmp_dir = _resolve_dispatch_dirs(master, run_key)
+
         for sc in scenarios:
-            sc_path = str(results_base / run_key / "networks" / f"{sc}.nc")
-            paths[sc] = sc_path
+            # Explizit konfigurierte Dispatch-Pfade (aus run_config["dispatch_paths"])
+            explicit_paths = run_conf.get("dispatch_paths", {})
+            explicit = explicit_paths.get(sc)
+            if explicit and Path(explicit).is_file():
+                paths[sc] = explicit
+                continue
+
+            # Auto-Suche im dispatch/-Verzeichnis (BUG-1 Fix)
+            found = _find_dispatch_for_scenario(dispatch_dir, dispatch_tmp_dir, sc)
+            if found:
+                paths[sc] = str(found)
+            else:
+                # Pfad eintragen damit RunSpec das Szenario kennt;
+                # "Datei fehlt"-Warnung kommt beim Laden via get_network()
+                safe = _safe_name(sc)
+                fallback = str(
+                    Path(master.aro_results_base)
+                    / run_key / "networks" / "dispatch"
+                    / f"dispatch_{safe}_std.nc"
+                )
+                paths[sc] = fallback
+                print(f"  [ARO] Kein Dispatch gefunden fuer '{sc}' - "
+                      f"erwarteter Pfad: {fallback}")
 
     return paths
 
@@ -222,6 +382,17 @@ class RunLoader:
                 include_robust=aro_include_robust,
                 include_scenarios=aro_include_scenarios,
             )
+            # BUG-4 Fix: Wenn keine Szenario-Pfade gefunden aber robust vorhanden ->
+            # trotzdem ein sinnvolles RunSpec liefern mit explizitem Hinweis
+            if not paths and aro_include_robust:
+                run_conf = self.master.aro_runs.get(run_key, {})
+                robust_raw = run_conf.get("robust_network")
+                if robust_raw:
+                    robust_path = self.master.resolve_template(robust_raw)
+                    if robust_path:
+                        paths["robust"] = robust_path
+                        print(f"  [RunLoader '{lbl}'] Nur robustes Netz verfügbar "
+                              f"(keine Dispatch-Szenarien gefunden).")
         else:
             raw_paths = self.master.get_networks(run_key=run_key)
             raw_list = raw_paths if isinstance(raw_paths, list) else []
