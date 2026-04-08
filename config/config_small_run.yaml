@@ -29,7 +29,7 @@ remote:
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#run
 run:
   prefix: ""
-  name: "big-aro-run-3"
+  name: "small-aro-run-1"
   scenarios:
     enable: false
     file: config/scenarios.yaml
@@ -45,16 +45,16 @@ workflow:
 robust:
   # diskrete Szenarien = manipulierten Cutouts
   cutouts:
-    - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_01_from_2031_12_06
-    - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_02_from_2030_11_23
-    - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_03_from_2035_11_22
-    - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_04_from_2040_12_12
-    - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_05_from_2033_11_21
-    - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_06_from_2047_01_07
+    #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_01_from_2031_12_06
+    #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_02_from_2030_11_23
+    #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_03_from_2035_11_22
+    #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_04_from_2040_12_12
+    #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_05_from_2033_11_21
+    #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_06_from_2047_01_07
     - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_07_from_2041_11_21
     - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_08_from_2047_11_23
     - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_09_from_2039_12_13
-    - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_10_from_2041_01_30
+    #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_10_from_2041_01_30
 
 
   base_target: "networks/base.nc"
@@ -84,16 +84,16 @@ robust:
       NumericFocus: 2      # Höchste numerische Stabilität für Dispatch
       ScaleFlag: -1 # Aggressivere Skalierung
     initial_cutouts:
-      - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_01_from_2031_12_06
-      - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_02_from_2030_11_23
-      - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_03_from_2035_11_22
-      - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_04_from_2040_12_12
-      - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_05_from_2033_11_21
-      - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_06_from_2047_01_07
+      #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_01_from_2031_12_06
+      #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_02_from_2030_11_23
+      #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_03_from_2035_11_22
+      #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_04_from_2040_12_12
+      #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_05_from_2033_11_21
+      #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_06_from_2047_01_07
       - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_07_from_2041_11_21
       - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_08_from_2047_11_23
       - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_09_from_2039_12_13
-      - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_10_from_2041_01_30
+      #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_10_from_2041_01_30
 
     max_iter: 1
 
@@ -1208,7 +1208,7 @@ clustering:
       ramp_limit_down: max
   temporal:
     resolution_elec: false # später wieder anpassen
-    resolution_sector: false
+    resolution_sector: 2h
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#adjustments
 adjustments:

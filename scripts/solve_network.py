@@ -536,7 +536,9 @@ def prepare_network(
             bus=buses_i,
             carrier="load",
             marginal_cost=load_shedding,  # Eur/MWh
-            p_nom=np.inf,
+            p_nom=n.loads_t.p_set.max().reindex(buses_i).fillna(
+                n.loads.p_set.reindex(buses_i).fillna(1e5)
+            ).clip(lower=100.0),
         )
 
     if solve_opts.get("curtailment_mode"):
@@ -587,6 +589,215 @@ def prepare_network(
         add_co2_sequestration_limit(
             n, limit_dict=limit_dict, planning_horizons=planning_horizons
         )
+
+    # [NUM-FIX] Cap unbounded variables to improve Barrier conditioning.
+    # General cap: all extendable links/generators/stores with p/e_nom_max=inf
+    import logging as _logging
+    _nf_logger = _logging.getLogger(__name__)
+
+    # Extendable Links p_nom_max=inf → 1e6 MW (1 TW — physically implausible to exceed)
+    _ext_links_inf = n.links.index[
+        n.links.p_nom_extendable.fillna(False) &
+        (n.links.p_nom_max >= 1e14)
+    ]
+    if len(_ext_links_inf):
+        n.links.loc[_ext_links_inf, "p_nom_max"] = 1e6
+        _nf_logger.info("[NUM-FIX] %d extendable links p_nom_max capped to 1e6 MW", len(_ext_links_inf))
+
+    # Extendable Generators p_nom_max=inf → 1e6 MW
+    _ext_gens_inf = n.generators.index[
+        n.generators.p_nom_extendable.fillna(False) &
+        (n.generators.p_nom_max >= 1e14)
+    ]
+    if len(_ext_gens_inf):
+        n.generators.loc[_ext_gens_inf, "p_nom_max"] = 1e6
+        _nf_logger.info("[NUM-FIX] %d extendable generators p_nom_max capped to 1e6 MW", len(_ext_gens_inf))
+
+    # Extendable Stores e_nom_max=inf — carrier-specific caps
+    _store_caps = {
+        "battery":            1e5,   # 100 GWh per node
+        "home battery":       1e5,
+        "H2 Store":           1e7,   # 10 TWh — seasonal H2
+        "rural water tanks":  1e6,
+        "urban central water tanks": 1e6,
+        "urban central water pits":  1e7,
+        "urban decentral water tanks": 1e6,
+        "co2 stored":         1e7,
+        "co2 sequestered":    1e7,
+        "gas":                5e7,
+        "oil":                1e7,
+        "methanol":           1e7,
+        "ammonia store":      1e7,
+        "coal":               1e7,
+        "lignite":            1e7,
+        "uranium":            1e7,
+        "geothermal_heat":    1e6,
+    }
+    _default_store_cap = 1e7
+    for _sc_carrier, _sc_cap in _store_caps.items():
+        _sc_idx = n.stores.index[
+            n.stores.e_nom_extendable.fillna(False) &
+            (n.stores.carrier == _sc_carrier) &
+            (n.stores.e_nom_max >= 1e14)
+        ]
+        if len(_sc_idx):
+            n.stores.loc[_sc_idx, "e_nom_max"] = _sc_cap
+    # Remaining extendable stores with inf
+    _remaining = n.stores.index[
+        n.stores.e_nom_extendable.fillna(False) &
+        (n.stores.e_nom_max >= 1e14)
+    ]
+    if len(_remaining):
+        n.stores.loc[_remaining, "e_nom_max"] = _default_store_cap
+    _nf_logger.info("[NUM-FIX] extendable stores e_nom_max capped (carrier-specific)")
+    # co2 sequestered has geological finite potentials up to 1e9 — cap regardless of inf
+    _co2seq_big = n.stores.index[
+        (n.stores.carrier == "co2 sequestered") &
+        n.stores.e_nom_extendable.fillna(False) &
+        (n.stores.e_nom_max > 1e7)
+    ]
+    if len(_co2seq_big):
+        n.stores.loc[_co2seq_big, "e_nom_max"] = 1e7
+        _nf_logger.info("[NUM-FIX] co2 sequestered e_nom_max capped to 1e7 (%d stores)", len(_co2seq_big))
+    # H2 Store and gas store have finite but large potentials from data
+    _h2_big = n.stores.index[
+        (n.stores.carrier == "H2 Store") &
+        n.stores.e_nom_extendable.fillna(False) &
+        (n.stores.e_nom_max > 1e7)
+    ]
+    if len(_h2_big):
+        n.stores.loc[_h2_big, "e_nom_max"] = 1e7
+        _nf_logger.info("[NUM-FIX] H2 Store e_nom_max capped to 1e7 (%d)", len(_h2_big))
+    _gas_big = n.stores.index[
+        (n.stores.carrier == "gas") &
+        (~n.stores.e_nom_extendable.fillna(False)) &
+        (n.stores.e_nom_max > 5e7)
+    ]
+    if len(_gas_big):
+        n.stores.loc[_gas_big, "e_nom_max"] = 5e7
+        _nf_logger.info("[NUM-FIX] gas store e_nom_max capped to 5e7 (%d)", len(_gas_big))
+
+    # Non-extendable links: cap p_nom_max to p_nom (or 1e6 if p_nom=0)
+    _fix_links = n.links.index[
+        (~n.links.p_nom_extendable.fillna(False)) &
+        (n.links.p_nom_max >= 1e14)
+    ]
+    if len(_fix_links):
+        _pn = n.links.loc[_fix_links, "p_nom"]
+        n.links.loc[_fix_links, "p_nom_max"] = _pn.where(_pn > 0, 1e6)
+        _nf_logger.info("[NUM-FIX] %d non-ext links p_nom_max capped", len(_fix_links))
+
+    _fix_gens = n.generators.index[
+        (~n.generators.p_nom_extendable.fillna(False)) &
+        (n.generators.p_nom_max >= 1e14)
+    ]
+    if len(_fix_gens):
+        _pn_g = n.generators.loc[_fix_gens, "p_nom"]
+        n.generators.loc[_fix_gens, "p_nom_max"] = _pn_g.where(_pn_g > 0, 1e6)
+        _nf_logger.info("[NUM-FIX] %d non-ext generators p_nom_max capped", len(_fix_gens))
+
+    # Non-extendable StorageUnits p_nom_max=inf → cap to p_nom
+    _fix_su = n.storage_units.index[
+        (~n.storage_units.p_nom_extendable.fillna(False)) &
+        (n.storage_units.p_nom_max >= 1e14)
+    ]
+    if len(_fix_su):
+        _pn_su = n.storage_units.loc[_fix_su, "p_nom"]
+        n.storage_units.loc[_fix_su, "p_nom_max"] = _pn_su.where(_pn_su > 0, 1e6)
+        _nf_logger.info("[NUM-FIX] %d non-ext storage_units p_nom_max capped", len(_fix_su))
+
+    _fix_stores_ne = n.stores.index[
+        (~n.stores.e_nom_extendable.fillna(False)) &
+        (n.stores.e_nom >= 1e14)
+    ]
+    if len(_fix_stores_ne):
+        n.stores.loc[_fix_stores_ne, "e_nom"] = 1e7
+        n.stores.loc[_fix_stores_ne, "e_nom_max"] = 1e7
+        _nf_logger.info("[NUM-FIX] %d non-ext stores e_nom/e_nom_max capped to 1e7", len(_fix_stores_ne))
+    # These fixes mirror the same patches in solve_robust.py.
+    import logging as _logging
+    _nf_logger = _logging.getLogger(__name__)
+
+    # offwind p_nom_max=inf (set by OFFWIND-FIX in prepare_sector_network)
+    _offwind_inf = n.generators.index[
+        n.generators.carrier.str.contains("offwind", case=False) &
+        n.generators.p_nom_extendable.fillna(False) &
+        (n.generators.p_nom_max >= 1e14)
+    ]
+    if len(_offwind_inf):
+        n.generators.loc[_offwind_inf, "p_nom_max"] = 1e6
+        _nf_logger.info("[NUM-FIX] offwind p_nom_max=1e6 MW (%d generators)", len(_offwind_inf))
+
+    # heat vent p_nom_max=inf
+    _hvent_inf = n.generators.index[
+        n.generators.carrier.str.contains("heat vent", case=False) &
+        n.generators.p_nom_extendable.fillna(False) &
+        (n.generators.p_nom_max >= 1e14)
+    ]
+    if len(_hvent_inf):
+        n.generators.loc[_hvent_inf, "p_nom_max"] = 1e5
+        _nf_logger.info("[NUM-FIX] heat vent p_nom_max=1e5 MW (%d generators)", len(_hvent_inf))
+
+    # battery / home battery e_nom_max=inf
+    _bat_inf = n.stores.index[
+        n.stores.carrier.str.contains("battery", case=False) &
+        n.stores.e_nom_extendable.fillna(False) &
+        (n.stores.e_nom_max >= 1e14)
+    ]
+    if len(_bat_inf):
+        n.stores.loc[_bat_inf, "e_nom_max"] = 1e7
+        _nf_logger.info("[NUM-FIX] battery e_nom_max=1e7 MWh (%d stores)", len(_bat_inf))
+
+    # water tanks / water pits e_nom_max=inf
+    _wt_inf = n.stores.index[
+        n.stores.carrier.str.contains("water tank|water pit", case=False) &
+        n.stores.e_nom_extendable.fillna(False) &
+        (n.stores.e_nom_max >= 1e14)
+    ]
+    if len(_wt_inf):
+        n.stores.loc[_wt_inf, "e_nom_max"] = 1e7
+        _nf_logger.info("[NUM-FIX] water tanks e_nom_max=1e7 MWh (%d stores)", len(_wt_inf))
+
+    # co2 stored e_nom_max=inf
+    _co2s_inf = n.stores.index[
+        (n.stores.carrier == "co2 stored") &
+        n.stores.e_nom_extendable.fillna(False) &
+        (n.stores.e_nom_max >= 1e14)
+    ]
+    if len(_co2s_inf):
+        _co2s_max = 2.5e8 / max(len(_co2s_inf), 1)
+        n.stores.loc[_co2s_inf, "e_nom_max"] = _co2s_max
+        _nf_logger.info("[NUM-FIX] co2 stored e_nom_max=%.2e tCO2 (%d stores)", _co2s_max, len(_co2s_inf))
+
+    # H2 Store e_nom_max=inf
+    _h2_inf = n.stores.index[
+        n.stores.carrier.str.contains("H2", case=False) &
+        n.stores.e_nom_extendable.fillna(False) &
+        (n.stores.e_nom_max >= 1e14)
+    ]
+    if len(_h2_inf):
+        n.stores.loc[_h2_inf, "e_nom_max"] = 1e7
+        _nf_logger.info("[NUM-FIX] H2 Store e_nom_max=1e7 MWh (%d stores)", len(_h2_inf))
+
+    # nuclear p_nom_max=inf (non-extendable dispatch variable)
+    _nuc_inf = n.generators.index[
+        n.generators.carrier.str.contains("nuclear", case=False) &
+        (~n.generators.p_nom_extendable.fillna(False)) &
+        (n.generators.p_nom_max >= 1e14)
+    ]
+    if len(_nuc_inf):
+        n.generators.loc[_nuc_inf, "p_nom_max"] = n.generators.loc[_nuc_inf, "p_nom"]
+        _nf_logger.info("[NUM-FIX] nuclear p_nom_max capped to p_nom (%d generators)", len(_nuc_inf))
+
+    # water tank charger/discharger capital_cost=1 EUR/MW
+    _wt_cap = n.links.index[
+        n.links.carrier.str.contains("water tanks", case=False) &
+        n.links.p_nom_extendable.fillna(False) &
+        (n.links.capital_cost <= 10.0)
+    ]
+    if len(_wt_cap):
+        n.links.loc[_wt_cap, "capital_cost"] = 100.0
+        _nf_logger.info("[NUM-FIX] water tanks capital_cost=100 EUR/MW (%d links)", len(_wt_cap))
 
 
 def add_CCL_constraints(

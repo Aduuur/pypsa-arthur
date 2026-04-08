@@ -6868,15 +6868,21 @@ if __name__ == "__main__":
     if offwind_policy.get("enable", False):
 
 
-        # 1. Remove p_nom_max cap for all offwind generators
+        # 1. Set p_nom_max for offwind generators
+        # For generators with p_nom_min > 0: use 3× p_nom_min (bounded but flexible)
+        # For generators with p_nom_min = 0: use 1e6 MW (effectively uncapped)
         _offwind_idx = n.generators.index[
             n.generators.carrier.str.contains("offwind", case=False) &
             n.generators.p_nom_extendable.fillna(False)
         ]
         if len(_offwind_idx):
-            n.generators.loc[_offwind_idx, "p_nom_max"] = float("inf")
-            logger.info("[OFFWIND-FIX] Set p_nom_max=inf for %d offwind generators",
-                        len(_offwind_idx))
+            import numpy as _np
+            _pmin = n.generators.loc[_offwind_idx, "p_nom_min"]
+            _pmax_new = (_pmin * 3).clip(lower=100000).where(_pmin > 0, 1e6)
+            n.generators.loc[_offwind_idx, "p_nom_max"] = _pmax_new
+            logger.info("[OFFWIND-FIX] Set offwind p_nom_max: %d with p_nom_min>0 (3x rule), "
+                        "%d with p_nom_min=0 (1e6 MW)",
+                        int((_pmin > 0).sum()), int((_pmin == 0).sum()))
 
         # 2. Set p_nom_min from installed capacity CSV
         _min_file = offwind_policy.get("p_nom_min_file", "")

@@ -127,8 +127,8 @@ countries:
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#snapshots
 snapshots:
-  start: "2028-01-01"
-  end: "2029-01-01"
+  start: "2024-01-01"
+  end: "2025-01-01"
   inclusive: 'left'
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#enable

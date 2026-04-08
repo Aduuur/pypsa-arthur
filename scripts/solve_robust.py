@@ -653,14 +653,21 @@ def _fix_distribution_grid(n: pypsa.Network) -> None:
                 peak = float(abs(load_row.get("p_set", 0.0) or 0.0))
                 bus_peak[bus] = bus_peak.get(bus, 0.0) + peak
 
-    # p_nom setzen: peak LV load des Zielbusses (bus1 = LV bus)
+    # p_nom setzen: peak LV load × lv_factor (aus Config oder Default 1.6)
+    # lv_factor berücksichtigt simultanen HP+Resistive+Battery Bedarf
+    _lv_factor = 1.6  # Default: ~60% HP/Resistive zusätzlich zur Strombedarf
+    try:
+        import snakemake as _sm  # noqa
+    except Exception:
+        pass
     fixed = 0
     for link_name in n.links.index[dg_mask]:
         bus1 = str(n.links.at[link_name, "bus1"])
-        peak = bus_peak.get(bus1, 0.0)
-        if peak > 0:
-            n.links.at[link_name, "p_nom"] = peak
-            n.links.at[link_name, "p_nom_min"] = peak  # [DIST-GRID-FIX] lower bound for extendable
+        peak_load = bus_peak.get(bus1, 0.0)
+        peak_total = peak_load * _lv_factor
+        if peak_total > 0:
+            n.links.at[link_name, "p_nom"] = peak_total
+            n.links.at[link_name, "p_nom_min"] = peak_total
             fixed += 1
 
     logger.info(
@@ -2680,6 +2687,34 @@ def _dispatch_solve(
         n.generators.loc[_nuc_d, "p_nom_max"] = n.generators.loc[_nuc_d, "p_nom"]
         logger.info("[NUM-FIX-3b] Dispatch: nuclear p_nom_max capped (%d)", len(_nuc_d))
 
+
+    # [NUM-FIX-GENERAL-D] Cap all remaining inf bounds
+    _ext_links_inf = n.links.index[
+        n.links.p_nom_extendable.fillna(False) & (n.links.p_nom_max >= 1e14)
+    ]
+    if len(_ext_links_inf):
+        n.links.loc[_ext_links_inf, "p_nom_max"] = 1e6
+        logger.info("[NUM-FIX-GENERAL-D] %d ext links p_nom_max=1e6", len(_ext_links_inf))
+    _ext_gens_inf = n.generators.index[
+        n.generators.p_nom_extendable.fillna(False) & (n.generators.p_nom_max >= 1e14)
+    ]
+    if len(_ext_gens_inf):
+        n.generators.loc[_ext_gens_inf, "p_nom_max"] = 1e6
+        logger.info("[NUM-FIX-GENERAL-D] %d ext generators p_nom_max=1e6", len(_ext_gens_inf))
+    _ext_stores_inf = n.stores.index[
+        n.stores.e_nom_extendable.fillna(False) & (n.stores.e_nom_max >= 1e14)
+    ]
+    if len(_ext_stores_inf):
+        n.stores.loc[_ext_stores_inf, "e_nom_max"] = 1e8
+        logger.info("[NUM-FIX-GENERAL-D] %d ext stores e_nom_max=1e8", len(_ext_stores_inf))
+    _fix_links_ne = n.links.index[
+        (~n.links.p_nom_extendable.fillna(False)) &
+        (n.links.p_nom_max >= 1e14) & (n.links.p_nom > 0)
+    ]
+    if len(_fix_links_ne):
+        n.links.loc[_fix_links_ne, "p_nom_max"] = n.links.loc[_fix_links_ne, "p_nom"]
+        logger.info("[NUM-FIX-GENERAL-D] %d non-ext links p_nom_max=p_nom", len(_fix_links_ne))
+
     # [ARO-FIX-11b] Align build_year in dispatch network.
     _cur_d = int(n.investment_periods[0]) if len(n.investment_periods) > 0 else 0
     for _cn_d in ("links", "generators", "storage_units", "stores", "lines"):
@@ -4093,6 +4128,58 @@ def solve_aro_master(
         n.stores.loc[_h2_inf, "e_nom_max"] = 1e8
         logger.info("[NUM-FIX-0] H2 Store e_nom_max capped to 1e8 MWh (%d stores)", len(_h2_inf))
 
+    # [NUM-FIX-0b2] Cap offwind p_nom_max — OFFWIND-FIX sets inf, cap to 1e6 MW
+    _offwind_inf = n.generators[
+        n.generators.carrier.str.contains("offwind", case=False) &
+        n.generators.p_nom_extendable.fillna(False) &
+        (n.generators.p_nom_max >= 1e14)
+    ].index
+    if len(_offwind_inf) > 0:
+        n.generators.loc[_offwind_inf, "p_nom_max"] = 1e6  # 1 TW per node
+        logger.info("[NUM-FIX-0b2] offwind p_nom_max capped to 1e6 MW (%d)", len(_offwind_inf))
+
+    # [NUM-FIX-0b3] Cap heat vent p_nom_max=inf
+    _hvent_inf = n.generators[
+        n.generators.carrier.str.contains("heat vent", case=False) &
+        n.generators.p_nom_extendable.fillna(False) &
+        (n.generators.p_nom_max >= 1e14)
+    ].index
+    if len(_hvent_inf) > 0:
+        n.generators.loc[_hvent_inf, "p_nom_max"] = 1e5  # 100 GW
+        logger.info("[NUM-FIX-0b3] heat vent p_nom_max capped to 1e5 MW (%d)", len(_hvent_inf))
+
+    # [NUM-FIX-0b4] Cap battery/home battery e_nom_max=inf
+    _bat_inf = n.stores[
+        n.stores.carrier.str.contains("battery", case=False) &
+        n.stores.e_nom_extendable.fillna(False) &
+        (n.stores.e_nom_max >= 1e14)
+    ].index
+    if len(_bat_inf) > 0:
+        n.stores.loc[_bat_inf, "e_nom_max"] = 1e7  # 10 TWh per node
+        logger.info("[NUM-FIX-0b4] battery e_nom_max capped to 1e7 MWh (%d)", len(_bat_inf))
+
+    # [NUM-FIX-0b5] Cap water tanks e_nom_max=inf
+    _wt_inf = n.stores[
+        n.stores.carrier.str.contains("water tank|water pit", case=False) &
+        n.stores.e_nom_extendable.fillna(False) &
+        (n.stores.e_nom_max >= 1e14)
+    ].index
+    if len(_wt_inf) > 0:
+        n.stores.loc[_wt_inf, "e_nom_max"] = 1e7  # 10 TWh
+        logger.info("[NUM-FIX-0b5] water tanks e_nom_max capped to 1e7 MWh (%d)", len(_wt_inf))
+
+    # [NUM-FIX-0b6] Cap co2 stored e_nom_max=inf
+    _co2s_inf = n.stores[
+        (n.stores.carrier == "co2 stored") &
+        n.stores.e_nom_extendable.fillna(False) &
+        (n.stores.e_nom_max >= 1e14)
+    ].index
+    if len(_co2s_inf) > 0:
+        # co2_sequestration_limit = 2.5e8 tCO2 total
+        _co2s_max = 2.5e8 / max(len(_co2s_inf), 1)
+        n.stores.loc[_co2s_inf, "e_nom_max"] = _co2s_max
+        logger.info("[NUM-FIX-0b6] co2 stored e_nom_max capped to %.2e tCO2 (%d)", _co2s_max, len(_co2s_inf))
+
     # [NUM-FIX-0c] Cap gas/methanol stores to finite max
     _gas_inf = n.stores[
         (n.stores.carrier.isin(["gas", "methanol", "oil", "ammonia store"])) &
@@ -4119,6 +4206,16 @@ def solve_aro_master(
         logger.info("[NUM-FIX-1] co2 sequestered p_nom_max set to %.2e MW (%d links)",
                     _max_per_node, len(_co2seq))
 
+    # [NUM-FIX-1c] Cap co2 sequestered Store e_nom_max (geological potentials up to 1e9)
+    _co2seq_stores = n.stores.index[
+        (n.stores.carrier == "co2 sequestered") &
+        n.stores.e_nom_extendable.fillna(False) &
+        (n.stores.e_nom_max > 1e7)
+    ]
+    if len(_co2seq_stores):
+        n.stores.loc[_co2seq_stores, "e_nom_max"] = 1e7
+        logger.info("[NUM-FIX-1c] co2 sequestered stores e_nom_max=1e7 (%d)", len(_co2seq_stores))
+
     # [NUM-FIX-2] Raise water tank charger/discharger capital_cost floor
     # capital_cost=1.0 EUR/MW creates 1e6 ratio vs DAC → poor Objective conditioning
     _tanks = n.links[
@@ -4141,6 +4238,71 @@ def solve_aro_master(
         n.generators.loc[_nuc_inf, "p_nom_max"] = n.generators.loc[_nuc_inf, "p_nom"]
         logger.info("[NUM-FIX-3] nuclear p_nom_max capped to p_nom (%d generators)",
                     len(_nuc_inf))
+
+
+    # [OFFWIND-FIX-2] Variable substitution for offwind p_nom_min > 0
+    # Barrier konditioniert besser wenn Variablen bei 0 starten.
+    # Ersetze p_nom ∈ [p_nom_min, p_nom_max] durch y ∈ [0, p_nom_max - p_nom_min]
+    # indem wir p_nom_min als fixen Beitrag in die Kostenfunktion einrechnen
+    # und p_nom_min auf 0 setzen, p_nom_max auf p_nom_max - p_nom_min.
+    _offwind_min = n.generators.index[
+        n.generators.carrier.str.contains("offwind", case=False) &
+        n.generators.p_nom_extendable.fillna(False) &
+        (n.generators.p_nom_min > 0)
+    ]
+    if len(_offwind_min) > 0:
+        _pmin = n.generators.loc[_offwind_min, "p_nom_min"].copy()
+        _pmax = n.generators.loc[_offwind_min, "p_nom_max"].copy()
+        _cc   = n.generators.loc[_offwind_min, "capital_cost"].copy()
+        # Schranken verschieben
+        n.generators.loc[_offwind_min, "p_nom_max"] = (_pmax - _pmin).clip(lower=0)
+        n.generators.loc[_offwind_min, "p_nom_min"] = 0.0
+        # Fixe Kapitalkosten für die Mindestkapazität als Konstante einrechnen
+        # Das ändert den Optimalwert aber nicht die optimale Lösung
+        n.generators.loc[_offwind_min, "capital_cost"] = _cc  # unveraendert
+        # p_nom_opt wird nach dem Solve um p_nom_min erhöht
+        # → speichere p_nom_min für Rücktransformation
+        if not hasattr(n, "_offwind_pnom_min_offset"):
+            n._offwind_pnom_min_offset = {}
+        n._offwind_pnom_min_offset.update(_pmin.to_dict())
+        logger.info("[OFFWIND-FIX-2] Variable substitution für %d offwind generators "
+                    "(p_nom_min range: %.0f-%.0f MW → 0)",
+                    len(_offwind_min), _pmin.min(), _pmin.max())
+
+    # [NUM-FIX-GENERAL] Cap all remaining inf bounds
+    _ext_links_inf = n.links.index[
+        n.links.p_nom_extendable.fillna(False) & (n.links.p_nom_max >= 1e14)
+    ]
+    if len(_ext_links_inf):
+        n.links.loc[_ext_links_inf, "p_nom_max"] = 1e6
+        logger.info("[NUM-FIX-GENERAL] %d ext links p_nom_max=1e6", len(_ext_links_inf))
+    _ext_gens_inf = n.generators.index[
+        n.generators.p_nom_extendable.fillna(False) & (n.generators.p_nom_max >= 1e14)
+    ]
+    if len(_ext_gens_inf):
+        n.generators.loc[_ext_gens_inf, "p_nom_max"] = 1e6
+        logger.info("[NUM-FIX-GENERAL] %d ext generators p_nom_max=1e6", len(_ext_gens_inf))
+    _ext_stores_inf = n.stores.index[
+        n.stores.e_nom_extendable.fillna(False) & (n.stores.e_nom_max >= 1e14)
+    ]
+    if len(_ext_stores_inf):
+        n.stores.loc[_ext_stores_inf, "e_nom_max"] = 1e8
+        logger.info("[NUM-FIX-GENERAL] %d ext stores e_nom_max=1e8", len(_ext_stores_inf))
+    _fix_links_ne = n.links.index[
+        (~n.links.p_nom_extendable.fillna(False)) &
+        (n.links.p_nom_max >= 1e14)
+    ]
+    if len(_fix_links_ne):
+        _pn = n.links.loc[_fix_links_ne, "p_nom"]
+        n.links.loc[_fix_links_ne, "p_nom_max"] = _pn.where(_pn > 0, 1e6)
+        logger.info("[NUM-FIX-GENERAL] %d non-ext links capped", len(_fix_links_ne))
+    _fix_stores_ne = n.stores.index[
+        (~n.stores.e_nom_extendable.fillna(False)) &
+        (n.stores.e_nom >= 1e14)
+    ]
+    if len(_fix_stores_ne):
+        n.stores.loc[_fix_stores_ne, "e_nom"] = 1e7
+        logger.info("[NUM-FIX-GENERAL] %d non-ext stores e_nom=1e7", len(_fix_stores_ne))
 
     # [ARO-FIX-11] PyPSA v1.0.4 masks dispatch variables for assets with
     # build_year > investment_period (here period=0). Fix: align build_year
@@ -4211,6 +4373,18 @@ def solve_aro_master(
             logger.warning("IIS failed: %s", _iis_e)
 
     _check_solver_status(n, "Master", hard_fail_suboptimal=hard_fail_suboptimal)
+    # [OFFWIND-FIX-2b] Rücktransformation nach Solve
+    if hasattr(n, "_offwind_pnom_min_offset"):
+        for _gen_idx, _pmin_off in n._offwind_pnom_min_offset.items():
+            if _gen_idx in n.generators.index:
+                n.generators.loc[_gen_idx, "p_nom_min"] = _pmin_off
+                n.generators.loc[_gen_idx, "p_nom_max"] += _pmin_off
+                if "p_nom_opt" in n.generators.columns:
+                    n.generators.loc[_gen_idx, "p_nom_opt"] = (
+                        n.generators.loc[_gen_idx, "p_nom_opt"] + _pmin_off
+                    )
+        logger.info("[OFFWIND-FIX-2b] p_nom restored for %d offwind generators",
+                    len(n._offwind_pnom_min_offset))
 
     sol          = _get_solution_dict(n)
     z_theta_star = _extract_scalar_solution(sol, "z_theta")
