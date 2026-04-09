@@ -83,6 +83,15 @@ MASTER_CONFIG: Dict[str, Any] = {
         "end_mmdd":       _env("DARK_SKY_END",   "01-28"),
     },
 
+    # Optional: dispatch-/netzwerkspezifische Analysefenster.
+    # Keys koennen Run-Keys (normal/aro), ARO-Szenarionamen oder freie Dispatch-Tags sein.
+    # Prioritaet bei Lookup:
+    #   1) dispatch_windows[run_key][dispatch_tag]
+    #   2) dispatch_windows[dispatch_tag]
+    #   3) dispatch_windows[run_key]["__default__"]
+    #   4) global dark_sky_period
+    "dispatch_windows": {},
+
     # =======================================================================
     # PLOT STYLE
     # =======================================================================
@@ -185,6 +194,14 @@ MASTER_CONFIG: Dict[str, Any] = {
                 "robust_network_std":      f"{{aro_results_base}}/{RUN_NAME}/networks/aro_robust__std.nc",
                 "worst_case_dispatch":     None,
                 "worst_case_dispatch_std": None,
+                "dispatch_paths":          {},
+                # Optional: run-spezifische Dunkelflautenfenster pro Dispatch/Szenario.
+                # Beispiel:
+                # "dispatch_windows": {
+                #     "__default__": {"reference_year": 2028, "start_mmdd": "01-07", "end_mmdd": "01-28"},
+                #     "cutout_2012": {"reference_year": 2012, "start_mmdd": "01-15", "end_mmdd": "01-29"},
+                # },
+                "dispatch_windows":       {},
                 "scenarios": [],
             },
         },
@@ -238,6 +255,53 @@ class MasterConfig:
     def dark_sky_end(self) -> str:
         """Gibt 'YYYY-MM-DD' zurück."""
         return f"{self.dark_sky_reference_year}-{self.dark_sky_period['end_mmdd']}"
+
+    @property
+    def dispatch_windows(self) -> Dict[str, Any]:
+        return dict(self.raw.get("dispatch_windows", {}))
+
+    @staticmethod
+    def _format_period(period: Dict[str, Any]) -> Dict[str, Any]:
+        ref = int(period["reference_year"])
+        start = f"{ref}-{period['start_mmdd']}"
+        end = f"{ref}-{period['end_mmdd']}"
+        return {
+            "reference_year": ref,
+            "start_mmdd": str(period["start_mmdd"]),
+            "end_mmdd": str(period["end_mmdd"]),
+            "start": start,
+            "end": end,
+        }
+
+    def get_dispatch_window(
+        self,
+        dispatch_tag: Optional[str] = None,
+        run_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        global_default = self._format_period(self.dark_sky_period)
+        windows = self.dispatch_windows
+        tag = str(dispatch_tag) if dispatch_tag is not None else None
+        rk = str(run_key) if run_key is not None else None
+
+        if rk and rk in self.aro_runs:
+            run_conf = self.aro_runs.get(rk, {})
+            run_windows = run_conf.get("dispatch_windows", {}) or {}
+            if tag and tag in run_windows:
+                return self._format_period(run_windows[tag])
+            if "__default__" in run_windows:
+                return self._format_period(run_windows["__default__"])
+
+        if rk and rk in windows and isinstance(windows[rk], dict):
+            run_windows = windows[rk]
+            if tag and tag in run_windows:
+                return self._format_period(run_windows[tag])
+            if "__default__" in run_windows:
+                return self._format_period(run_windows["__default__"])
+
+        if tag and tag in windows:
+            return self._format_period(windows[tag])
+
+        return global_default
 
     # ---------- COUNTRIES ----------
     @property
@@ -306,7 +370,6 @@ class MasterConfig:
         return list(self.raw["aro"]["countries_to_analyze"])
 
     # ---------- Helpers ----------
-
     def get_run_type(self, run_key: Optional[str] = None) -> str:
         key = run_key or self.scenario_selection
         reg_entry = self.scenarios_registry.get(key, {})
@@ -414,7 +477,6 @@ class PlottingConfig:
         self.SCENARIOS          = self.master.scenarios_registry
         self.PLOTS_TO_RUN       = self.master.plots_selection
         self.AVAILABLE_PLOTS    = self.master.available_plots
-        # Dark sky period — direkt als fertige Strings verfügbar
         self.DARK_SKY_START     = self.master.dark_sky_start
         self.DARK_SKY_END       = self.master.dark_sky_end
 
@@ -442,6 +504,8 @@ class AROPlottingConfig:
         self.CARRIER_COLORS       = self.master.carrier_colors
         self.DEFAULT_COLOR        = self.master.default_color
         self.ARO_PLOTS            = self.master.aro_plot_toggles
+        self.DARK_SKY_START       = self.master.dark_sky_start
+        self.DARK_SKY_END         = self.master.dark_sky_end
 
     def get_current_run_config(self) -> Dict[str, Any]:
         cfg = dict(self.ARO_RUNS[self.SELECTED_RUN])
@@ -449,8 +513,17 @@ class AROPlottingConfig:
                   "worst_case_dispatch", "worst_case_dispatch_std"]:
             if k in cfg:
                 cfg[k] = self.master.resolve_template(cfg[k])
+        raw_dispatch_paths = dict(cfg.get("dispatch_paths", {}) or {})
+        cfg["dispatch_paths"] = {
+            sc: self.master.resolve_template(v) for sc, v in raw_dispatch_paths.items()
+        }
         if not cfg.get("scenarios"):
             cfg["scenarios"] = self.master.get_aro_scenarios_for_run(self.SELECTED_RUN)
+        cfg["resolved_dispatch_windows"] = {
+            sc: self.master.get_dispatch_window(sc, self.SELECTED_RUN)
+            for sc in cfg.get("scenarios", [])
+        }
+        cfg["resolved_run_default_window"] = self.master.get_dispatch_window(None, self.SELECTED_RUN)
         return cfg
 
     def get_plot_output_dir(self, plot_type: str = "general") -> Path:
@@ -546,7 +619,6 @@ def validate_config(master: Optional[MasterConfig] = None, strict: bool = False)
         else:
             info(f"ARO '{aro_sel}': {len(scenarios)} Szenarien: {scenarios[:5]}{'...' if len(scenarios)>5 else ''}")
 
-    # Dark sky period check
     try:
         import pandas as pd
         pd.Timestamp(master.dark_sky_start)
