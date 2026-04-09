@@ -419,23 +419,70 @@ def run_standalone_scripts(
 
 # -----------------------------------------------------------------------
 # Hilfsfunktion: robusten Portfolio-Pfad ermitteln
+# FIX: pypsa.Network hat kein _source_path-Attribut → Pfad direkt aus
+#      run_config lesen. Wenn kein robustes Portfolio vorhanden, wird
+#      das Basisrun-Referenznetz (Basisrun-rcp45-2028) als Vergleich
+#      für installed_cap_vgl verwendet.
 # -----------------------------------------------------------------------
 
 def _resolve_robust_path(analyzer: "AROAnalyzer") -> Optional[str]:
-    """Pfad zum robusten Portfolio-Netzwerk (für installed_cap_vgl etc.)."""
-    if analyzer.n_robust is not None and hasattr(analyzer.n_robust, "_source_path"):
-        p = str(analyzer.n_robust._source_path)
-        if Path(p).is_file():
-            return p
-    # Fallback: aus AROPlottingConfig
+    """
+    Ermittelt den Dateipfad des robusten Portfolio-Netzwerks für Standalone-
+    Skripte (insb. installed_cap_vgl).
+
+    Priorität:
+      1. run_config["robust_network"] / run_config["robust_network_std"]
+         (direkt aus AROPlottingConfig, kein _source_path nötig)
+      2. BASE_RESULTS_PATH/<run_name>/networks/robust_*.nc  (glob-Suche)
+      3. Basisrun-Referenznetz aus AROPlottingConfig.REFERENCE_NETWORK_PATH
+         (Basisrun-rcp45-2028 — Kernidee: ARO-Kapazitäten vs. Basisrun)
+      4. Fallback: erstes Netz aus config.REFERENCE_NETWORK_PATH
+    """
+    run_conf = analyzer.config.get_current_run_config()
+
+    # 1. Direkt aus run_config
+    for key in ("robust_network_std", "robust_network"):
+        p = run_conf.get(key)
+        if p and Path(p).is_file():
+            print(f"  [robust_path] Aus run_config['{key}']: {Path(p).name}")
+            return str(p)
+
+    # 2. Glob-Suche im Run-Verzeichnis
     try:
-        run_conf = analyzer.config.get_current_run_config()
-        for key in ("robust_network_std", "robust_network"):
-            p = run_conf.get(key)
-            if p and Path(p).is_file():
-                return p
+        base = Path(analyzer.config.BASE_RESULTS_PATH)
+        run_name = analyzer.run_config.get("name", "")
+        if run_name:
+            run_dir = base / run_name / "networks"
+            for pattern in ("robust_*.nc", "*robust*.nc", "n_robust*.nc"):
+                hits = sorted(run_dir.glob(pattern))
+                if hits:
+                    print(f"  [robust_path] Gefunden via glob ({pattern}): {hits[0].name}")
+                    return str(hits[0])
     except Exception:
         pass
+
+    # 3. Basisrun-Referenznetz (Kernidee: ARO vs. Basisrun)
+    #    Basisrun-rcp45-2028 enthält das optimierte Basisportfolio als Vergleich.
+    try:
+        ref_path = getattr(analyzer.config, "REFERENCE_NETWORK_PATH", None)
+        if ref_path and Path(ref_path).is_file():
+            print(f"  [robust_path] Basisrun-Referenznetz: {Path(ref_path).name}")
+            return str(ref_path)
+    except Exception:
+        pass
+
+    # 4. Fallback: Referenznetzwerke aus Config-Methode
+    try:
+        ref_networks = analyzer.config.get_reference_networks()
+        if ref_networks:
+            first = ref_networks[0] if isinstance(ref_networks, list) else next(iter(ref_networks.values()))[0]
+            if Path(first).is_file():
+                print(f"  [robust_path] Referenznetz-Fallback: {Path(first).name}")
+                return str(first)
+    except Exception:
+        pass
+
+    print("  [robust_path] WARNUNG: Kein robustes Portfolio / Referenznetz gefunden.")
     return None
 
 
@@ -572,8 +619,11 @@ def run_aro(
                   "Standalone-Skripte laufen ohne Dispatch-Netz (Ergebnisse werden leer sein)")
 
         if robust_path:
-            print(f"  [ARO] Robustes Portfolio für Standalone-Skripte: "
+            print(f"  [ARO] Referenz/Robust-Portfolio für installed_cap_vgl: "
                   f"{Path(robust_path).name}")
+        else:
+            print("  [ARO] Warnung: Kein robustes Portfolio / Referenznetz gefunden – "
+                  "installed_cap_vgl wird übersprungen.")
 
         print("\n=== Standalone plot_*.py Skripte (ARO-kompatibel) ===")
         standalone_report = run_standalone_scripts(
