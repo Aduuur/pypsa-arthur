@@ -9,6 +9,9 @@ Berechnet die Netto-Emissionen basierend auf:
 (-) CO2-Sequestrierung (Was dauerhaft aus dem System entfernt wird)
 
 Vermeidet Doppelzählung von Biogas/Synfuels.
+
+ARO-Fix: year-Parsing defensiv – wenn kein YYYY im Pfad (z.B. Dispatch-Netz),
+wird 2050 als Fallback verwendet, damit .group() nicht auf None crasht.
 """
 
 import os
@@ -23,6 +26,17 @@ FOSSIL_SOURCES = ["coal", "lignite", "oil", "gas", "oil primary"]
 
 # Was ist Sequestrierung? (Endlagerung)
 SINK_CARRIER = "co2 sequestered"
+
+
+def _parse_year(path: str, fallback: int = 2050) -> int:
+    """Extrahiert das Jahr aus einem Netzwerk-Pfad.
+
+    Unterstützt sowohl Planungsnetze ('base_s_24___2050.nc')
+    als auch ARO Dispatch-Netze ('dispatch_..._worst_case_std.nc').
+    Im letzten Fall gibt es kein YYYY im Namen → Fallback wird genutzt.
+    """
+    m = re.search(r"___(\d{4})\.nc$", path) or re.search(r"_(\d{4})\.nc", path)
+    return int(m.group(1)) if m else fallback
 
 
 def get_emissions_source_based(n: pypsa.Network, country_code: str) -> dict:
@@ -186,14 +200,17 @@ def main():
 
     res = []
     for path in paths:
-        if not os.path.isfile(path): continue
-        y = int(re.search(r"_(\d{4})\.nc", path).group(1))
+        if not os.path.isfile(path):
+            continue
+
+        # ARO-Fix: defensives year-parsing – kein Crash wenn kein YYYY im Pfad
+        y = _parse_year(path, fallback=2050)
         print(f"Jahr {y}...")
         n = pypsa.Network(path)
 
         # DE nach alter Logik (Verbrennung), ALL nach neuer Logik (Primärenergie)
         de = get_emissions_consumption_based(n, "DE")
-        all_sys = get_emissions_source_based(n, "ALL")  # <--- DAS IST DER TEST
+        all_sys = get_emissions_source_based(n, "ALL")
 
         res.append({
             "Year": y,

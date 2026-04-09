@@ -13,6 +13,9 @@ Logik:
   - Laden: Pumpen (nur PHS)
   - Entladen: Turbinieren (PHS + Hydro)
   - Füllstand: Aggregierte Energie
+
+ARO-Fix: year-Parsing defensiv – wenn kein YYYY im Pfad (z.B. Dispatch-Netz),
+wird 2050 als Fallback verwendet.
 """
 
 import os
@@ -28,6 +31,17 @@ from config_final import PlottingConfig
 # ------------------------------------------------------------
 # Hilfsfunktionen
 # ------------------------------------------------------------
+
+def _parse_year(path: str, fallback: int = 2050) -> int:
+    """Extrahiert das Jahr aus einem Netzwerk-Pfad.
+
+    Unterstützt sowohl Planungsnetze ('base_s_24___2050.nc')
+    als auch ARO Dispatch-Netze ('dispatch_..._worst_case_std.nc').
+    Im letzten Fall gibt es kein YYYY im Namen → Fallback wird genutzt.
+    """
+    m = re.search(r"___(\d{4})\.nc$", path) or re.search(r"_(\d{4})\.nc", path)
+    return int(m.group(1)) if m else fallback
+
 
 def extract_country(bus_name):
     """Länderkürzel aus Busname."""
@@ -102,17 +116,13 @@ def plot_country_storage(n, country, year, save_dir):
             hydro_e_nom += (n.storage_units.loc[hydro_su, "p_nom"] * n.storage_units.loc[hydro_su, "max_hours"]).sum()
 
     # b) PHS Pumpen über Links (wichtig!)
-    # In PyPSA-Eur werden PHS-Pumpen oft als separate Links modelliert
-    # Suche nach Links die zu PHS-StorageUnits gehören
     if not phs_su.empty:
         for su in phs_su:
-            # Finde Links, die zu diesem StorageUnit führen (Pumpen)
             pump_links = n.links.index[
                 (n.links.bus1 == n.storage_units.loc[su, "bus"]) &
                 (n.links.carrier.str.contains("PHS", case=False, na=False))
                 ]
             if not pump_links.empty:
-                # p1 ist die Leistung am bus1 (Speicher) - positiv = hinein pumpen
                 hydro_pump += n.links_t.p1[pump_links].sum(axis=1).clip(lower=0)
 
     # c) Stores (falls verwendet)
@@ -138,7 +148,6 @@ def plot_country_storage(n, country, year, save_dir):
     daily_hydro_soc_norm = hydro_soc_norm.resample("D").mean()
 
     # === 4. Plotting mit größeren Schriften ===
-    # Setze global Schriftgrößen
     plt.rcParams.update({
         'font.size': 16,
         'axes.titlesize': 18,
@@ -150,7 +159,6 @@ def plot_country_storage(n, country, year, save_dir):
     })
 
     fig, axes = plt.subplots(2, 1, figsize=(14, 9), sharex=True)
-    # Titel hier anpassen, wenn gewünscht (z.B. "Speicherbewirtschaftung in DE (2050)")
     fig.suptitle(f"Speicheranalyse für {country} im Jahr {year}", fontsize=22)
 
     # Plot Batterie
@@ -196,7 +204,6 @@ def plot_country_storage(n, country, year, save_dir):
     plt.savefig(path, dpi=300)
     plt.close()
 
-    # Reset font settings (wichtig, falls das Skript als Modul genutzt wird)
     plt.rcParams.update(plt.rcParamsDefault)
 
     print(f"✅ Speicherplot gespeichert: {path}")
@@ -212,7 +219,6 @@ def main():
     # Falls Dictionary, nimm das ausgewählte Szenario
     if isinstance(networks, dict):
         if config.SCENARIO_SELECTION == "both":
-            # Nimm das erste Szenario (z.B. average oder dunkelflaute)
             networks = list(networks.values())[0]
         else:
             networks = networks[config.SCENARIO_SELECTION]
@@ -222,9 +228,12 @@ def main():
             continue
 
         try:
-            year = int(re.search(r"_(\d{4})\.nc$", path).group(1))
+            # ARO-Fix: defensives year-parsing – kein Crash wenn kein YYYY im Pfad
+            year = _parse_year(path, fallback=2050)
 
-            # Alle Jahre 2025, 2030-2050 plotten
+            # Im Normalmodus: nur bekannte Planungsjahre verarbeiten.
+            # Im ARO-Modus liefert _parse_year(dispatch_...) → 2050, also
+            # immer in der Whitelist.
             if year not in [2025, 2030, 2035, 2040, 2045, 2050]:
                 continue
 

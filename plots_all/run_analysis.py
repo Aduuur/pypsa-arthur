@@ -64,20 +64,48 @@ STANDALONE_SCRIPTS: Dict[str, str] = {
     "check_waermepumpen":      "plot_check_wärmepumpen_df.py",
 }
 
-# Skripte die sinnvoll auf einem einzelnen Netz (ARO Worst-Case) laufen
+# -----------------------------------------------------------------------
+# ARO_APPLICABLE_SCRIPTS
+# -----------------------------------------------------------------------
+# Skripte die sinnvoll auf einem einzelnen Netz (ARO Worst-Case) laufen.
+#
+# Erweiterung gegenüber ursprünglicher Liste:
+#   + installed_cap_vgl       – Kapazitäten direkt aus dem Netz ableitbar
+#   + storage_kombi_es_de     – Speicherplot für ES/DE, funktioniert auf Dispatch-Netz
+#   + storage_kombi_fr_de     – dto. für FR/DE
+#   + marginal_prices_check   – Marginalpreise, identisch zu marginal_prices
+#   + dec_price_split         – Dezentraler Preis aufgeteilt, braucht nur 1 Netz
+#   + delta_prices_map        – Preiskarte, braucht nur 1 Netz
+#   + map_leitung_export      – Leitungsauslastung, sinnvoll auf Dispatch-Netz
+#   + map_nutzbare_uebertrag  – dto.
+#   + co2_emissionen_analyse  – Detailanalyse, gleiche Datengrundlage wie co2_emissionen
+#   + check_waermepumpen      – Wärmepumpencheck, braucht nur 1 Netz
+#
+# Bewusst NICHT in ARO_APPLICABLE:
+#   dec_delta_dispatch  – vergleicht zwei Szenarien, braucht beide Netze
 ARO_APPLICABLE_SCRIPTS: set = {
     "dispatch_timeline",
     "balance_timeline",
+    "installed_cap_vgl",
     "energy_gen_no_storage",
     "generation_timeline_res",
     "generation_timeline_gen",
     "storage_v2",
+    "storage_kombi_es_de",
+    "storage_kombi_fr_de",
     "marginal_prices",
+    "marginal_prices_check",
     "dec_price_normal",
     "dec_price_new_jan",
+    "dec_price_split",
+    "delta_prices_map",
     "dispatch_gas_h2",
     "consumption_timeline",
+    "map_leitung_export",
+    "map_nutzbare_uebertrag",
     "co2_emissionen",
+    "co2_emissionen_analyse",
+    "check_waermepumpen",
 }
 
 SCRIPTS_DIR = Path(__file__).parent
@@ -106,19 +134,6 @@ def _year_from_path(path: str) -> Optional[int]:
 
 # -----------------------------------------------------------------------
 # BUG B FIX: _inject_aro_dispatch_network
-#
-# Previous version patched MASTER_CONFIG["networks"]["2050"] which does
-# NOT exist.  Standalone scripts (balance_timeline, dispatch_timeline …)
-# determine the network path from one of these locations:
-#
-#   (A) MASTER_CONFIG["scenarios"]["registry"][<run>]["networks"][0]
-#       → most scripts call master_config.get_networks() or read the
-#         first entry of the registry list
-#   (B) MASTER_CONFIG["network_path"]        (flat key, some older scripts)
-#   (C) MASTER_CONFIG["network_2050"]        (flat key variant)
-#
-# All three are now patched so every script receives the ARO worst-case
-# dispatch network instead of the empty planning network.
 # -----------------------------------------------------------------------
 
 def _inject_aro_dispatch_network(aro_dispatch_path: str) -> dict:
@@ -143,8 +158,6 @@ def _inject_aro_dispatch_network(aro_dispatch_path: str) -> dict:
     p = str(aro_dispatch_path)
 
     # --- (A) scenarios.registry.<run>.networks  [PRIMARY] ---------------
-    # This is what get_networks() reads. We replace the networks list for
-    # every registry entry so the scenario selection doesn't matter.
     registry = MASTER_CONFIG.get("scenarios", {}).get("registry", {})
     if isinstance(registry, dict):
         for run_key, run_cfg in registry.items():
@@ -182,15 +195,6 @@ def _restore_network_config(saved: dict) -> None:
 
 # -----------------------------------------------------------------------
 # BUG A FIX: _resolve_wc_dispatch_path
-#
-# Previously run_aro() called analyzer.get_worst_case_dispatch_path()
-# which does NOT exist on AROAnalyzer.  The correct way to obtain the
-# worst-case dispatch path is:
-#
-#   1. analyzer.n_worst_case._source_path  (if we inject it during load)
-#   2. analyzer._dispatch_dir() + glob for *_worst_case_std.nc
-#   3. Any scenario network path for the known worst_case_cutout
-#   4. Glob fallback in dispatch dir
 # -----------------------------------------------------------------------
 
 def _resolve_wc_dispatch_path(analyzer: "AROAnalyzer") -> Optional[str]:
@@ -279,9 +283,7 @@ def _load_and_run_script(
     aro_dispatch_path : str, optional
         If set (ARO mode), temporarily patches the network path in MASTER_CONFIG
         so the script reads the worst-case dispatch network instead of the
-        planning network.  Without this, all time-series based plots produce
-        0 GWh generation / empty marginal prices because the planning network
-        has no dispatch solution stored in generators_t, buses_t, etc.
+        planning network.
     """
     result: Dict[str, Any] = {"script": script_key, "ok": False, "error": None}
 
@@ -451,8 +453,6 @@ def run_aro(
     # Standalone Skripte
     # ------------------------------------------------------------------
     if run_standalone:
-        # BUG A FIX: Use _resolve_wc_dispatch_path() instead of the
-        # non-existent analyzer.get_worst_case_dispatch_path().
         wc_dispatch_path: Optional[str] = _resolve_wc_dispatch_path(analyzer)
 
         if wc_dispatch_path:
@@ -465,7 +465,7 @@ def run_aro(
         print("\n=== Standalone plot_*.py Skripte (ARO-kompatibel) ===")
         standalone_report = run_standalone_scripts(
             script_keys=standalone_keys,
-            aro_only=(standalone_keys is None),   # ohne explizite Auswahl: nur ARO_APPLICABLE
+            aro_only=(standalone_keys is None),
             override_scenario=run_key,
             aro_dispatch_path=wc_dispatch_path,
         )
