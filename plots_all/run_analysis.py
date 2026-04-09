@@ -62,27 +62,15 @@ STANDALONE_SCRIPTS: Dict[str, str] = {
     "co2_emissionen":          "plot_jaehrliche_co2_emissionen.py",
     "co2_emissionen_analyse":  "plot_jaehrliche_co2_emissionen_analyse.py",
     "check_waermepumpen":      "plot_check_wärmepumpen_df.py",
+    # --- NEU: ARO-spezifische Plots ---
+    "aro_capacity_by_country": "plot_aro_capacity_by_country.py",
+    "aro_annual_dispatch":     "plot_aro_annual_dispatch.py",
 }
 
 # -----------------------------------------------------------------------
 # ARO_APPLICABLE_SCRIPTS
 # -----------------------------------------------------------------------
 # Skripte die sinnvoll auf einem einzelnen Netz (ARO Worst-Case) laufen.
-#
-# Erweiterung gegenüber ursprünglicher Liste:
-#   + installed_cap_vgl       – Kapazitäten direkt aus dem Netz ableitbar
-#   + storage_kombi_es_de     – Speicherplot für ES/DE, funktioniert auf Dispatch-Netz
-#   + storage_kombi_fr_de     – dto. für FR/DE
-#   + marginal_prices_check   – Marginalpreise, identisch zu marginal_prices
-#   + dec_price_split         – Dezentraler Preis aufgeteilt, braucht nur 1 Netz
-#   + delta_prices_map        – Preiskarte, braucht nur 1 Netz
-#   + map_leitung_export      – Leitungsauslastung, sinnvoll auf Dispatch-Netz
-#   + map_nutzbare_uebertrag  – dto.
-#   + co2_emissionen_analyse  – Detailanalyse, gleiche Datengrundlage wie co2_emissionen
-#   + check_waermepumpen      – Wärmepumpencheck, braucht nur 1 Netz
-#
-# Bewusst NICHT in ARO_APPLICABLE:
-#   dec_delta_dispatch  – vergleicht zwei Szenarien, braucht beide Netze
 ARO_APPLICABLE_SCRIPTS: set = {
     "dispatch_timeline",
     "balance_timeline",
@@ -106,6 +94,9 @@ ARO_APPLICABLE_SCRIPTS: set = {
     "co2_emissionen",
     "co2_emissionen_analyse",
     "check_waermepumpen",
+    # --- NEU: direkt alle scenario_networks nutzend, kein Worst-Case-Inject nötig ---
+    "aro_capacity_by_country",
+    "aro_annual_dispatch",
 }
 
 SCRIPTS_DIR = Path(__file__).parent
@@ -270,6 +261,7 @@ def _load_and_run_script(
     script_key: str,
     override_scenario: Optional[str] = None,
     aro_dispatch_path: Optional[str] = None,
+    analyzer: Optional["AROAnalyzer"] = None,
 ) -> Dict[str, Any]:
     """
     Load and execute a standalone plot_*.py script.
@@ -284,6 +276,10 @@ def _load_and_run_script(
         If set (ARO mode), temporarily patches the network path in MASTER_CONFIG
         so the script reads the worst-case dispatch network instead of the
         planning network.
+    analyzer : AROAnalyzer, optional
+        Wenn gesetzt, wird für ARO-native Skripte (aro_capacity_by_country,
+        aro_annual_dispatch) direkt das analyzer-Objekt verwendet statt
+        MASTER_CONFIG zu patchen.
     """
     result: Dict[str, Any] = {"script": script_key, "ok": False, "error": None}
 
@@ -300,6 +296,57 @@ def _load_and_run_script(
     if str(SCRIPTS_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPTS_DIR))
 
+    # --- ARO-native Skripte: direkt über analyzer laufen ----------------
+    if script_key == "aro_capacity_by_country" and analyzer is not None:
+        try:
+            from plot_aro_capacity_by_country import run_capacity_by_country
+            out_dir = analyzer.config.get_plot_output_dir("capacity_by_country")
+            cost_dict = (
+                analyzer.aro_summary
+                .get("aro_final_evaluation", {})
+                .get("all_costs", {}) or {}
+            )
+            run_capacity_by_country(
+                n_robust=analyzer.n_robust,
+                scenario_networks=analyzer.scenario_networks,
+                output_dir=out_dir,
+                run_name=analyzer.config.SELECTED_RUN,
+                user_colors=analyzer.config.CARRIER_COLORS,
+                plot_diff=True,
+                save=True,
+            )
+            result["ok"] = True
+        except Exception as e:
+            import traceback
+            result["error"] = str(e)
+            result["traceback"] = traceback.format_exc()
+        return result
+
+    if script_key == "aro_annual_dispatch" and analyzer is not None:
+        try:
+            from plot_aro_annual_dispatch import run_annual_dispatch
+            out_dir = analyzer.config.get_plot_output_dir("annual_dispatch")
+            cost_dict = (
+                analyzer.aro_summary
+                .get("aro_final_evaluation", {})
+                .get("all_costs", {}) or {}
+            )
+            run_annual_dispatch(
+                scenario_networks=analyzer.scenario_networks,
+                output_dir=out_dir,
+                run_name=analyzer.config.SELECTED_RUN,
+                user_colors=analyzer.config.CARRIER_COLORS,
+                cost_dict=cost_dict,
+                save=True,
+            )
+            result["ok"] = True
+        except Exception as e:
+            import traceback
+            result["error"] = str(e)
+            result["traceback"] = traceback.format_exc()
+        return result
+
+    # --- Standard: MASTER_CONFIG patchen und Skript ausführen -----------
     from master_config import MASTER_CONFIG
     _orig_sel = None
     _network_backup: dict = {}
@@ -308,14 +355,12 @@ def _load_and_run_script(
         _orig_sel = MASTER_CONFIG["scenarios"]["selection"]
         MASTER_CONFIG["scenarios"]["selection"] = override_scenario
 
-    # --- ARO fix: redirect network path to worst-case dispatch -----------
     if aro_dispatch_path is not None:
         if Path(aro_dispatch_path).is_file():
             _network_backup = _inject_aro_dispatch_network(aro_dispatch_path)
             print(f"     [ARO] Netzwerk → {Path(aro_dispatch_path).name}")
         else:
             print(f"     [ARO] Warnung: Worst-Case-Dispatch nicht gefunden: {aro_dispatch_path}")
-    # ----------------------------------------------------------------------
 
     try:
         spec = importlib.util.spec_from_file_location(f"_standalone_{script_key}", script_path)
@@ -344,6 +389,7 @@ def run_standalone_scripts(
     aro_only: bool = False,
     override_scenario: Optional[str] = None,
     aro_dispatch_path: Optional[str] = None,
+    analyzer: Optional["AROAnalyzer"] = None,
 ) -> Dict[str, Any]:
     report: Dict[str, Any] = {"ok": True, "scripts": {}}
 
@@ -357,6 +403,7 @@ def run_standalone_scripts(
             key,
             override_scenario=override_scenario,
             aro_dispatch_path=aro_dispatch_path,
+            analyzer=analyzer,
         )
         report["scripts"][key] = res
         if res["ok"]:
@@ -432,6 +479,51 @@ def run_aro(
     except Exception as e:
         report["warnings"].append(f"plot_scenario_capacity_comparison failed: {e}")
 
+    # --- NEU: Kapazitäten nach Land + Jährlicher Dispatch ---------------
+    try:
+        from plot_aro_capacity_by_country import run_capacity_by_country
+        cost_dict = (
+            analyzer.aro_summary
+            .get("aro_final_evaluation", {})
+            .get("all_costs", {}) or {}
+        )
+        run_capacity_by_country(
+            n_robust=analyzer.n_robust,
+            scenario_networks=analyzer.scenario_networks,
+            output_dir=aro_out / "capacity_by_country",
+            run_name=run_key,
+            user_colors=aro_cfg.CARRIER_COLORS,
+            plot_diff=True,
+            save=True,
+        )
+        report["steps"].append({"capacity_by_country": "ok"})
+    except Exception as e:
+        import traceback
+        report["warnings"].append(f"capacity_by_country failed: {e}")
+        report["warnings"].append(traceback.format_exc())
+
+    try:
+        from plot_aro_annual_dispatch import run_annual_dispatch
+        cost_dict = (
+            analyzer.aro_summary
+            .get("aro_final_evaluation", {})
+            .get("all_costs", {}) or {}
+        )
+        run_annual_dispatch(
+            scenario_networks=analyzer.scenario_networks,
+            output_dir=aro_out / "annual_dispatch",
+            run_name=run_key,
+            user_colors=aro_cfg.CARRIER_COLORS,
+            cost_dict=cost_dict,
+            save=True,
+        )
+        report["steps"].append({"annual_dispatch": "ok"})
+    except Exception as e:
+        import traceback
+        report["warnings"].append(f"annual_dispatch failed: {e}")
+        report["warnings"].append(traceback.format_exc())
+    # --- Ende neue Plots -------------------------------------------------
+
     if toggles.get("worst_case_analysis", False):
         c_list = countries or aro_cfg.COUNTRIES_TO_ANALYZE
         for c in c_list:
@@ -468,6 +560,7 @@ def run_aro(
             aro_only=(standalone_keys is None),
             override_scenario=run_key,
             aro_dispatch_path=wc_dispatch_path,
+            analyzer=analyzer,   # NEU: direkt übergeben
         )
         report["standalone"] = standalone_report
 
@@ -540,7 +633,6 @@ def run_normal(
             for p in paths:
                 analyze_one(p, branch_out)
 
-    # Standalone Skripte
     if run_standalone:
         print("\n=== Standalone plot_*.py Skripte ===")
         standalone_report = run_standalone_scripts(
@@ -669,7 +761,6 @@ def main():
     run_standalone = not args.no_standalone
     standalone_keys = args.standalone if args.standalone is not None else None
 
-    # --mode standalone: nur Standalone-Skripte, kein CountryAnalyzer / ARO
     if args.mode == "standalone":
         print("\n=== Nur Standalone Skripte ===")
         rep = run_standalone_scripts(
