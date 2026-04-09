@@ -306,11 +306,19 @@ def run_annual_dispatch(
     output_dir: Path,
     run_name: str = "",
     user_colors: Optional[Dict] = None,
+    cost_dict: Optional[Dict[str, float]] = None,
     save: bool = True,
 ) -> None:
     """
     Erstellt alle jährlichen Dispatch-Vergleichsplots.
     Szenario-Namen → stress_xy Kurzlabels.
+
+    Parameters
+    ----------
+    cost_dict : dict, optional
+        {cutout_name → Kosten [Mrd. EUR/a]} aus aro_final_evaluation.all_costs.
+        Wird für den Scatter-Plot (CF vs. Systemkosten) genutzt.
+        Falls None: Kosten werden aus den Netzwerken selbst berechnet.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -339,7 +347,12 @@ def run_annual_dispatch(
         slabel = label_map[full_name]
         gen_data[slabel]  = _extract_annual_generation(n)
         cf_data[slabel]   = _capacity_factor(n)
-        cost_data[slabel] = _extract_system_cost(n)
+        # Kosten: aus cost_dict bevorzugen (direkter ARO-Summary-Wert),
+        # sonst aus Netzwerk berechnen
+        if cost_dict and full_name in cost_dict:
+            cost_data[slabel] = float(cost_dict[full_name])
+        else:
+            cost_data[slabel] = _extract_system_cost(n)
 
     # Carrier-Reihenfolge
     all_carriers_set = set().union(*[set(s.index) for s in gen_data.values()])
@@ -368,10 +381,12 @@ def run_annual_dispatch(
     )
 
     # Plot 3: Scatter
+    # Titel mit Hinweis ob Kosten aus Summary oder Netzwerk kommen
+    cost_source = "ARO-Summary" if cost_dict else "berechnet aus Netzwerk"
     plot_cf_vs_cost_scatter(
         cf_data=cf_data,
         cost_data=cost_data,
-        title=f"Kapazitätsfaktor vs. Systemkosten [{run_name}]",
+        title=f"Kapazitätsfaktor vs. Systemkosten [{run_name}] (Kosten: {cost_source})",
         out_path=output_dir / "cf_vs_cost_scatter.png",
         save=save,
     )
@@ -402,12 +417,19 @@ def main():
     analyzer = AROAnalyzer(config=aro_cfg, auto_find_dispatch=True)
     out_dir  = Path(args.output) if args.output else aro_cfg.get_plot_output_dir("annual_dispatch")
 
+    cost_dict = (
+        analyzer.aro_summary
+        .get("aro_final_evaluation", {})
+        .get("all_costs", {}) or {}
+    )
+
     run_annual_dispatch(
         n_robust=analyzer.n_robust,
         scenario_networks=analyzer.scenario_networks,
         output_dir=out_dir,
         run_name=aro_cfg.SELECTED_RUN,
         user_colors=aro_cfg.CARRIER_COLORS,
+        cost_dict=cost_dict,
         save=True,
     )
     print(f"\n✓ Jährlicher Dispatch gespeichert in: {out_dir}")

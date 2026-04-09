@@ -126,6 +126,19 @@ def _parse_int_list(s: Optional[str]) -> Optional[List[int]]:
 
 
 def _year_from_path(path: str) -> Optional[int]:
+    """Jahr aus Dateipfad extrahieren.
+
+    Strategie:
+      1. Netzwerk laden und Jahr aus n.snapshots lesen (sicher, auch für
+         ARO-Dispatch-Dateien ohne Jahr im Namen).
+      2. Fallback: Regex auf den Dateinamen (klassische Planung ___YYYY.nc).
+    """
+    try:
+        import pypsa
+        n = pypsa.Network(path)
+        return int(n.snapshots[0].year)
+    except Exception:
+        pass
     m = re.search(r"___(\d{4})\.nc$", path) or re.search(r"_(\d{4})\.nc$", path)
     return int(m.group(1)) if m else None
 
@@ -246,6 +259,7 @@ def _load_and_run_script(
     script_key: str,
     override_scenario: Optional[str] = None,
     aro_dispatch_path: Optional[str] = None,
+    aro_robust_path: Optional[str] = None,
     analyzer: Optional["AROAnalyzer"] = None,
 ) -> Dict[str, Any]:
     result: Dict[str, Any] = {"script": script_key, "ok": False, "error": None}
@@ -294,6 +308,7 @@ def _load_and_run_script(
                 .get("all_costs", {}) or {}
             )
             run_annual_dispatch(
+                n_robust=analyzer.n_robust,
                 scenario_networks=analyzer.scenario_networks,
                 output_dir=out_dir,
                 run_name=analyzer.config.SELECTED_RUN,
@@ -302,6 +317,30 @@ def _load_and_run_script(
                 save=True,
             )
             result["ok"] = True
+        except Exception as e:
+            import traceback
+            result["error"] = str(e)
+            result["traceback"] = traceback.format_exc()
+        return result
+
+    # BUG-2 FIX: installed_cap_vgl im ARO-Modus direkt über main(aro_network=...) aufrufen
+    # statt MASTER_CONFIG zu patchen (was zum 'SCENARIO_SELECTION muss both sein'-Fehler führte)
+    if script_key == "installed_cap_vgl" and aro_dispatch_path is not None:
+        if not Path(aro_dispatch_path).is_file():
+            result["error"] = f"ARO-Dispatch nicht gefunden: {aro_dispatch_path}"
+            return result
+        try:
+            spec = importlib.util.spec_from_file_location(f"_standalone_{script_key}", script_path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            if hasattr(mod, "main"):
+                mod.main(
+                    aro_network=aro_dispatch_path,
+                    aro_robust_network=aro_robust_path,
+                )
+                result["ok"] = True
+            else:
+                result["error"] = "Kein main() gefunden"
         except Exception as e:
             import traceback
             result["error"] = str(e)
@@ -351,6 +390,7 @@ def run_standalone_scripts(
     aro_only: bool = False,
     override_scenario: Optional[str] = None,
     aro_dispatch_path: Optional[str] = None,
+    aro_robust_path: Optional[str] = None,
     analyzer: Optional["AROAnalyzer"] = None,
 ) -> Dict[str, Any]:
     report: Dict[str, Any] = {"ok": True, "scripts": {}}
@@ -365,6 +405,7 @@ def run_standalone_scripts(
             key,
             override_scenario=override_scenario,
             aro_dispatch_path=aro_dispatch_path,
+            aro_robust_path=aro_robust_path,
             analyzer=analyzer,
         )
         report["scripts"][key] = res
@@ -374,6 +415,28 @@ def run_standalone_scripts(
             print(f"  ✗ {key}: {res['error']}")
 
     return report
+
+
+# -----------------------------------------------------------------------
+# Hilfsfunktion: robusten Portfolio-Pfad ermitteln
+# -----------------------------------------------------------------------
+
+def _resolve_robust_path(analyzer: "AROAnalyzer") -> Optional[str]:
+    """Pfad zum robusten Portfolio-Netzwerk (für installed_cap_vgl etc.)."""
+    if analyzer.n_robust is not None and hasattr(analyzer.n_robust, "_source_path"):
+        p = str(analyzer.n_robust._source_path)
+        if Path(p).is_file():
+            return p
+    # Fallback: aus AROPlottingConfig
+    try:
+        run_conf = analyzer.config.get_current_run_config()
+        for key in ("robust_network_std", "robust_network"):
+            p = run_conf.get(key)
+            if p and Path(p).is_file():
+                return p
+    except Exception:
+        pass
+    return None
 
 
 # -----------------------------------------------------------------------
@@ -396,13 +459,6 @@ def run_aro(
         aro_cfg.SELECTED_RUN = aro_run
 
     run_key = aro_cfg.SELECTED_RUN
-
-    # out_dir IS bereits der Run-Ordner (plots_base/<run_key>/).
-    # AROPlottingConfig.get_plot_output_dir() legt Unterordner dort an.
-    # Wir setzen den Override NICHT mehr, damit der Property-Getter
-    # sauber über get_run_output_dir() läuft.
-    # Für Rückwärtskompatibilität (falls Code direkt auf PLOT_OUTPUT_PATH
-    # zugreift) setzen wir ihn trotzdem:
     aro_cfg.PLOT_OUTPUT_PATH = str(out_dir)
 
     run_conf = aro_cfg.get_current_run_config()
@@ -448,11 +504,6 @@ def run_aro(
     # Kapazitäten nach Land
     try:
         from plot_aro_capacity_by_country import run_capacity_by_country
-        cost_dict = (
-            analyzer.aro_summary
-            .get("aro_final_evaluation", {})
-            .get("all_costs", {}) or {}
-        )
         run_capacity_by_country(
             n_robust=analyzer.n_robust,
             scenario_networks=analyzer.scenario_networks,
@@ -477,6 +528,7 @@ def run_aro(
             .get("all_costs", {}) or {}
         )
         run_annual_dispatch(
+            n_robust=analyzer.n_robust,
             scenario_networks=analyzer.scenario_networks,
             output_dir=aro_cfg.get_plot_output_dir("annual_dispatch"),
             run_name=run_key,
@@ -510,6 +562,7 @@ def run_aro(
     # Standalone Skripte
     if run_standalone:
         wc_dispatch_path: Optional[str] = _resolve_wc_dispatch_path(analyzer)
+        robust_path: Optional[str] = _resolve_robust_path(analyzer)
 
         if wc_dispatch_path:
             print(f"\n  [ARO] Worst-Case-Dispatch für Standalone-Skripte: "
@@ -518,12 +571,17 @@ def run_aro(
             print("\n  [ARO] Warnung: Kein Worst-Case-Dispatch gefunden – "
                   "Standalone-Skripte laufen ohne Dispatch-Netz (Ergebnisse werden leer sein)")
 
+        if robust_path:
+            print(f"  [ARO] Robustes Portfolio für Standalone-Skripte: "
+                  f"{Path(robust_path).name}")
+
         print("\n=== Standalone plot_*.py Skripte (ARO-kompatibel) ===")
         standalone_report = run_standalone_scripts(
             script_keys=standalone_keys,
             aro_only=(standalone_keys is None),
             override_scenario=run_key,
             aro_dispatch_path=wc_dispatch_path,
+            aro_robust_path=robust_path,
             analyzer=analyzer,
         )
         report["standalone"] = standalone_report
@@ -559,7 +617,6 @@ def run_normal(
 
     c_list = countries or plot_cfg.get_countries()
 
-    # out_dir ist bereits plots_base/<run_key>/ — kein extra normal/<run_key>/ Infix.
     def analyze_one(net_path: str, base_out: Path):
         y = _year_from_path(net_path)
         if years is not None and y is not None and y not in years:
@@ -568,7 +625,6 @@ def run_normal(
             report["warnings"].append(f"Network file missing: {net_path}")
             return
 
-        # Wenn mehrere Jahre: Unterordner pro Jahr; bei einzelnem Netz direkt.
         if y is not None and isinstance(networks, list) and len(networks) > 1:
             per_net_out = base_out / str(y)
         else:
@@ -654,7 +710,6 @@ def run_all_scenarios(
     for key in master.scenarios_registry:
         run_type = master.get_run_type(key)
         print(f"\n[all] Verarbeite Szenario '{key}' (run_type={run_type})")
-        # out_dir ist der globale plots_base/; jeder Key bekommt seinen eigenen Unterordner
         key_out = master.get_run_output_dir(key)
         try:
             if run_type == "aro":
@@ -719,7 +774,6 @@ def main():
     master = MasterConfig()
     v      = validate_config(master, strict=args.strict)
 
-    # run_key für den Output-Ordner bestimmen
     run_key = (
         args.run_name
         or args.aro_run
