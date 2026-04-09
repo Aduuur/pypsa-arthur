@@ -100,8 +100,64 @@ def _parse_int_list(s: Optional[str]) -> Optional[List[int]]:
 
 
 def _year_from_path(path: str) -> Optional[int]:
-    m = re.search(r"___(\\d{4})\\.nc$", path) or re.search(r"_(\\d{4})\\.nc$", path)
+    m = re.search(r"___(\d{4})\.nc$", path) or re.search(r"_(\d{4})\.nc$", path)
     return int(m.group(1)) if m else None
+
+
+def _inject_aro_dispatch_network(aro_dispatch_path: str) -> dict:
+    """
+    Temporarily override the network path in MASTER_CONFIG so standalone
+    scripts pick up the ARO worst-case dispatch network instead of the
+    planning network (base_s_24___2050.nc).
+
+    Returns a dict with the original values so the caller can restore them
+    in a finally block via _restore_network_config().
+
+    The function patches the following common keys used by standalone scripts:
+      MASTER_CONFIG["networks"]["2050"]          (most scripts)
+      MASTER_CONFIG["networks"]["network_2050"]  (alt key variant)
+      MASTER_CONFIG["network_path"]              (simple key variant)
+    All patches are only applied when the key already exists; unknown schemas
+    are left untouched so the injection is always safe.
+    """
+    from master_config import MASTER_CONFIG
+
+    saved: dict = {}
+    p = str(aro_dispatch_path)
+
+    # Variant A: nested dict under "networks"
+    networks = MASTER_CONFIG.get("networks", {})
+    if isinstance(networks, dict):
+        for k in list(networks.keys()):
+            # patch any key that looks like a year-keyed path (2050, "2050", etc.)
+            if str(k) == "2050" or k == "network_2050":
+                saved[("networks", k)] = networks[k]
+                networks[k] = p
+
+    # Variant B: flat "network_path" key
+    if "network_path" in MASTER_CONFIG:
+        saved[("network_path",)] = MASTER_CONFIG["network_path"]
+        MASTER_CONFIG["network_path"] = p
+
+    # Variant C: flat "network_2050" key at top level
+    if "network_2050" in MASTER_CONFIG:
+        saved[("network_2050",)] = MASTER_CONFIG["network_2050"]
+        MASTER_CONFIG["network_2050"] = p
+
+    return saved
+
+
+def _restore_network_config(saved: dict) -> None:
+    """Restore MASTER_CONFIG keys previously saved by _inject_aro_dispatch_network."""
+    from master_config import MASTER_CONFIG
+
+    networks = MASTER_CONFIG.get("networks", {})
+    for key_tuple, original in saved.items():
+        if len(key_tuple) == 2 and key_tuple[0] == "networks":
+            if isinstance(networks, dict):
+                networks[key_tuple[1]] = original
+        elif len(key_tuple) == 1:
+            MASTER_CONFIG[key_tuple[0]] = original
 
 
 # -----------------------------------------------------------------------
@@ -111,7 +167,24 @@ def _year_from_path(path: str) -> Optional[int]:
 def _load_and_run_script(
     script_key: str,
     override_scenario: Optional[str] = None,
+    aro_dispatch_path: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """
+    Load and execute a standalone plot_*.py script.
+
+    Parameters
+    ----------
+    script_key : str
+        Registry key from STANDALONE_SCRIPTS.
+    override_scenario : str, optional
+        If set, temporarily overrides MASTER_CONFIG["scenarios"]["selection"].
+    aro_dispatch_path : str, optional
+        If set (ARO mode), temporarily patches the network path in MASTER_CONFIG
+        so the script reads the worst-case dispatch network instead of the
+        planning network.  Without this, all time-series based plots produce
+        0 GWh generation / empty marginal prices because the planning network
+        has no dispatch solution stored in generators_t, buses_t, etc.
+    """
     result: Dict[str, Any] = {"script": script_key, "ok": False, "error": None}
 
     filename = STANDALONE_SCRIPTS.get(script_key)
@@ -129,9 +202,20 @@ def _load_and_run_script(
 
     from master_config import MASTER_CONFIG
     _orig_sel = None
+    _network_backup: dict = {}
+
     if override_scenario is not None:
         _orig_sel = MASTER_CONFIG["scenarios"]["selection"]
         MASTER_CONFIG["scenarios"]["selection"] = override_scenario
+
+    # --- ARO fix: redirect network path to worst-case dispatch -----------
+    if aro_dispatch_path is not None:
+        if Path(aro_dispatch_path).is_file():
+            _network_backup = _inject_aro_dispatch_network(aro_dispatch_path)
+            print(f"     [ARO] Netzwerk → {Path(aro_dispatch_path).name}")
+        else:
+            print(f"     [ARO] Warnung: Worst-Case-Dispatch nicht gefunden: {aro_dispatch_path}")
+    # ----------------------------------------------------------------------
 
     try:
         spec = importlib.util.spec_from_file_location(f"_standalone_{script_key}", script_path)
@@ -149,6 +233,8 @@ def _load_and_run_script(
     finally:
         if _orig_sel is not None:
             MASTER_CONFIG["scenarios"]["selection"] = _orig_sel
+        if _network_backup:
+            _restore_network_config(_network_backup)
 
     return result
 
@@ -157,6 +243,7 @@ def run_standalone_scripts(
     script_keys: Optional[List[str]] = None,
     aro_only: bool = False,
     override_scenario: Optional[str] = None,
+    aro_dispatch_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     report: Dict[str, Any] = {"ok": True, "scripts": {}}
 
@@ -166,7 +253,11 @@ def run_standalone_scripts(
 
     for key in keys:
         print(f"  [standalone] {key}  ({STANDALONE_SCRIPTS.get(key, '?')})")
-        res = _load_and_run_script(key, override_scenario=override_scenario)
+        res = _load_and_run_script(
+            key,
+            override_scenario=override_scenario,
+            aro_dispatch_path=aro_dispatch_path,
+        )
         report["scripts"][key] = res
         if res["ok"]:
             print(f"  ✓ {key}")
@@ -259,13 +350,67 @@ def run_aro(
         except Exception as e:
             report["warnings"].append(f"analyze_all_scenario_dispatches failed: {e}")
 
+    # ------------------------------------------------------------------
     # Standalone Skripte
+    # ------------------------------------------------------------------
     if run_standalone:
+        # Resolve the worst-case dispatch path so standalone scripts get a
+        # network with an actual dispatch solution (generators_t.p, buses_t.
+        # marginal_price, etc.) instead of the empty planning network.
+        wc_dispatch_path: Optional[str] = None
+        try:
+            wc_dispatch_path = analyzer.get_worst_case_dispatch_path()
+        except Exception:
+            pass
+
+        # Fallback: inspect scenario_networks for the worst-case key
+        if not wc_dispatch_path:
+            try:
+                wc_key = analyzer.worst_case_cutout  # attribute set during init
+                if wc_key and wc_key in analyzer.scenario_networks:
+                    n = analyzer.scenario_networks[wc_key]
+                    if hasattr(n, "_source_path"):
+                        wc_dispatch_path = n._source_path
+                    elif hasattr(analyzer, "_dispatch_paths") and wc_key in analyzer._dispatch_paths:
+                        wc_dispatch_path = analyzer._dispatch_paths[wc_key]
+            except Exception:
+                pass
+
+        # Second fallback: search dispatch dir directly
+        if not wc_dispatch_path:
+            try:
+                dispatch_dir = Path(analyzer.config.get_dispatch_dir())
+                worst_cutout = analyzer.worst_case_cutout or ""
+                safe = worst_cutout.replace("/", "_").replace(" ", "_")
+                for candidate in (
+                    f"dispatch_{safe}_worst_case_std.nc",
+                    f"dispatch_{safe}_std.nc",
+                ):
+                    p = dispatch_dir / candidate
+                    if p.is_file():
+                        wc_dispatch_path = str(p)
+                        break
+                if not wc_dispatch_path:
+                    # any *_worst_case_std.nc in dispatch dir
+                    candidates = sorted(dispatch_dir.glob("*_worst_case_std.nc"))
+                    if candidates:
+                        wc_dispatch_path = str(candidates[0])
+            except Exception:
+                pass
+
+        if wc_dispatch_path:
+            print(f"\n  [ARO] Worst-Case-Dispatch für Standalone-Skripte: "
+                  f"{Path(wc_dispatch_path).name}")
+        else:
+            print("\n  [ARO] Warnung: Kein Worst-Case-Dispatch gefunden – "
+                  "Standalone-Skripte laufen ohne Dispatch-Netz (Ergebnisse werden leer sein)")
+
         print("\n=== Standalone plot_*.py Skripte (ARO-kompatibel) ===")
         standalone_report = run_standalone_scripts(
             script_keys=standalone_keys,
             aro_only=(standalone_keys is None),   # ohne explizite Auswahl: nur ARO_APPLICABLE
             override_scenario=run_key,
+            aro_dispatch_path=wc_dispatch_path,
         )
         report["standalone"] = standalone_report
 
