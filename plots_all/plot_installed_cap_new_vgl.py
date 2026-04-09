@@ -6,7 +6,7 @@ Plot_scenario_comparison_installed_capacity
 ============================================================
 Vergleicht installierte Kapazitaeten zwischen zwei Szenarien.
 
-ARO-Modus: robustes Portfolio (average) vs. Worst-Case-Dispatch (dunkelflaute)
+ARO-Modus: robustes Portfolio (links) vs. Basisjahr-Planungsnetz (rechts)
 Klassischer Modus: 'both' aus config (average vs. dunkelflaute)
 """
 
@@ -217,26 +217,28 @@ def get_installed_capacity(n: pypsa.Network, country_code: str) -> pd.Series:
 # --- PLOTTING ---
 # =====================================================================
 
-def plot_scenario_comparison(df_avg, df_df, years, country, config):
-    all_techs = df_avg.index.union(df_df.index)
-    df_avg = df_avg.reindex(all_techs, fill_value=0)
-    df_df = df_df.reindex(all_techs, fill_value=0)
+def plot_scenario_comparison(df_robust, df_basis, years, country, config,
+                             label_left="Robustes Portfolio",
+                             label_right="Basisjahr"):
+    all_techs = df_robust.index.union(df_basis.index)
+    df_robust = df_robust.reindex(all_techs, fill_value=0)
+    df_basis  = df_basis.reindex(all_techs, fill_value=0)
 
     ALWAYS_KEEP = [
         "Braunkohle", "Steinkohle", "Biomasse", "Oel", "Kernkraft",
         "Laufwasser", "Wasserkraft", "Erdgas (GuD)", "Erdgas (Gasturbine)",
         "Pumpspeicher", "Batteriespeicher", "Heimspeicher"
     ]
-    total_max = max(df_avg.sum().max(), df_df.sum().max())
+    total_max = max(df_robust.sum().max(), df_basis.sum().max())
     MIN_SHARE = 0.01
 
     keep_mask = (
-        (df_avg.max(axis=1) >= MIN_SHARE * total_max) |
-        (df_df.max(axis=1) >= MIN_SHARE * total_max) |
-        (df_avg.index.isin(ALWAYS_KEEP))
+        (df_robust.max(axis=1) >= MIN_SHARE * total_max) |
+        (df_basis.max(axis=1)  >= MIN_SHARE * total_max) |
+        (df_robust.index.isin(ALWAYS_KEEP))
     )
-    df_avg = df_avg[keep_mask].copy()
-    df_df = df_df[keep_mask].copy()
+    df_robust = df_robust[keep_mask].copy()
+    df_basis  = df_basis[keep_mask].copy()
 
     order = [
         "Kernkraft", "Photovoltaik",
@@ -247,19 +249,19 @@ def plot_scenario_comparison(df_avg, df_df, years, country, config):
         "Pumpspeicher", "Batteriespeicher", "Heimspeicher",
         "H2-Turbine", "H2-Gasturbine"
     ]
-    common_index = df_avg.index
+    common_index = df_robust.index
     final_order = [t for t in order if t in common_index]
     final_order.extend([t for t in common_index if t not in final_order])
 
-    df_avg = df_avg.reindex(final_order)
-    df_df = df_df.reindex(final_order)
-    techs_ordered = df_avg.index.tolist()
+    df_robust = df_robust.reindex(final_order)
+    df_basis  = df_basis.reindex(final_order)
+    techs_ordered = df_robust.index.tolist()
 
     fig, ax = plt.subplots(figsize=(16, 10))
     x = np.arange(len(years))
     width = 0.35
-    bottom_avg = np.zeros(len(years))
-    bottom_df = np.zeros(len(years))
+    bottom_robust = np.zeros(len(years))
+    bottom_basis  = np.zeros(len(years))
     TEXT_THRESHOLD = 0.025 * total_max
 
     for tech in techs_ordered:
@@ -269,30 +271,33 @@ def plot_scenario_comparison(df_avg, df_df, years, country, config):
             k = next((k for k, v in CARRIER_TRANSLATION.items() if v == tech), tech)
             color = config.CARRIER_COLORS.get(k, config.DEFAULT_COLOR)
 
-        vals_avg = df_avg.loc[tech, years].values
-        vals_df = df_df.loc[tech, years].values
+        vals_robust = df_robust.loc[tech, years].values
+        vals_basis  = df_basis.loc[tech, years].values
 
-        ax.bar(x - width / 2, vals_avg, width, bottom=bottom_avg,
+        ax.bar(x - width / 2, vals_robust, width, bottom=bottom_robust,
                color=color, edgecolor="white", linewidth=0.5, label=tech)
-        ax.bar(x + width / 2, vals_df, width, bottom=bottom_df,
+        ax.bar(x + width / 2, vals_basis, width, bottom=bottom_basis,
                color=color, edgecolor="white", linewidth=0.5, alpha=0.95, hatch="///")
 
         for i in range(len(years)):
-            if vals_avg[i] >= TEXT_THRESHOLD:
-                ax.text(x[i] - width / 2, bottom_avg[i] + vals_avg[i] / 2, f"{int(round(vals_avg[i]))}",
+            if vals_robust[i] >= TEXT_THRESHOLD:
+                ax.text(x[i] - width / 2, bottom_robust[i] + vals_robust[i] / 2,
+                        f"{int(round(vals_robust[i]))}",
                         ha="center", va="center", color="white",
                         fontsize=FONT_SIZES["bar_text"], fontweight="bold")
-            if vals_df[i] >= TEXT_THRESHOLD:
-                ax.text(x[i] + width / 2, bottom_df[i] + vals_df[i] / 2, f"{int(round(vals_df[i]))}",
+            if vals_basis[i] >= TEXT_THRESHOLD:
+                ax.text(x[i] + width / 2, bottom_basis[i] + vals_basis[i] / 2,
+                        f"{int(round(vals_basis[i]))}",
                         ha="center", va="center", color="white",
                         fontsize=FONT_SIZES["bar_text"], fontweight="bold")
 
-        bottom_avg += vals_avg
-        bottom_df += vals_df
+        bottom_robust += vals_robust
+        bottom_basis  += vals_basis
 
     c_name = COUNTRY_NAMES.get(country, country)
     ax.set_title(
-        f"Installierte Kapazitaet: {c_name}\n(Links: Robustes Portfolio | Rechts: Worst-Case Dispatch)",
+        f"Installierte Kapazitaet: {c_name}\n"
+        f"(Links: {label_left} | Rechts: {label_right})",
         fontsize=FONT_SIZES["title"], pad=20
     )
     ax.set_ylabel("Kapazitaet (GW)", fontsize=FONT_SIZES["axis_label"])
@@ -323,75 +328,109 @@ def plot_scenario_comparison(df_avg, df_df, years, country, config):
 # --- MAIN (standalone + ARO-kompatibel via run_analysis.py) ---
 # =====================================================================
 
-def main(aro_network=None, aro_robust_network=None):
+def main(aro_network=None, aro_robust_network=None, aro_basis_network=None):
     """
     Parameters
     ----------
     aro_network : str or None
-        Im ARO-Modus: Pfad zum Worst-Case-Dispatch-Netzwerk (= 'dunkelflaute'-Seite).
+        Veraltet / ungenutzt im ARO-Modus. Wird ignoriert wenn aro_robust_network
+        und aro_basis_network gesetzt sind. Bleibt fuer Rueckwaertskompatibilitaet
+        als Trigger fuer den ARO-Zweig erhalten (prueft ob ARO-Modus aktiv).
     aro_robust_network : str or None
-        Im ARO-Modus: Pfad zum robusten Portfolio-Netzwerk (= 'average'-Seite).
-        Falls None aber aro_network gesetzt, wird nur ein Balken gezeigt.
+        Pfad zum robusten Portfolio-Netzwerk (linke Balken).
+    aro_basis_network : str or None
+        Pfad zum Basisjahr-Planungsnetz (rechte Balken, Vergleichsreferenz).
+        Frueherer Name: aro_network (war faelschlicherweise Worst-Case-Dispatch).
     """
     config = PlottingConfig()
 
     # ----------------------------------------------------------------
-    # ARO-Modus
+    # ARO-Modus: wird aktiviert wenn aro_robust_network ODER aro_network gesetzt.
+    # Fuer den Vergleich werden robust (links) und basis (rechts) benoetigt.
     # ----------------------------------------------------------------
-    if aro_network is not None:
-        paths_avg = [aro_robust_network] if aro_robust_network and os.path.isfile(aro_robust_network) else []
-        paths_df  = [aro_network]        if os.path.isfile(aro_network) else []
+    aro_mode = (aro_robust_network is not None) or (aro_network is not None)
 
-        if not paths_df:
-            print(f"\u26a0\ufe0f  ARO-Netzwerk nicht gefunden: {aro_network}")
-            return
-        if not paths_avg:
+    if aro_mode:
+        # Rueckwaertskompatibilitaet: frueheres aro_network war der Dispatch-Pfad
+        # und wurde als rechte Seite missbraucht. Jetzt ist aro_basis_network
+        # die korrekte rechte Seite. Falls aro_basis_network nicht gesetzt,
+        # Fallback auf aro_network (altes Verhalten, zeigt Warnung).
+        path_robust = aro_robust_network
+        path_basis  = aro_basis_network
+
+        if path_basis is None and aro_network is not None:
+            print(
+                "\u26a0\ufe0f  aro_basis_network nicht gesetzt — Fallback auf aro_network.\n"
+                "   Bitte run_analysis.py aktualisieren: aro_basis_network=<Basisjahr-Pfad>."
+            )
+            path_basis = aro_network
+
+        paths_robust = [path_robust] if path_robust and os.path.isfile(path_robust) else []
+        paths_basis  = [path_basis]  if path_basis  and os.path.isfile(path_basis)  else []
+
+        if not paths_robust:
             print("\u26a0\ufe0f  Kein robustes Portfolio angegeben — Vergleich nicht moeglich, uebersprungen.")
+            return
+        if not paths_basis:
+            print("\u26a0\ufe0f  Kein Basisjahr-Planungsnetz angegeben — Vergleich nicht moeglich, uebersprungen.")
             return
 
         countries = config.get_countries()
-        data_avg = {c: {} for c in countries}
-        data_df  = {c: {} for c in countries}
-        years_avg, years_df = [], []
+        data_robust = {c: {} for c in countries}
+        data_basis  = {c: {} for c in countries}
+        years_robust, years_basis = [], []
 
-        for path in paths_avg:
+        for path in paths_robust:
             try:
                 n = pypsa.Network(path)
                 year = _extract_year_from_network(n, path)
                 if year is None:
                     continue
-                years_avg.append(year)
+                years_robust.append(year)
                 for c in countries:
-                    data_avg[c][year] = get_installed_capacity(n, c)
+                    data_robust[c][year] = get_installed_capacity(n, c)
             except Exception as e:
                 print(f"Err {path}: {e}")
 
-        for path in paths_df:
+        for path in paths_basis:
             try:
                 n = pypsa.Network(path)
                 year = _extract_year_from_network(n, path)
                 if year is None:
                     continue
-                years_df.append(year)
+                years_basis.append(year)
                 for c in countries:
-                    data_df[c][year] = get_installed_capacity(n, c)
+                    data_basis[c][year] = get_installed_capacity(n, c)
             except Exception as e:
                 print(f"Err {path}: {e}")
 
-        common_years = sorted(set(years_avg) & set(years_df))
+        # Falls die Jahreszahlen verschieden sind (z.B. Robust 2050, Basis 2050),
+        # versuchen wir gemeinsame Jahre; bei keinem Treffer nehmen wir alle
+        # verfuegbaren Jahre und haengen sie nebeneinander.
+        common_years = sorted(set(years_robust) & set(years_basis))
         if not common_years:
-            print("\u26a0\ufe0f  Keine gemeinsamen Jahre gefunden (ARO-Modus).")
-            return
+            # Kein gemeinsames Jahr: beide Seiten trotzdem plotten mit
+            # 0-Auffuellung fuer fehlendes Jahr.
+            all_years = sorted(set(years_robust) | set(years_basis))
+            print(
+                f"\u26a0\ufe0f  Keine gemeinsamen Jahre (Robust: {years_robust}, Basis: {years_basis}).\n"
+                f"   Plotte alle verfuegbaren Jahre nebeneinander: {all_years}"
+            )
+            common_years = all_years
 
         save_dir = os.path.join(config.BASE_SAVE_PATH, "scenario_comparison", "installed_capacities")
         os.makedirs(save_dir, exist_ok=True)
 
         for c in countries:
-            df_a = pd.DataFrame(data_avg[c]).fillna(0)
-            df_d = pd.DataFrame(data_df[c]).fillna(0)
-            if df_a.empty and df_d.empty:
+            df_r = pd.DataFrame(data_robust[c]).reindex(columns=common_years).fillna(0)
+            df_b = pd.DataFrame(data_basis[c]).reindex(columns=common_years).fillna(0)
+            if df_r.empty and df_b.empty:
                 continue
-            fig = plot_scenario_comparison(df_a, df_d, common_years, c, config)
+            fig = plot_scenario_comparison(
+                df_r, df_b, common_years, c, config,
+                label_left="Robustes Portfolio",
+                label_right="Basisjahr",
+            )
             fname = f"Compare_Capacity_ARO_{c}.png"
             fig.savefig(os.path.join(save_dir, fname), dpi=300, bbox_inches="tight")
             plt.close(fig)
@@ -476,7 +515,11 @@ def main(aro_network=None, aro_robust_network=None):
         if df_a.empty and df_d.empty:
             continue
 
-        fig = plot_scenario_comparison(df_a, df_d, common_years, c, config)
+        fig = plot_scenario_comparison(
+            df_a, df_d, common_years, c, config,
+            label_left="Durchschnitt",
+            label_right="Dunkelflaute",
+        )
         fname = f"Compare_Capacity_{c}.png"
         fig.savefig(os.path.join(save_dir, fname), dpi=300, bbox_inches="tight")
         plt.close(fig)
