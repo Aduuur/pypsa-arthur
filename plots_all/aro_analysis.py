@@ -35,6 +35,50 @@ def _first_existing(paths: List[Optional[Path]]) -> Optional[Path]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Kapazitätsextraktion (Planungsnetz)
+# ---------------------------------------------------------------------------
+
+def _extract_capacity(n: pypsa.Network, label: str) -> pd.Series:
+    """
+    Extrahiert installierte Kapazitäten aus einem Planungsnetz.
+
+    Priorität: p_nom_opt > p_nom_min (wenn >0) > p_nom.
+    Gibt eine nach Carrier aggregierte Series zurück.
+    """
+    gens = n.generators.copy()
+    if "carrier" not in gens.columns:
+        print(f"  [{label}] WARNUNG: generators.carrier fehlt.")
+        return pd.Series(dtype=float)
+
+    if "p_nom_opt" in gens.columns:
+        pcol = "p_nom_opt"
+    elif "p_nom_min" in gens.columns and (gens["p_nom_min"] > 0).any():
+        pcol = "p_nom_min"
+    else:
+        pcol = "p_nom"
+
+    cap = gens.groupby("carrier")[pcol].sum()
+    cap = cap[cap > 1e-3].drop(index=["load"], errors="ignore")  # < 1 kW ignorieren
+    print(f"  [{label}] Kapazitätsquelle: {pcol} — {len(cap)} Carrier")
+    return cap
+
+
+def _extract_storage_capacity(n: pypsa.Network, label: str) -> pd.Series:
+    """Speicherkapazitäten (StorageUnits + Links mit Speicher-Carrier)."""
+    parts = []
+
+    if not n.storage_units.empty and "carrier" in n.storage_units.columns:
+        su = n.storage_units.copy()
+        pcol = "p_nom_opt" if "p_nom_opt" in su.columns else "p_nom"
+        s = su.groupby("carrier")[pcol].sum()
+        parts.append(s[s > 1e-3])
+
+    if parts:
+        return pd.concat(parts).groupby(level=0).sum()
+    return pd.Series(dtype=float)
+
+
 class AROAnalyzer:
     """
     Generischer Analyzer für ARO-Ergebnisse.
@@ -86,20 +130,10 @@ class AROAnalyzer:
         print(f"  Iterationen: {iters}  |  Finale Szenarien: {len(self.scenarios)}")
 
     # ------------------------------------------------------------------
-    # Dispatch-Pfad-Suche (FIX: networks/dispatch/ statt _dispatch_tmp/final/)
+    # Dispatch-Pfad-Suche
     # ------------------------------------------------------------------
 
     def _dispatch_dir(self) -> Optional[Path]:
-        """
-        Persistentes Dispatch-Verzeichnis:
-          results/<run>/networks/dispatch/
-        (= Snakemake output.dispatch_dir aus rule solve_aro)
-        Dateibenennung durch solve_aro.py:
-          dispatch_{safe_name}_worst_case_std.nc   <- Worst-Case
-          dispatch_{safe_name}_std.nc              <- alle anderen
-          dispatch_{safe_name}_worst_case_flat.nc
-          dispatch_{safe_name}_flat.nc
-        """
         base = Path(self.config.BASE_RESULTS_PATH)
         run_name = self.run_config.get("name", "")
         if not run_name:
@@ -108,10 +142,6 @@ class AROAnalyzer:
         return d if d.is_dir() else None
 
     def _dispatch_tmp_dir(self) -> Optional[Path]:
-        """
-        Fallback: temporäres Verzeichnis (_dispatch_tmp/final/).
-        Nur vorhanden wenn solve_aro noch läuft oder --out-dispatch-dir nicht gesetzt war.
-        """
         base = Path(self.config.BASE_RESULTS_PATH)
         run_name = self.run_config.get("name", "")
         if not run_name:
@@ -120,38 +150,22 @@ class AROAnalyzer:
         return d if d.is_dir() else None
 
     def _safe_name(self, scenario_name: str) -> str:
-        """Repliziert die safe_name-Logik aus solve_aro.py."""
         return scenario_name.replace("/", "_").replace(" ", "_")
 
     def _auto_find_dispatch_for_scenario(self, scenario_name: str) -> Optional[Path]:
-        """
-        Sucht das Dispatch-Netzwerk für ein bestimmtes Szenario.
-
-        Suchpfade (in dieser Reihenfolge):
-        1. results/<run>/networks/dispatch/dispatch_{safe_name}_std.nc       (bevorzugt)
-        2. results/<run>/networks/dispatch/dispatch_{safe_name}_flat.nc
-        3. results/<run>/networks/dispatch/dispatch_{safe_name}*.nc          (glob-Fallback)
-        4. results/<run>/networks/_dispatch_tmp/final/dispatch_{safe_name}*.nc (Rückwärtskompatibilität)
-        """
         safe = self._safe_name(scenario_name)
-
-        # 1+2+3: persistentes dispatch/-Verzeichnis (Snakemake output.dispatch_dir)
         d = self._dispatch_dir()
         if d is not None:
             for suffix in (f"dispatch_{safe}_std.nc", f"dispatch_{safe}_flat.nc"):
                 p = d / suffix
                 if p.is_file():
                     return p
-            # glob-Fallback (z.B. wenn safe_name leicht abweicht)
             candidates = sorted(d.glob(f"dispatch_*{safe}*.nc"))
-            # Bevorzuge _std.nc vor _flat.nc
             std_cands = [c for c in candidates if "_std.nc" in c.name]
             if std_cands:
                 return std_cands[0]
             if candidates:
                 return candidates[0]
-
-        # 4: temporäres Verzeichnis (Rückwärtskompatibilität)
         tmp = self._dispatch_tmp_dir()
         if tmp is not None:
             short = (
@@ -163,19 +177,10 @@ class AROAnalyzer:
                 candidates = sorted(tmp.glob(pattern))
                 if candidates:
                     return candidates[0]
-
         return None
 
     def _auto_find_any_dispatch(self) -> Optional[Path]:
-        """
-        Fallback: findet das Worst-Case-Dispatch-Netzwerk.
-
-        Bevorzugt explizit das _worst_case_std.nc aus networks/dispatch/,
-        dann _worst_case_flat.nc, dann irgend ein dispatch_*.nc.
-        """
         worst = self.aro_summary.get("aro_final_evaluation", {}).get("worst_case_cutout")
-
-        # 1. Persistentes dispatch/-Verzeichnis
         d = self._dispatch_dir()
         if d is not None:
             if worst:
@@ -189,27 +194,21 @@ class AROAnalyzer:
                     p = d / suffix
                     if p.is_file():
                         return p
-                # glob-Fallback mit worst_case im Namen
                 candidates = sorted(d.glob(f"dispatch_*{safe}*worst_case*.nc"))
                 if candidates:
                     return candidates[0]
-
-            # Kein worst_cutout bekannt → nimm irgendeinen worst_case
             wc_cands = sorted(d.glob("dispatch_*_worst_case_std.nc"))
             if wc_cands:
                 return wc_cands[0]
             wc_cands = sorted(d.glob("dispatch_*_worst_case*.nc"))
             if wc_cands:
                 return wc_cands[0]
-            # Letzter Ausweg: irgendeinen _std.nc
             all_std = sorted(d.glob("dispatch_*_std.nc"))
             if all_std:
                 return all_std[-1]
             all_nc = sorted(d.glob("dispatch_*.nc"))
             if all_nc:
                 return all_nc[-1]
-
-        # 2. Fallback: temporäres Verzeichnis (Rückwärtskompatibilität)
         tmp = self._dispatch_tmp_dir()
         if tmp is not None:
             candidates = sorted(tmp.glob("dispatch_*.nc"))
@@ -220,15 +219,76 @@ class AROAnalyzer:
                     if str(worst) in p.name:
                         return p
             return candidates[-1]
+        return None
 
+    def _find_basis_network(self) -> Optional[pypsa.Network]:
+        """
+        Sucht das Basisjahr-Planungsnetz für den Robust-vs-Basis-Vergleich.
+
+        Suchpfade (Priorität):
+          1. run_config["basis_network"]              — explizit in master_config gesetzt
+          2. run_config["reference_network"]          — Alternativschlüssel
+          3. config.REFERENCE_NETWORK_PATH            — Global definiertes Referenznetz
+          4. config.get_reference_networks()[0]       — Erste aus Liste
+          5. results/<run>/networks/base_s_*.nc       — Glob-Suche im Run-Verzeichnis
+        """
+        # 1+2: run_config-Schlüssel
+        for key in ("basis_network", "reference_network", "base_network"):
+            p = _safe_path(self.run_config.get(key))
+            if p is not None and p.is_file():
+                print(f"  [basis_network] Aus run_config['{key}']: {p.name}")
+                return pypsa.Network(str(p))
+
+        # 3: Globaler REFERENCE_NETWORK_PATH
+        ref_path = getattr(self.config, "REFERENCE_NETWORK_PATH", None)
+        if ref_path:
+            p = Path(str(ref_path))
+            if p.is_file():
+                print(f"  [basis_network] REFERENCE_NETWORK_PATH: {p.name}")
+                return pypsa.Network(str(p))
+
+        # 4: get_reference_networks()
+        try:
+            ref_networks = self.config.get_reference_networks()
+            if ref_networks:
+                first = (
+                    ref_networks[0]
+                    if isinstance(ref_networks, list)
+                    else next(iter(ref_networks.values()))[0]
+                )
+                p = Path(str(first))
+                if p.is_file():
+                    print(f"  [basis_network] get_reference_networks()[0]: {p.name}")
+                    return pypsa.Network(str(p))
+        except Exception:
+            pass
+
+        # 5: Glob-Suche
+        try:
+            base = Path(self.config.BASE_RESULTS_PATH)
+            run_name = self.run_config.get("name", "")
+            if run_name:
+                run_net_dir = base / run_name / "networks"
+                for pattern in ("base_s_*.nc", "*base*.nc", "*reference*.nc"):
+                    hits = sorted(run_net_dir.glob(pattern))
+                    # Dispatch-Netze ausschließen
+                    hits = [h for h in hits if "dispatch" not in h.name]
+                    if hits:
+                        print(f"  [basis_network] Glob ({pattern}): {hits[0].name}")
+                        return pypsa.Network(str(hits[0]))
+        except Exception:
+            pass
+
+        print("  [basis_network] WARNUNG: Kein Basisjahr-Planungsnetz gefunden.")
         return None
 
     def load_networks(self, auto_find_dispatch: bool = True):
         """
         Lädt:
-          - n_robust: robustes Portfolio-Netzwerk
+          - n_robust:          robustes Portfolio-Netzwerk
+          - n_basis:           Basisjahr-Planungsnetz (für Vergleich)
           - scenario_networks: dict{szenario -> pypsa.Network} für ALLE Szenarien
-          - n_worst_case: Worst-Case-Dispatch (für Rückwärtskompatibilität)
+          - n_worst_case:      Worst-Case-Dispatch (Rückwärtskompatibilität)
         """
         # ---- Robustes Portfolio ----
         portfolio_path = _safe_path(self.run_config.get("robust_network"))
@@ -239,16 +299,21 @@ class AROAnalyzer:
             self.n_robust = None
             print(f"WARNUNG: Portfolio nicht gefunden: {portfolio_path}")
 
+        # ---- Basisjahr-Planungsnetz ----
+        self.n_basis: Optional[pypsa.Network] = self._find_basis_network()
+        if self.n_basis is not None:
+            print(f"Basisjahr-Netz geladen: {len(self.n_basis.generators)} Generatoren")
+        else:
+            print("WARNUNG: Basisjahr-Planungsnetz nicht verfügbar — Robust-vs-Basis-Plots werden übersprungen.")
+
         # ---- Alle Szenario-Dispatch-Netzwerke ----
         self.scenario_networks: Dict[str, pypsa.Network] = {}
 
         for scenario in self.scenarios:
-            # 1. Explizit in run_config (z.B. "dispatch_paths": {"cutout_rcp45": "/path/..."})
             dispatch_paths = self.run_config.get("dispatch_paths", {})
             explicit = _safe_path(dispatch_paths.get(scenario))
             chosen = _first_existing([explicit])
 
-            # 2. Auto-Suche (primär in networks/dispatch/)
             if chosen is None and auto_find_dispatch:
                 chosen = self._auto_find_dispatch_for_scenario(scenario)
 
@@ -272,7 +337,6 @@ class AROAnalyzer:
             self.n_worst_case = pypsa.Network(str(chosen_wc))
             print(f"Worst-Case Dispatch geladen: {len(self.n_worst_case.snapshots)} Snapshots ({chosen_wc.name})")
         elif self.scenario_networks:
-            # Fallback: teuerstes Szenario als worst case
             all_costs = self.aro_summary.get("aro_final_evaluation", {}).get("all_costs", {})
             if all_costs:
                 worst_key = max(all_costs, key=lambda k: all_costs[k])
@@ -426,21 +490,190 @@ class AROAnalyzer:
             print(f"Gespeichert: {p}")
         plt.close()
 
+    # ------------------------------------------------------------------
+    # NEUER HAUPTPLOT: Robust vs. Basisjahr
+    # Ersetzt das alte Robust-vs-WorstCase im scenario_comparison-Ordner.
+    # ------------------------------------------------------------------
+
+    def plot_robust_vs_basis(
+        self,
+        save: bool = True,
+        n_basis_override: Optional[pypsa.Network] = None,
+        label_robust: str = "Robustes Portfolio (ARO)",
+        label_basis:  str = "Basisjahr",
+    ) -> None:
+        """
+        Vergleich: Installierte Kapazitäten – Robustes Portfolio vs. Basisjahr.
+
+        Erstellt drei Sub-Plots:
+          1. Grouped Bar Chart: absolute Kapazitäten je Carrier
+          2. Delta-Chart: (Robust − Basis) je Carrier
+          3. Donut-Chart: Anteile beider Portfolios (außen=ARO, innen=Basis)
+
+        Das Basisjahr-Netz wird aus self.n_basis genommen (geladen via
+        _find_basis_network() in load_networks). Optional kann ein eigenes
+        Netz über n_basis_override übergeben werden.
+        """
+        n_robust = self.n_robust
+        n_basis  = n_basis_override or self.n_basis
+
+        if n_robust is None:
+            print("[robust_vs_basis] Robustes Portfolio nicht verfügbar — übersprungen.")
+            return
+        if n_basis is None:
+            print("[robust_vs_basis] Basisjahr-Netz nicht verfügbar — übersprungen.")
+            # Fallback: nur Robust-Breakdown zeigen
+            self.plot_robust_capacity_breakdown(save=save)
+            return
+
+        cap_robust = _extract_capacity(n_robust, label_robust)
+        cap_basis  = _extract_capacity(n_basis,  label_basis)
+
+        # Alle Carrier vereinen
+        all_carriers = sorted(set(cap_robust.index) | set(cap_basis.index))
+        rob = cap_robust.reindex(all_carriers, fill_value=0.0)
+        bas = cap_basis.reindex(all_carriers, fill_value=0.0)
+        delta = rob - bas
+
+        # Carrier filtern: mindestens 1 MW in einem der beiden
+        mask = (rob.abs() + bas.abs()) > 1.0
+        rob   = rob[mask]
+        bas   = bas[mask]
+        delta = delta[mask]
+        all_carriers = list(rob.index)
+
+        if not all_carriers:
+            print("[robust_vs_basis] Keine gemeinsamen Carrier mit Kapazität > 1 MW.")
+            return
+
+        colors_rob = [self.config.CARRIER_COLORS.get(c, "#a9a9a9") for c in all_carriers]
+        colors_bas = [self._lighten(self.config.CARRIER_COLORS.get(c, "#a9a9a9"), 0.45) for c in all_carriers]
+        delta_colors = ["#2ca02c" if d >= 0 else "#d62728" for d in delta]
+
+        fig = plt.figure(figsize=(20, 14))
+        gs  = fig.add_gridspec(2, 2, hspace=0.38, wspace=0.32)
+
+        # ---- Sub-Plot 1: Grouped Bar ----
+        ax1 = fig.add_subplot(gs[0, :])
+        x   = np.arange(len(all_carriers))
+        w   = 0.38
+        bars_r = ax1.bar(x - w / 2, rob.values / 1e3,   width=w, label=label_robust, color=colors_rob, alpha=0.92)
+        bars_b = ax1.bar(x + w / 2, bas.values / 1e3,   width=w, label=label_basis,  color=colors_bas, alpha=0.92,
+                         edgecolor="grey", linewidth=0.6)
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(all_carriers, rotation=35, ha="right", fontsize=9)
+        ax1.set_ylabel("Kapazität [GW]", fontsize=11)
+        ax1.set_title(
+            f"Installierte Kapazitäten: {label_robust} vs. {label_basis}",
+            fontsize=13, fontweight="bold",
+        )
+        ax1.legend(fontsize=10)
+        ax1.grid(axis="y", alpha=0.3)
+        ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0f}"))
+
+        # Wertebeschriftung (nur wenn > 0.1 GW)
+        for bar, val in zip(bars_r, rob.values / 1e3):
+            if val > 0.1:
+                ax1.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.15,
+                         f"{val:.1f}", ha="center", va="bottom", fontsize=7, color="#333")
+        for bar, val in zip(bars_b, bas.values / 1e3):
+            if val > 0.1:
+                ax1.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.15,
+                         f"{val:.1f}", ha="center", va="bottom", fontsize=7, color="#555")
+
+        # ---- Sub-Plot 2: Delta ----
+        ax2 = fig.add_subplot(gs[1, 0])
+        ax2.bar(all_carriers, delta.values / 1e3, color=delta_colors, alpha=0.88)
+        ax2.axhline(0, color="black", linewidth=0.8, linestyle="--")
+        ax2.set_xticklabels(all_carriers, rotation=35, ha="right", fontsize=9)
+        ax2.set_ylabel("Δ Kapazität [GW]  (Robust − Basis)", fontsize=10)
+        ax2.set_title("Kapazitätsdifferenz (ARO − Basisjahr)", fontsize=12)
+        ax2.grid(axis="y", alpha=0.3)
+
+        from matplotlib.patches import Patch
+        ax2.legend(handles=[
+            Patch(facecolor="#2ca02c", label="ARO höher"),
+            Patch(facecolor="#d62728", label="ARO niedriger"),
+        ], fontsize=9)
+
+        # ---- Sub-Plot 3: Donut-Vergleich ----
+        ax3 = fig.add_subplot(gs[1, 1])
+        total_rob = rob.sum()
+        total_bas = bas.sum()
+        if total_rob > 0 and total_bas > 0:
+            # Donut: äußerer Ring = Robust, innerer Ring = Basis
+            # Nur Top-8 Carrier zeigen (Rest als "Sonstige")
+            top_n = 8
+            top_idx = rob.abs().nlargest(top_n).index.tolist()
+            other_idx = [c for c in all_carriers if c not in top_idx]
+
+            rob_top  = rob[top_idx].tolist()  + ([rob[other_idx].sum()]  if other_idx else [])
+            bas_top  = bas[top_idx].tolist()  + ([bas[other_idx].sum()]  if other_idx else [])
+            labels_d = top_idx + (["Sonstige"] if other_idx else [])
+            cols_d   = [self.config.CARRIER_COLORS.get(c, "#a9a9a9") for c in top_idx]
+            if other_idx:
+                cols_d.append("#cccccc")
+
+            kw = dict(wedgeprops=dict(width=0.42), startangle=90, labels=None)
+            ax3.pie(rob_top, colors=cols_d, radius=1.0,   **kw)
+            ax3.pie(bas_top, colors=cols_d, radius=0.58,  **kw)
+
+            ax3.text(0,  0.14, "ARO",   ha="center", va="center", fontsize=11, fontweight="bold")
+            ax3.text(0, -0.14, "Basis", ha="center", va="center", fontsize=10, color="#555")
+
+            # Legende
+            handles = [plt.Rectangle((0,0),1,1, fc=c) for c in cols_d]
+            ax3.legend(handles, labels_d, loc="lower center",
+                       bbox_to_anchor=(0.5, -0.18), ncol=3, fontsize=8)
+            ax3.set_title("Portfolio-Anteile (außen=ARO, innen=Basis)", fontsize=11)
+        else:
+            ax3.axis("off")
+            ax3.text(0.3, 0.5, "Keine Daten für Donut.", fontsize=11)
+
+        # Kennzahlen-Box
+        total_delta_gw = (total_rob - total_bas) / 1e3
+        pct_change     = ((total_rob - total_bas) / total_bas * 100) if total_bas > 0 else float("nan")
+        info_text = (
+            f"Gesamtkapazität\n"
+            f"  ARO:   {total_rob/1e3:.1f} GW\n"
+            f"  Basis: {total_bas/1e3:.1f} GW\n"
+            f"  Delta: {total_delta_gw:+.1f} GW ({pct_change:+.1f}%)"
+        )
+        fig.text(0.72, 0.02, info_text, fontsize=9, family="monospace",
+                 bbox=dict(boxstyle="round", facecolor="#f0f0f0", alpha=0.8))
+
+        plt.suptitle(
+            f"Robustes Portfolio vs. Basisjahr — {self.run_config.get('name', '')}",
+            fontsize=15, fontweight="bold", y=0.98,
+        )
+
+        if save:
+            p = self.config.get_plot_output_dir("scenario_comparison") / "robust_vs_basis_capacity.png"
+            plt.savefig(p, dpi=300, bbox_inches="tight")
+            print(f"Gespeichert: {p}")
+        plt.close()
+        print("[robust_vs_basis] Plot fertig.")
+
+    @staticmethod
+    def _lighten(hex_color: str, amount: float = 0.4) -> str:
+        """Hellt eine Hex-Farbe auf (amount=1.0 → weiß)."""
+        try:
+            h = hex_color.lstrip("#")
+            r, g, b = [int(h[i:i+2], 16) / 255.0 for i in (0, 2, 4)]
+            r = r + (1 - r) * amount
+            g = g + (1 - g) * amount
+            b = b + (1 - b) * amount
+            return "#{:02x}{:02x}{:02x}".format(int(r*255), int(g*255), int(b*255))
+        except Exception:
+            return hex_color
+
     def plot_robust_capacity_breakdown(self, save=True):
-        """Kapazitätsaufschlüsselung des robusten Portfolios."""
+        """Kapazitätsaufschlüsselung des robusten Portfolios (einzeln, ohne Vergleich)."""
         if self.n_robust is None:
             print("Robustes Portfolio nicht verfügbar")
             return
 
-        gens = self.n_robust.generators
-        pcol = "p_nom_opt" if "p_nom_opt" in gens.columns else ("p_nom" if "p_nom" in gens.columns else None)
-        if pcol is None or "carrier" not in gens.columns:
-            print("Generators fehlen p_nom_opt/p_nom oder carrier.")
-            return
-
-        cap = gens.groupby("carrier")[pcol].sum()
-        cap = cap[cap > 0].sort_values(ascending=False).drop(index=["load"], errors="ignore")
-
+        cap = _extract_capacity(self.n_robust, "robust")
         if cap.empty:
             print("Keine positiven Kapazitäten gefunden.")
             return
@@ -471,11 +704,16 @@ class AROAnalyzer:
 
     def plot_scenario_capacity_comparison(self, save=True):
         """
-        Vergleicht Dispatch-Ergebnisse pro Szenario — zeigt wie das robuste
-        Portfolio unter verschiedenen Klimaszenarien performt.
+        scenario_comparison/-Ordner:
+          1. Robust vs. Basisjahr (Kapazitätsvergleich)  ← NEU, Hauptplot
+          2. Dispatch-Performance je Klimaszenario        ← wie bisher
         """
+        # --- 1. Robust vs. Basisjahr ---
+        self.plot_robust_vs_basis(save=save)
+
+        # --- 2. Dispatch-Performance je Szenario ---
         if not self.scenario_networks:
-            print("Keine Szenario-Netzwerke geladen — plot_scenario_capacity_comparison übersprungen.")
+            print("Keine Szenario-Netzwerke geladen — Dispatch-Szenariovergleich übersprungen.")
             return
 
         all_costs = self.aro_summary.get("aro_final_evaluation", {}).get("all_costs", {})
@@ -521,9 +759,9 @@ class AROAnalyzer:
 
         colors = [self.config.CARRIER_COLORS.get(c, "#a9a9a9") for c in pivot.columns]
         pivot.plot(kind="bar", stacked=True, ax=axes[0], color=colors)
-        axes[0].set_title(f"Erzeugung/Kapazität pro Szenario — N={len(pivot)}", fontsize=13)
+        axes[0].set_title(f"Erzeugung pro Klimaszenario (robustes Portfolio) — N={len(pivot)}", fontsize=13)
         axes[0].set_xlabel("Szenario")
-        axes[0].set_ylabel("MWh / MW")
+        axes[0].set_ylabel("MWh")
         axes[0].legend(loc="upper right", fontsize=8, ncol=2)
         plt.setp(axes[0].xaxis.get_majorticklabels(), rotation=45, ha="right")
 
@@ -537,16 +775,16 @@ class AROAnalyzer:
                                  xytext=(4, 4), textcoords="offset points")
             axes[1].set_xlabel("Gesamterzeugung [MWh]")
             axes[1].set_ylabel("Systemkosten [€/a]")
-            axes[1].set_title("Kosten vs. Erzeugung (je Szenario)", fontsize=13)
+            axes[1].set_title("Kosten vs. Erzeugung (je Klimaszenario)", fontsize=13)
             axes[1].grid(True, alpha=0.3)
         else:
             axes[1].axis("off")
             axes[1].text(0.1, 0.5, "Keine Kostendaten für Scatter.", fontsize=11)
 
-        plt.suptitle(f"Szenario-Vergleich — {self.run_config.get('name', '')}", fontsize=15)
+        plt.suptitle(f"Dispatch-Szenariovergleich — {self.run_config.get('name', '')}", fontsize=15)
         plt.tight_layout()
         if save:
-            p = self.config.get_plot_output_dir("scenario_comparison") / "scenario_capacity_comparison.png"
+            p = self.config.get_plot_output_dir("scenario_comparison") / "scenario_dispatch_comparison.png"
             plt.savefig(p, dpi=300, bbox_inches="tight")
             print(f"Gespeichert: {p}")
         plt.close()
@@ -572,7 +810,6 @@ class AROAnalyzer:
     def analyze_all_scenario_dispatches(self, countries: Optional[List[str]] = None, save=True):
         """
         Führt CountryAnalyzer für ALLE geladenen Szenario-Netzwerke durch.
-        Ermöglicht vollständige Auswertung aller ARO-Szenarien.
         """
         if not self.scenario_networks:
             print("Keine Szenario-Netzwerke verfügbar.")
@@ -609,7 +846,8 @@ class AROAnalyzer:
             ("ARO Konvergenz",              self.plot_aro_convergence),
             ("Szenario-Kostenvergleich",     self.plot_scenario_cost_comparison),
             ("Robuste Kapazitäten",          self.plot_robust_capacity_breakdown),
-            ("Szenario-Kapazitätsvergleich", self.plot_scenario_capacity_comparison),
+            ("Robust vs. Basisjahr",          self.plot_robust_vs_basis),
+            ("Szenario-Dispatch-Vergleich",   self.plot_scenario_capacity_comparison),
         ]
 
         for name, func in plot_functions:
@@ -648,7 +886,13 @@ class AROAnalyzer:
             loaded = "✓" if s in self.scenario_networks else "✗ (nicht geladen)"
             print(f"  {loaded}  {s}: {cost/1e9:.2f} Mrd. €/a")
 
-        # Dispatch-Verzeichnis-Status anzeigen
+        n_basis_info = (
+            f"{len(self.n_basis.generators)} Generatoren"
+            if self.n_basis is not None
+            else "nicht gefunden"
+        )
+        print(f"\nBasisjahr-Netz: {n_basis_info}")
+
         d = self._dispatch_dir()
         tmp = self._dispatch_tmp_dir()
         if d:
