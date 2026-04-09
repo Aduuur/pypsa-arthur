@@ -46,8 +46,12 @@ MASTER_CONFIG: Dict[str, Any] = {
     "paths": {
         "pypsa_results_base": _env("PYPSA_RESULTS_BASE", "/home/endata/PycharmProjects/pypsa-ee/results"),
         "aro_results_base":   _env("ARO_RESULTS_BASE",   "/home/endata/PycharmProjects/pypsa-ee/results"),
+        # plots_base ist die EINZIGE Output-Wurzel für alle Plots.
+        # Jeder Run landet als Unterordner: plots_base/<run_key>/
+        # aro_plots_base wird nicht mehr als separate Wurzel genutzt,
+        # bleibt aber für Rückwärtskompatibilität als Alias konfigurierbar.
         "plots_base":         _env("PLOTS_BASE",         "/mnt/endata/MA_Arthur/PyPSA-results/plots"),
-        "aro_plots_base":     _env("ARO_PLOTS_BASE",     "/mnt/endata/MA_Arthur/aro_analysis/plots"),
+        "aro_plots_base":     _env("ARO_PLOTS_BASE",     "/mnt/endata/MA_Arthur/PyPSA-results/plots"),
     },
 
     # =======================================================================
@@ -71,11 +75,6 @@ MASTER_CONFIG: Dict[str, Any] = {
 
     # =======================================================================
     # DARK SKY / DUNKELFLAUTE ANALYSIS PERIOD
-    # Zeitraum für Wärmesektor-Analysen und Dunkelflaute-Plots.
-    # Das Referenzjahr entspricht dem meteorologischen Jahr im Modell (cutout).
-    # start/end: MM-DD (wird mit reference_year kombiniert).
-    # Kann per Umgebungsvariable überschrieben werden:
-    #   DARK_SKY_YEAR=2012  DARK_SKY_START=01-07  DARK_SKY_END=01-28
     # =======================================================================
     "dark_sky_period": {
         "reference_year": int(_env("DARK_SKY_YEAR", "2028")),
@@ -83,13 +82,6 @@ MASTER_CONFIG: Dict[str, Any] = {
         "end_mmdd":       _env("DARK_SKY_END",   "01-28"),
     },
 
-    # Optional: dispatch-/netzwerkspezifische Analysefenster.
-    # Keys koennen Run-Keys (normal/aro), ARO-Szenarionamen oder freie Dispatch-Tags sein.
-    # Prioritaet bei Lookup:
-    #   1) dispatch_windows[run_key][dispatch_tag]
-    #   2) dispatch_windows[dispatch_tag]
-    #   3) dispatch_windows[run_key]["__default__"]
-    #   4) global dark_sky_period
     "dispatch_windows": {},
 
     # =======================================================================
@@ -235,7 +227,36 @@ class MasterConfig:
 
     @property
     def aro_plots_base(self) -> str:
-        return self.paths["aro_plots_base"]
+        # Alias: zeigt auf plots_base damit ARO + normal dieselbe Wurzel nutzen.
+        # Kann per Env-Variable ARO_PLOTS_BASE auf separates Verzeichnis gesetzt werden,
+        # aber Standard ist plots_base.
+        return self.paths.get("aro_plots_base", self.paths["plots_base"])
+
+    # ---------- UNIFIED OUTPUT DIR ----------
+    def get_run_output_dir(self, run_key: str, sub: Optional[str] = None) -> Path:
+        """
+        Gibt den kanonischen Output-Ordner für einen Run zurück und legt ihn an:
+
+          <plots_base>/<run_key>/           <- Root des Runs
+          <plots_base>/<run_key>/<sub>/     <- falls sub angegeben
+
+        Das ist die EINZIGE Funktion die Output-Pfade erzeugt.
+        Sowohl ARO- als auch Normal-Runs landen hier.
+
+        Beispiele:
+          master.get_run_output_dir("big-aro-run-2")
+            => /mnt/.../plots/big-aro-run-2/
+
+          master.get_run_output_dir("big-aro-run-2", "aro_metrics")
+            => /mnt/.../plots/big-aro-run-2/aro_metrics/
+
+          master.get_run_output_dir("my-normal-run", "country/DE")
+            => /mnt/.../plots/my-normal-run/country/DE/
+        """
+        p = Path(self.plots_base) / run_key
+        if sub:
+            p = p / sub
+        return _mkdir(p)
 
     # ---------- DARK SKY PERIOD ----------
     @property
@@ -468,7 +489,6 @@ class PlottingConfig:
         self.master = master or MasterConfig()
         self.BASE_NETWORK_PATH  = self.master.pypsa_results_base
         self.BASE_SAVE_PATH     = self.master.plots_base
-        self.PLOT_OUTPUT_PATH   = str(_mkdir(Path(self.BASE_SAVE_PATH) / "plots_combined"))
         self.SCENARIO_SELECTION = self.master.scenario_selection
         self.COUNTRIES_TO_PLOT  = self.master.get_countries(self.master.default_countries_to_plot)
         self.FONT_SIZES         = self.master.font_sizes
@@ -479,6 +499,11 @@ class PlottingConfig:
         self.AVAILABLE_PLOTS    = self.master.available_plots
         self.DARK_SKY_START     = self.master.dark_sky_start
         self.DARK_SKY_END       = self.master.dark_sky_end
+        # PLOT_OUTPUT_PATH zeigt jetzt auf plots_base/<run_key>/
+        # (war früher plots_base/plots_combined/)
+        self.PLOT_OUTPUT_PATH   = str(
+            self.master.get_run_output_dir(self.SCENARIO_SELECTION)
+        )
 
     def get_networks(self):
         return self.master.get_networks()
@@ -496,7 +521,10 @@ class AROPlottingConfig:
     def __init__(self, master: Optional[MasterConfig] = None):
         self.master = master or MasterConfig()
         self.BASE_RESULTS_PATH    = self.master.aro_results_base
-        self.PLOT_OUTPUT_PATH     = self.master.aro_plots_base
+        # PLOT_OUTPUT_PATH: Root für alle ARO-Plots dieses Runs.
+        # Wird vom Setter überschrieben wenn run_analysis.py einen spezifischen
+        # Ordner setzt; default ist plots_base/<selected_run>/
+        self._plot_output_path_override: Optional[str] = None
         self.ARO_RUNS             = self.master.aro_runs
         self.SELECTED_RUN         = self.master.aro_selected_run
         self.COUNTRIES_TO_ANALYZE = self.master.aro_countries_to_analyze
@@ -506,6 +534,17 @@ class AROPlottingConfig:
         self.ARO_PLOTS            = self.master.aro_plot_toggles
         self.DARK_SKY_START       = self.master.dark_sky_start
         self.DARK_SKY_END         = self.master.dark_sky_end
+
+    @property
+    def PLOT_OUTPUT_PATH(self) -> str:
+        if self._plot_output_path_override is not None:
+            return self._plot_output_path_override
+        return str(self.master.get_run_output_dir(self.SELECTED_RUN))
+
+    @PLOT_OUTPUT_PATH.setter
+    def PLOT_OUTPUT_PATH(self, value: str) -> None:
+        """Erlaubt Überschreiben von run_analysis.py (Rückwärtskompatibilität)."""
+        self._plot_output_path_override = value
 
     def get_current_run_config(self) -> Dict[str, Any]:
         cfg = dict(self.ARO_RUNS[self.SELECTED_RUN])
@@ -527,8 +566,19 @@ class AROPlottingConfig:
         return cfg
 
     def get_plot_output_dir(self, plot_type: str = "general") -> Path:
-        output_dir = Path(self.PLOT_OUTPUT_PATH) / self.SELECTED_RUN / plot_type
-        return _mkdir(output_dir)
+        """
+        Gibt den kanonischen Unterordner für einen Plot-Typ zurück:
+          <plots_base>/<run_key>/<plot_type>/
+
+        Delegiert an MasterConfig.get_run_output_dir() damit ARO-Plots
+        und Normal-Plots dieselbe Root-Struktur haben.
+        """
+        # Falls PLOT_OUTPUT_PATH manuell gesetzt wurde (Legacy), nutze diesen
+        # als Basis; sonst get_run_output_dir.
+        if self._plot_output_path_override is not None:
+            base = Path(self._plot_output_path_override)
+            return _mkdir(base / plot_type)
+        return self.master.get_run_output_dir(self.SELECTED_RUN, sub=plot_type)
 
 
 # =============================================================================
@@ -554,12 +604,20 @@ def validate_config(master: Optional[MasterConfig] = None, strict: bool = False)
     def warn(msg): report["warnings"].append(msg)
     def info(msg): report["infos"].append(msg)
 
-    for k in ["pypsa_results_base", "aro_results_base", "plots_base", "aro_plots_base"]:
+    # plots_base muss existieren; aro_plots_base ist optional (kann alias sein)
+    for k, required in [("pypsa_results_base", False), ("aro_results_base", False),
+                        ("plots_base", True), ("aro_plots_base", False)]:
         v = master.paths.get(k)
         if v is None:
-            err(f"paths.{k} fehlt.")
+            if required:
+                err(f"paths.{k} fehlt.")
+            else:
+                warn(f"paths.{k} ist nicht gesetzt.")
         elif not _exists_dir(v):
-            warn(f"Verzeichnis existiert nicht: paths.{k}={v}")
+            if required:
+                warn(f"Verzeichnis existiert noch nicht (wird angelegt): paths.{k}={v}")
+            else:
+                info(f"Verzeichnis existiert noch nicht: paths.{k}={v}")
 
     plotting = master.plotting
     if not isinstance(plotting.get("dpi"), int) or plotting["dpi"] <= 0:
@@ -635,10 +693,17 @@ def validate_config(master: Optional[MasterConfig] = None, strict: bool = False)
 
 
 def make_run_output_dir(master: Optional[MasterConfig] = None, run_name: str = "run") -> Path:
+    """
+    Rückwärtskompatible Funktion — delegiert an get_run_output_dir().
+
+    Früher: plots_base/analysis_runs/<run_name>_<timestamp>/
+    Jetzt:  plots_base/<run_name>/
+
+    Der Timestamp-Suffix entfällt. Läufe überschreiben vorhandene Outputs
+    (gewünschtes Verhalten: kein Akkumulieren von Timestamp-Ordnern).
+    """
     master = master or MasterConfig()
-    base = Path(master.plots_base) / "analysis_runs"
-    out = base / f"{run_name}_{_now_stamp()}"
-    return _mkdir(out)
+    return master.get_run_output_dir(run_name)
 
 
 def write_report(out_dir: Path, report: Dict[str, Any], name: str = "report") -> None:

@@ -10,6 +10,17 @@ Verwendung:
   python plots_all/run_analysis.py --mode standalone              # nur plot_*.py Skripte
   python plots_all/run_analysis.py --mode aro --no-standalone     # ohne standalone Skripte
   python plots_all/run_analysis.py --mode aro --standalone dispatch_timeline co2_emissionen
+
+Output-Struktur (unified per-run):
+  <plots_base>/<run_key>/
+    country/<land>/        <- CountryAnalyzer (normal + ARO worst-case)
+    aro_metrics/           <- ARO Konvergenz, Gap, ...
+    capacity/              <- robuste Kapazitäten
+    scenario_comparison/   <- Kosten-Vergleich über Szenarien
+    worst_case/            <- Worst-Case Dispatch-Analyse
+    annual_dispatch/       <- Jährlicher Dispatch je Szenario
+    capacity_by_country/   <- Kapazitäten nach Land (ARO)
+    validation_report.json
 """
 
 from __future__ import annotations
@@ -62,14 +73,11 @@ STANDALONE_SCRIPTS: Dict[str, str] = {
     "co2_emissionen":          "plot_jaehrliche_co2_emissionen.py",
     "co2_emissionen_analyse":  "plot_jaehrliche_co2_emissionen_analyse.py",
     "check_waermepumpen":      "plot_check_wärmepumpen_df.py",
-    # --- NEU: ARO-spezifische Plots ---
+    # ARO-spezifische Plots
     "aro_capacity_by_country": "plot_aro_capacity_by_country.py",
     "aro_annual_dispatch":     "plot_aro_annual_dispatch.py",
 }
 
-# -----------------------------------------------------------------------
-# ARO_APPLICABLE_SCRIPTS
-# -----------------------------------------------------------------------
 # Skripte die sinnvoll auf einem einzelnen Netz (ARO Worst-Case) laufen.
 ARO_APPLICABLE_SCRIPTS: set = {
     "dispatch_timeline",
@@ -94,7 +102,6 @@ ARO_APPLICABLE_SCRIPTS: set = {
     "co2_emissionen",
     "co2_emissionen_analyse",
     "check_waermepumpen",
-    # --- NEU: direkt alle scenario_networks nutzend, kein Worst-Case-Inject nötig ---
     "aro_capacity_by_country",
     "aro_annual_dispatch",
 }
@@ -132,23 +139,12 @@ def _inject_aro_dispatch_network(aro_dispatch_path: str) -> dict:
     Temporarily override the network path in MASTER_CONFIG so standalone
     scripts pick up the ARO worst-case dispatch network instead of the
     planning network (base_s_24___2050.nc).
-
-    Returns a dict with the original values so the caller can restore them
-    in a finally block via _restore_network_config().
-
-    Patches:
-      (A) MASTER_CONFIG["scenarios"]["registry"][<run>]["networks"]
-          – replaces the entire list with [aro_dispatch_path] so that
-            calls to master_config.get_networks() return the dispatch net.
-      (B) MASTER_CONFIG["network_path"]     (flat key, if present)
-      (C) MASTER_CONFIG["network_2050"]     (flat key variant, if present)
     """
     from master_config import MASTER_CONFIG
 
     saved: dict = {}
     p = str(aro_dispatch_path)
 
-    # --- (A) scenarios.registry.<run>.networks  [PRIMARY] ---------------
     registry = MASTER_CONFIG.get("scenarios", {}).get("registry", {})
     if isinstance(registry, dict):
         for run_key, run_cfg in registry.items():
@@ -156,12 +152,10 @@ def _inject_aro_dispatch_network(aro_dispatch_path: str) -> dict:
                 saved[("scenarios", "registry", run_key, "networks")] = list(run_cfg["networks"])
                 run_cfg["networks"] = [p]
 
-    # --- (B) flat "network_path" key ------------------------------------
     if "network_path" in MASTER_CONFIG:
         saved[("network_path",)] = MASTER_CONFIG["network_path"]
         MASTER_CONFIG["network_path"] = p
 
-    # --- (C) flat "network_2050" key ------------------------------------
     if "network_2050" in MASTER_CONFIG:
         saved[("network_2050",)] = MASTER_CONFIG["network_2050"]
         MASTER_CONFIG["network_2050"] = p
@@ -191,18 +185,13 @@ def _restore_network_config(saved: dict) -> None:
 def _resolve_wc_dispatch_path(analyzer: "AROAnalyzer") -> Optional[str]:
     """
     Return the filesystem path of the worst-case dispatch network.
-
-    AROAnalyzer has no get_worst_case_dispatch_path() method.
-    We reconstruct the path from the analyzer's internal state instead.
     """
-    # --- 1. _source_path attribute injected at load time ----------------
     if analyzer.n_worst_case is not None:
         if hasattr(analyzer.n_worst_case, "_source_path"):
             p = str(analyzer.n_worst_case._source_path)
             if Path(p).is_file():
                 return p
 
-    # --- 2. Derive from worst_case_cutout + dispatch_dir ----------------
     worst_cutout: Optional[str] = (
         analyzer.aro_summary
         .get("aro_final_evaluation", {})
@@ -221,7 +210,6 @@ def _resolve_wc_dispatch_path(analyzer: "AROAnalyzer") -> Optional[str]:
             p = dispatch_dir / candidate_name
             if p.is_file():
                 return str(p)
-        # glob fallback — prefer _worst_case_std.nc
         for pattern in (
             f"dispatch_*{safe}*_worst_case_std.nc",
             f"dispatch_*{safe}*_worst_case*.nc",
@@ -231,7 +219,6 @@ def _resolve_wc_dispatch_path(analyzer: "AROAnalyzer") -> Optional[str]:
             if hits:
                 return str(hits[0])
 
-    # --- 3. Path from scenario_networks for known worst_case_cutout -----
     if worst_cutout and worst_cutout in analyzer.scenario_networks:
         n = analyzer.scenario_networks[worst_cutout]
         if n is not None and hasattr(n, "_source_path"):
@@ -239,13 +226,11 @@ def _resolve_wc_dispatch_path(analyzer: "AROAnalyzer") -> Optional[str]:
             if Path(p).is_file():
                 return p
 
-    # --- 4. Any *_worst_case_std.nc in dispatch_dir ---------------------
     if dispatch_dir is not None:
         for pattern in ("dispatch_*_worst_case_std.nc", "dispatch_*_worst_case*.nc"):
             hits = sorted(dispatch_dir.glob(pattern))
             if hits:
                 return str(hits[0])
-        # absolute last resort: any *_std.nc
         hits = sorted(dispatch_dir.glob("dispatch_*_std.nc"))
         if hits:
             return str(hits[-1])
@@ -263,24 +248,6 @@ def _load_and_run_script(
     aro_dispatch_path: Optional[str] = None,
     analyzer: Optional["AROAnalyzer"] = None,
 ) -> Dict[str, Any]:
-    """
-    Load and execute a standalone plot_*.py script.
-
-    Parameters
-    ----------
-    script_key : str
-        Registry key from STANDALONE_SCRIPTS.
-    override_scenario : str, optional
-        If set, temporarily overrides MASTER_CONFIG["scenarios"]["selection"].
-    aro_dispatch_path : str, optional
-        If set (ARO mode), temporarily patches the network path in MASTER_CONFIG
-        so the script reads the worst-case dispatch network instead of the
-        planning network.
-    analyzer : AROAnalyzer, optional
-        Wenn gesetzt, wird für ARO-native Skripte (aro_capacity_by_country,
-        aro_annual_dispatch) direkt das analyzer-Objekt verwendet statt
-        MASTER_CONFIG zu patchen.
-    """
     result: Dict[str, Any] = {"script": script_key, "ok": False, "error": None}
 
     filename = STANDALONE_SCRIPTS.get(script_key)
@@ -296,16 +263,11 @@ def _load_and_run_script(
     if str(SCRIPTS_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPTS_DIR))
 
-    # --- ARO-native Skripte: direkt über analyzer laufen ----------------
+    # ARO-native Skripte: direkt über analyzer laufen
     if script_key == "aro_capacity_by_country" and analyzer is not None:
         try:
             from plot_aro_capacity_by_country import run_capacity_by_country
             out_dir = analyzer.config.get_plot_output_dir("capacity_by_country")
-            cost_dict = (
-                analyzer.aro_summary
-                .get("aro_final_evaluation", {})
-                .get("all_costs", {}) or {}
-            )
             run_capacity_by_country(
                 n_robust=analyzer.n_robust,
                 scenario_networks=analyzer.scenario_networks,
@@ -346,7 +308,7 @@ def _load_and_run_script(
             result["traceback"] = traceback.format_exc()
         return result
 
-    # --- Standard: MASTER_CONFIG patchen und Skript ausführen -----------
+    # Standard: MASTER_CONFIG patchen und Skript ausführen
     from master_config import MASTER_CONFIG
     _orig_sel = None
     _network_backup: dict = {}
@@ -433,13 +395,17 @@ def run_aro(
     if aro_run is not None:
         aro_cfg.SELECTED_RUN = aro_run
 
-    run_key  = aro_cfg.SELECTED_RUN
+    run_key = aro_cfg.SELECTED_RUN
+
+    # out_dir IS bereits der Run-Ordner (plots_base/<run_key>/).
+    # AROPlottingConfig.get_plot_output_dir() legt Unterordner dort an.
+    # Wir setzen den Override NICHT mehr, damit der Property-Getter
+    # sauber über get_run_output_dir() läuft.
+    # Für Rückwärtskompatibilität (falls Code direkt auf PLOT_OUTPUT_PATH
+    # zugreift) setzen wir ihn trotzdem:
+    aro_cfg.PLOT_OUTPUT_PATH = str(out_dir)
+
     run_conf = aro_cfg.get_current_run_config()
-
-    aro_out = out_dir / "aro" / run_key
-    aro_out.mkdir(parents=True, exist_ok=True)
-    aro_cfg.PLOT_OUTPUT_PATH = str(aro_out)
-
     report["steps"].append({"run_key": run_key, "scenarios": run_conf.get("scenarios", [])})
 
     try:
@@ -479,7 +445,7 @@ def run_aro(
     except Exception as e:
         report["warnings"].append(f"plot_scenario_capacity_comparison failed: {e}")
 
-    # --- NEU: Kapazitäten nach Land + Jährlicher Dispatch ---------------
+    # Kapazitäten nach Land
     try:
         from plot_aro_capacity_by_country import run_capacity_by_country
         cost_dict = (
@@ -490,7 +456,7 @@ def run_aro(
         run_capacity_by_country(
             n_robust=analyzer.n_robust,
             scenario_networks=analyzer.scenario_networks,
-            output_dir=aro_out / "capacity_by_country",
+            output_dir=aro_cfg.get_plot_output_dir("capacity_by_country"),
             run_name=run_key,
             user_colors=aro_cfg.CARRIER_COLORS,
             plot_diff=True,
@@ -502,6 +468,7 @@ def run_aro(
         report["warnings"].append(f"capacity_by_country failed: {e}")
         report["warnings"].append(traceback.format_exc())
 
+    # Jährlicher Dispatch
     try:
         from plot_aro_annual_dispatch import run_annual_dispatch
         cost_dict = (
@@ -511,7 +478,7 @@ def run_aro(
         )
         run_annual_dispatch(
             scenario_networks=analyzer.scenario_networks,
-            output_dir=aro_out / "annual_dispatch",
+            output_dir=aro_cfg.get_plot_output_dir("annual_dispatch"),
             run_name=run_key,
             user_colors=aro_cfg.CARRIER_COLORS,
             cost_dict=cost_dict,
@@ -522,7 +489,6 @@ def run_aro(
         import traceback
         report["warnings"].append(f"annual_dispatch failed: {e}")
         report["warnings"].append(traceback.format_exc())
-    # --- Ende neue Plots -------------------------------------------------
 
     if toggles.get("worst_case_analysis", False):
         c_list = countries or aro_cfg.COUNTRIES_TO_ANALYZE
@@ -541,9 +507,7 @@ def run_aro(
         except Exception as e:
             report["warnings"].append(f"analyze_all_scenario_dispatches failed: {e}")
 
-    # ------------------------------------------------------------------
     # Standalone Skripte
-    # ------------------------------------------------------------------
     if run_standalone:
         wc_dispatch_path: Optional[str] = _resolve_wc_dispatch_path(analyzer)
 
@@ -560,7 +524,7 @@ def run_aro(
             aro_only=(standalone_keys is None),
             override_scenario=run_key,
             aro_dispatch_path=wc_dispatch_path,
-            analyzer=analyzer,   # NEU: direkt übergeben
+            analyzer=analyzer,
         )
         report["standalone"] = standalone_report
 
@@ -594,9 +558,8 @@ def run_normal(
         return report
 
     c_list = countries or plot_cfg.get_countries()
-    normal_out = out_dir / "normal" / plot_cfg.SCENARIO_SELECTION
-    normal_out.mkdir(parents=True, exist_ok=True)
 
+    # out_dir ist bereits plots_base/<run_key>/ — kein extra normal/<run_key>/ Infix.
     def analyze_one(net_path: str, base_out: Path):
         y = _year_from_path(net_path)
         if years is not None and y is not None and y not in years:
@@ -604,16 +567,19 @@ def run_normal(
         if not Path(net_path).is_file():
             report["warnings"].append(f"Network file missing: {net_path}")
             return
-        tag = str(y) if y is not None else Path(net_path).stem
-        per_net_out = base_out / tag
-        per_net_out.mkdir(parents=True, exist_ok=True)
+
+        # Wenn mehrere Jahre: Unterordner pro Jahr; bei einzelnem Netz direkt.
+        if y is not None and isinstance(networks, list) and len(networks) > 1:
+            per_net_out = base_out / str(y)
+        else:
+            per_net_out = base_out
 
         for c in c_list:
             try:
                 ca = CountryAnalyzer(
                     network_path=net_path,
                     country=c,
-                    output_dir=str(per_net_out / c),
+                    output_dir=str(per_net_out / "country" / c),
                     carrier_colors=plot_cfg.CARRIER_COLORS,
                     default_color=plot_cfg.DEFAULT_COLOR,
                 )
@@ -625,10 +591,10 @@ def run_normal(
 
     if isinstance(networks, list):
         for p in networks:
-            analyze_one(p, normal_out)
+            analyze_one(p, out_dir)
     elif isinstance(networks, dict):
         for branch, paths in networks.items():
-            branch_out = normal_out / branch
+            branch_out = out_dir / branch
             branch_out.mkdir(parents=True, exist_ok=True)
             for p in paths:
                 analyze_one(p, branch_out)
@@ -688,13 +654,15 @@ def run_all_scenarios(
     for key in master.scenarios_registry:
         run_type = master.get_run_type(key)
         print(f"\n[all] Verarbeite Szenario '{key}' (run_type={run_type})")
+        # out_dir ist der globale plots_base/; jeder Key bekommt seinen eigenen Unterordner
+        key_out = master.get_run_output_dir(key)
         try:
             if run_type == "aro":
-                sub = run_aro(master, out_dir, aro_run=key, countries=countries,
+                sub = run_aro(master, key_out, aro_run=key, countries=countries,
                               all_scenarios=all_scenarios,
                               run_standalone=run_standalone, standalone_keys=standalone_keys)
             else:
-                sub = run_normal(master, out_dir, scenario=key, countries=countries,
+                sub = run_normal(master, key_out, scenario=key, countries=countries,
                                  years=years,
                                  run_standalone=run_standalone, standalone_keys=standalone_keys)
             report["sub_reports"][key] = sub
@@ -744,21 +712,34 @@ def main():
     ap.add_argument("--no-standalone", action="store_true",
                     help="Standalone Skripte komplett deaktivieren")
     ap.add_argument("--strict",        action="store_true", help="Strikte Validierung")
-    ap.add_argument("--run-name",      default="analysis", help="Prefix für Output-Ordner")
+    ap.add_argument("--run-name",      default=None,
+                    help="Run-Key überschreiben (bestimmt den Output-Unterordner)")
     args = ap.parse_args()
 
-    master  = MasterConfig()
-    v       = validate_config(master, strict=args.strict)
-    out_dir = make_run_output_dir(master, run_name=args.run_name)
+    master = MasterConfig()
+    v      = validate_config(master, strict=args.strict)
+
+    # run_key für den Output-Ordner bestimmen
+    run_key = (
+        args.run_name
+        or args.aro_run
+        or args.scenario
+        or master.aro_selected_run
+        if master.get_run_type() == "aro"
+        else master.scenario_selection
+    )
+    out_dir = master.get_run_output_dir(run_key)
     write_report(out_dir, v, name="validation")
+
+    print(f"[Output] Alle Ergebnisse in: {out_dir}")
 
     if args.mode == "validate":
         print(f"[OK={v['ok']}] Validierungsbericht: {out_dir}")
         return
 
-    countries      = _parse_csv(args.countries)
-    years          = _parse_int_list(args.years)
-    run_standalone = not args.no_standalone
+    countries       = _parse_csv(args.countries)
+    years           = _parse_int_list(args.years)
+    run_standalone  = not args.no_standalone
     standalone_keys = args.standalone if args.standalone is not None else None
 
     if args.mode == "standalone":
