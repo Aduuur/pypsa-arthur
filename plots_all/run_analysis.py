@@ -69,10 +69,10 @@ STANDALONE_SCRIPTS: Dict[str, str] = {
     "dispatch_gas_h2":         "plot_dispatch_gas_h2.py",
     "consumption_timeline":    "plot_consumption_timeline.py",
     "map_leitung_export":      "plot_map_leitung_export.py",
-    "map_nutzbare_uebertrag":  "plot_map_nutzbare_übertragung.py",
+    "map_nutzbare_uebertrag":  "plot_map_nutzbare_\u00fcbertragung.py",
     "co2_emissionen":          "plot_jaehrliche_co2_emissionen.py",
     "co2_emissionen_analyse":  "plot_jaehrliche_co2_emissionen_analyse.py",
-    "check_waermepumpen":      "plot_check_wärmepumpen_df.py",
+    "check_waermepumpen":      "plot_check_w\u00e4rmepumpen_df.py",
     # ARO-spezifische Plots
     "aro_capacity_by_country": "plot_aro_capacity_by_country.py",
     "aro_annual_dispatch":     "plot_aro_annual_dispatch.py",
@@ -104,6 +104,14 @@ ARO_APPLICABLE_SCRIPTS: set = {
     "check_waermepumpen",
     "aro_capacity_by_country",
     "aro_annual_dispatch",
+}
+
+# Skripte die im ARO-Modus direkt über main(aro_network=...) aufgerufen werden,
+# statt MASTER_CONFIG zu patchen.  Das Skript muss main(aro_network=None)
+# als Signatur haben und den ARO-Pfad selbst auswerten.
+ARO_DIRECT_CALL_SCRIPTS: set = {
+    "installed_cap_vgl",
+    "delta_prices_map",
 }
 
 SCRIPTS_DIR = Path(__file__).parent
@@ -323,24 +331,30 @@ def _load_and_run_script(
             result["traceback"] = traceback.format_exc()
         return result
 
-    # BUG-2 FIX: installed_cap_vgl im ARO-Modus direkt über main(aro_network=...) aufrufen
-    # statt MASTER_CONFIG zu patchen (was zum 'SCENARIO_SELECTION muss both sein'-Fehler führte)
-    if script_key == "installed_cap_vgl" and aro_dispatch_path is not None:
+    # Skripte die im ARO-Modus direkt über main(aro_network=...) aufgerufen werden
+    # (installed_cap_vgl, delta_prices_map).
+    # Das Skript wertet aro_network selbst aus und bestimmt seinen Modus intern.
+    if script_key in ARO_DIRECT_CALL_SCRIPTS and aro_dispatch_path is not None:
         if not Path(aro_dispatch_path).is_file():
             result["error"] = f"ARO-Dispatch nicht gefunden: {aro_dispatch_path}"
             return result
         try:
             spec = importlib.util.spec_from_file_location(f"_standalone_{script_key}", script_path)
-            mod = importlib.util.module_from_spec(spec)
+            mod  = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
-            if hasattr(mod, "main"):
+            if not hasattr(mod, "main"):
+                result["error"] = "Kein main() gefunden"
+                return result
+            # installed_cap_vgl braucht aro_network + aro_robust_network,
+            # delta_prices_map braucht nur aro_network.
+            if script_key == "installed_cap_vgl":
                 mod.main(
                     aro_network=aro_dispatch_path,
                     aro_robust_network=aro_robust_path,
                 )
-                result["ok"] = True
             else:
-                result["error"] = "Kein main() gefunden"
+                mod.main(aro_network=aro_dispatch_path)
+            result["ok"] = True
         except Exception as e:
             import traceback
             result["error"] = str(e)
@@ -365,7 +379,7 @@ def _load_and_run_script(
 
     try:
         spec = importlib.util.spec_from_file_location(f"_standalone_{script_key}", script_path)
-        mod = importlib.util.module_from_spec(spec)
+        mod  = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         if hasattr(mod, "main"):
             mod.main()
@@ -609,7 +623,7 @@ def run_aro(
     # Standalone Skripte
     if run_standalone:
         wc_dispatch_path: Optional[str] = _resolve_wc_dispatch_path(analyzer)
-        robust_path: Optional[str] = _resolve_robust_path(analyzer)
+        robust_path:      Optional[str] = _resolve_robust_path(analyzer)
 
         if wc_dispatch_path:
             print(f"\n  [ARO] Worst-Case-Dispatch für Standalone-Skripte: "
@@ -658,7 +672,7 @@ def run_normal(
         master.raw["scenarios"]["selection"] = scenario
 
     plot_cfg = PlottingConfig(master=master)
-    networks = plot_cfg.get_networks()
+    networks  = plot_cfg.get_networks()
 
     if networks is None:
         report["ok"] = False
