@@ -104,6 +104,23 @@ def _year_from_path(path: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+# -----------------------------------------------------------------------
+# BUG B FIX: _inject_aro_dispatch_network
+#
+# Previous version patched MASTER_CONFIG["networks"]["2050"] which does
+# NOT exist.  Standalone scripts (balance_timeline, dispatch_timeline …)
+# determine the network path from one of these locations:
+#
+#   (A) MASTER_CONFIG["scenarios"]["registry"][<run>]["networks"][0]
+#       → most scripts call master_config.get_networks() or read the
+#         first entry of the registry list
+#   (B) MASTER_CONFIG["network_path"]        (flat key, some older scripts)
+#   (C) MASTER_CONFIG["network_2050"]        (flat key variant)
+#
+# All three are now patched so every script receives the ARO worst-case
+# dispatch network instead of the empty planning network.
+# -----------------------------------------------------------------------
+
 def _inject_aro_dispatch_network(aro_dispatch_path: str) -> dict:
     """
     Temporarily override the network path in MASTER_CONFIG so standalone
@@ -113,33 +130,34 @@ def _inject_aro_dispatch_network(aro_dispatch_path: str) -> dict:
     Returns a dict with the original values so the caller can restore them
     in a finally block via _restore_network_config().
 
-    The function patches the following common keys used by standalone scripts:
-      MASTER_CONFIG["networks"]["2050"]          (most scripts)
-      MASTER_CONFIG["networks"]["network_2050"]  (alt key variant)
-      MASTER_CONFIG["network_path"]              (simple key variant)
-    All patches are only applied when the key already exists; unknown schemas
-    are left untouched so the injection is always safe.
+    Patches:
+      (A) MASTER_CONFIG["scenarios"]["registry"][<run>]["networks"]
+          – replaces the entire list with [aro_dispatch_path] so that
+            calls to master_config.get_networks() return the dispatch net.
+      (B) MASTER_CONFIG["network_path"]     (flat key, if present)
+      (C) MASTER_CONFIG["network_2050"]     (flat key variant, if present)
     """
     from master_config import MASTER_CONFIG
 
     saved: dict = {}
     p = str(aro_dispatch_path)
 
-    # Variant A: nested dict under "networks"
-    networks = MASTER_CONFIG.get("networks", {})
-    if isinstance(networks, dict):
-        for k in list(networks.keys()):
-            # patch any key that looks like a year-keyed path (2050, "2050", etc.)
-            if str(k) == "2050" or k == "network_2050":
-                saved[("networks", k)] = networks[k]
-                networks[k] = p
+    # --- (A) scenarios.registry.<run>.networks  [PRIMARY] ---------------
+    # This is what get_networks() reads. We replace the networks list for
+    # every registry entry so the scenario selection doesn't matter.
+    registry = MASTER_CONFIG.get("scenarios", {}).get("registry", {})
+    if isinstance(registry, dict):
+        for run_key, run_cfg in registry.items():
+            if isinstance(run_cfg, dict) and "networks" in run_cfg:
+                saved[("scenarios", "registry", run_key, "networks")] = list(run_cfg["networks"])
+                run_cfg["networks"] = [p]
 
-    # Variant B: flat "network_path" key
+    # --- (B) flat "network_path" key ------------------------------------
     if "network_path" in MASTER_CONFIG:
         saved[("network_path",)] = MASTER_CONFIG["network_path"]
         MASTER_CONFIG["network_path"] = p
 
-    # Variant C: flat "network_2050" key at top level
+    # --- (C) flat "network_2050" key ------------------------------------
     if "network_2050" in MASTER_CONFIG:
         saved[("network_2050",)] = MASTER_CONFIG["network_2050"]
         MASTER_CONFIG["network_2050"] = p
@@ -151,13 +169,93 @@ def _restore_network_config(saved: dict) -> None:
     """Restore MASTER_CONFIG keys previously saved by _inject_aro_dispatch_network."""
     from master_config import MASTER_CONFIG
 
-    networks = MASTER_CONFIG.get("networks", {})
     for key_tuple, original in saved.items():
-        if len(key_tuple) == 2 and key_tuple[0] == "networks":
-            if isinstance(networks, dict):
-                networks[key_tuple[1]] = original
+        if len(key_tuple) == 4 and key_tuple[:3] == ("scenarios", "registry") and key_tuple[3] == "networks":
+            run_key = key_tuple[2]
+            registry = MASTER_CONFIG.get("scenarios", {}).get("registry", {})
+            if isinstance(registry, dict) and run_key in registry:
+                if isinstance(registry[run_key], dict):
+                    registry[run_key]["networks"] = original
         elif len(key_tuple) == 1:
             MASTER_CONFIG[key_tuple[0]] = original
+
+
+# -----------------------------------------------------------------------
+# BUG A FIX: _resolve_wc_dispatch_path
+#
+# Previously run_aro() called analyzer.get_worst_case_dispatch_path()
+# which does NOT exist on AROAnalyzer.  The correct way to obtain the
+# worst-case dispatch path is:
+#
+#   1. analyzer.n_worst_case._source_path  (if we inject it during load)
+#   2. analyzer._dispatch_dir() + glob for *_worst_case_std.nc
+#   3. Any scenario network path for the known worst_case_cutout
+#   4. Glob fallback in dispatch dir
+# -----------------------------------------------------------------------
+
+def _resolve_wc_dispatch_path(analyzer: "AROAnalyzer") -> Optional[str]:
+    """
+    Return the filesystem path of the worst-case dispatch network.
+
+    AROAnalyzer has no get_worst_case_dispatch_path() method.
+    We reconstruct the path from the analyzer's internal state instead.
+    """
+    # --- 1. _source_path attribute injected at load time ----------------
+    if analyzer.n_worst_case is not None:
+        if hasattr(analyzer.n_worst_case, "_source_path"):
+            p = str(analyzer.n_worst_case._source_path)
+            if Path(p).is_file():
+                return p
+
+    # --- 2. Derive from worst_case_cutout + dispatch_dir ----------------
+    worst_cutout: Optional[str] = (
+        analyzer.aro_summary
+        .get("aro_final_evaluation", {})
+        .get("worst_case_cutout")
+    )
+    dispatch_dir: Optional[Path] = analyzer._dispatch_dir()
+
+    if dispatch_dir is not None and worst_cutout:
+        safe = analyzer._safe_name(str(worst_cutout))
+        for candidate_name in (
+            f"dispatch_{safe}_worst_case_std.nc",
+            f"dispatch_{safe}_worst_case_flat.nc",
+            f"dispatch_{safe}_std.nc",
+            f"dispatch_{safe}_flat.nc",
+        ):
+            p = dispatch_dir / candidate_name
+            if p.is_file():
+                return str(p)
+        # glob fallback — prefer _worst_case_std.nc
+        for pattern in (
+            f"dispatch_*{safe}*_worst_case_std.nc",
+            f"dispatch_*{safe}*_worst_case*.nc",
+            f"dispatch_*{safe}*_std.nc",
+        ):
+            hits = sorted(dispatch_dir.glob(pattern))
+            if hits:
+                return str(hits[0])
+
+    # --- 3. Path from scenario_networks for known worst_case_cutout -----
+    if worst_cutout and worst_cutout in analyzer.scenario_networks:
+        n = analyzer.scenario_networks[worst_cutout]
+        if n is not None and hasattr(n, "_source_path"):
+            p = str(n._source_path)
+            if Path(p).is_file():
+                return p
+
+    # --- 4. Any *_worst_case_std.nc in dispatch_dir ---------------------
+    if dispatch_dir is not None:
+        for pattern in ("dispatch_*_worst_case_std.nc", "dispatch_*_worst_case*.nc"):
+            hits = sorted(dispatch_dir.glob(pattern))
+            if hits:
+                return str(hits[0])
+        # absolute last resort: any *_std.nc
+        hits = sorted(dispatch_dir.glob("dispatch_*_std.nc"))
+        if hits:
+            return str(hits[-1])
+
+    return None
 
 
 # -----------------------------------------------------------------------
@@ -263,7 +361,6 @@ def run_standalone_scripts(
             print(f"  ✓ {key}")
         else:
             print(f"  ✗ {key}: {res['error']}")
-            # Einzelner Fehler stoppt nicht den Rest
 
     return report
 
@@ -354,49 +451,9 @@ def run_aro(
     # Standalone Skripte
     # ------------------------------------------------------------------
     if run_standalone:
-        # Resolve the worst-case dispatch path so standalone scripts get a
-        # network with an actual dispatch solution (generators_t.p, buses_t.
-        # marginal_price, etc.) instead of the empty planning network.
-        wc_dispatch_path: Optional[str] = None
-        try:
-            wc_dispatch_path = analyzer.get_worst_case_dispatch_path()
-        except Exception:
-            pass
-
-        # Fallback: inspect scenario_networks for the worst-case key
-        if not wc_dispatch_path:
-            try:
-                wc_key = analyzer.worst_case_cutout  # attribute set during init
-                if wc_key and wc_key in analyzer.scenario_networks:
-                    n = analyzer.scenario_networks[wc_key]
-                    if hasattr(n, "_source_path"):
-                        wc_dispatch_path = n._source_path
-                    elif hasattr(analyzer, "_dispatch_paths") and wc_key in analyzer._dispatch_paths:
-                        wc_dispatch_path = analyzer._dispatch_paths[wc_key]
-            except Exception:
-                pass
-
-        # Second fallback: search dispatch dir directly
-        if not wc_dispatch_path:
-            try:
-                dispatch_dir = Path(analyzer.config.get_dispatch_dir())
-                worst_cutout = analyzer.worst_case_cutout or ""
-                safe = worst_cutout.replace("/", "_").replace(" ", "_")
-                for candidate in (
-                    f"dispatch_{safe}_worst_case_std.nc",
-                    f"dispatch_{safe}_std.nc",
-                ):
-                    p = dispatch_dir / candidate
-                    if p.is_file():
-                        wc_dispatch_path = str(p)
-                        break
-                if not wc_dispatch_path:
-                    # any *_worst_case_std.nc in dispatch dir
-                    candidates = sorted(dispatch_dir.glob("*_worst_case_std.nc"))
-                    if candidates:
-                        wc_dispatch_path = str(candidates[0])
-            except Exception:
-                pass
+        # BUG A FIX: Use _resolve_wc_dispatch_path() instead of the
+        # non-existent analyzer.get_worst_case_dispatch_path().
+        wc_dispatch_path: Optional[str] = _resolve_wc_dispatch_path(analyzer)
 
         if wc_dispatch_path:
             print(f"\n  [ARO] Worst-Case-Dispatch für Standalone-Skripte: "
@@ -610,8 +667,6 @@ def main():
     countries      = _parse_csv(args.countries)
     years          = _parse_int_list(args.years)
     run_standalone = not args.no_standalone
-    # args.standalone ist None wenn Flag nicht gesetzt,
-    # [] wenn --standalone ohne Keys, ["k1","k2"] mit Keys
     standalone_keys = args.standalone if args.standalone is not None else None
 
     # --mode standalone: nur Standalone-Skripte, kein CountryAnalyzer / ARO
