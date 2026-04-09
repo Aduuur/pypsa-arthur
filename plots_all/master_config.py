@@ -41,6 +41,13 @@ ARO_RUN_NAME: str = _env("ARO_RUN_NAME", "big-aro-run-2")       # type: ignore[a
 REF_RUN_NAME: str = _env("REF_RUN_NAME", "Basisrun-rcp45-2028") # type: ignore[assignment]
 RUN_NAME: str = _env("RUN_NAME", ARO_RUN_NAME)                   # type: ignore[assignment]
 
+# Basis-Pfade als Python-Variablen — werden DIREKT in den aro.runs-Pfaden
+# eingesetzt (als f-String), nicht über das Template-System.
+# Das Template-System ({pypsa_results_base} etc.) ist NUR für Strings
+# gedacht, die aus externen Quellen kommen und keine Python-Variablen kennen.
+_PYPSA_RESULTS_BASE: str = _env("PYPSA_RESULTS_BASE", "/home/endata/PycharmProjects/pypsa-ee/results")
+_ARO_RESULTS_BASE:   str = _env("ARO_RESULTS_BASE",   "/home/endata/PycharmProjects/pypsa-ee/results")
+
 
 # -----------------------------------------------------------------------------
 # Master configuration block
@@ -50,8 +57,8 @@ MASTER_CONFIG: Dict[str, Any] = {
     # GLOBAL PATHS
     # =======================================================================
     "paths": {
-        "pypsa_results_base": _env("PYPSA_RESULTS_BASE", "/home/endata/PycharmProjects/pypsa-ee/results"),
-        "aro_results_base":   _env("ARO_RESULTS_BASE",   "/home/endata/PycharmProjects/pypsa-ee/results"),
+        "pypsa_results_base": _PYPSA_RESULTS_BASE,
+        "aro_results_base":   _ARO_RESULTS_BASE,
         # plots_base ist die EINZIGE Output-Wurzel für alle Plots.
         # Jeder Run landet als Unterordner: plots_base/<run_key>/
         "plots_base":         _env("PLOTS_BASE",         "/mnt/endata/MA_Arthur/PyPSA-results/plots"),
@@ -140,22 +147,19 @@ MASTER_CONFIG: Dict[str, Any] = {
             ARO_RUN_NAME: {
                 "run_type": "aro",
                 "description": "ARO-Lauf mit robustem Portfolio (big-aro-run-2)",
-                # Robustes Netz für Kapazitätsvergleich (wird von run_loader genutzt
-                # wenn nur aro_include_scenarios=False -> "robust"-Tag)
                 "networks": [
-                    f"/home/endata/PycharmProjects/pypsa-ee/results/{ARO_RUN_NAME}/networks/aro_robust__std.nc",
+                    f"{_ARO_RESULTS_BASE}/{ARO_RUN_NAME}/networks/aro_robust__std.nc",
                 ],
             },
             # -----------------------------------------------------------------
             # Deterministischer Referenz-Run (Basisrun-rcp45-2028)
-            # Wird als Vergleichsnetz in plot_installed_cap_new_vgl etc. genutzt.
-            # Das n_roth / aro_robust_network in den Plots zeigt auf diesen Run.
+            # Wird als Basisjahr-Vergleichsnetz in plot_installed_cap_new_vgl genutzt.
             # -----------------------------------------------------------------
             REF_RUN_NAME: {
                 "run_type": "normal",
                 "description": "Deterministischer Referenz-Run rcp4.5 / 2028",
                 "networks": [
-                    f"/home/endata/PycharmProjects/pypsa-ee/results/{REF_RUN_NAME}/networks/base_s_24___2050.nc",
+                    f"{_PYPSA_RESULTS_BASE}/{REF_RUN_NAME}/networks/base_s_24___2050.nc",
                 ],
             },
         },
@@ -187,9 +191,12 @@ MASTER_CONFIG: Dict[str, Any] = {
 
     # =======================================================================
     # ARO RUN REGISTRY
+    # Wichtig: Alle Pfade hier als direkte f-Strings mit Python-Variablen.
+    # NICHT als Template-Strings mit {pypsa_results_base} — das Template-System
+    # kennt keine Python-Variablen wie ARO_RUN_NAME und würde mit KeyError
+    # abbrechen.
     # =======================================================================
     "aro": {
-        # Aktiv selektierter ARO-Run (= der Run dessen Dispatch-Netze geladen werden)
         "selected_run": _env("ARO_SELECTED_RUN", ARO_RUN_NAME),
         "countries_to_analyze": ["ALL", "DE", "FR", "ES", "CH"],
         "plot_toggles": {
@@ -202,26 +209,20 @@ MASTER_CONFIG: Dict[str, Any] = {
 
         "runs": {
             ARO_RUN_NAME: {
-                "name":                    ARO_RUN_NAME,
-                "summary_json":            f"{{aro_results_base}}/{ARO_RUN_NAME}/results/aro_summary.json",
-                # Robustes Portfolio-Netzwerk (das ARO-Ergebnis selbst)
-                "robust_network":          f"{{aro_results_base}}/{ARO_RUN_NAME}/networks/aro_robust.nc",
-                "robust_network_std":      f"{{aro_results_base}}/{ARO_RUN_NAME}/networks/aro_robust__std.nc",
-                # Deterministisches Referenznetz für Vergleichsplots (n_roth / aro_robust_network
-                # in plot_installed_cap_new_vgl.py und aro_analysis.py).
-                # Bezieht sich IMMER auf Basisrun-rcp45-2028.
-                "reference_network":       f"{{pypsa_results_base}}/{REF_RUN_NAME}/networks/base_s_24___2050.nc",
+                "name":               ARO_RUN_NAME,
+                # --- Direkte absolute Pfade (kein Template-System) ---
+                "summary_json":       f"{_ARO_RESULTS_BASE}/{ARO_RUN_NAME}/results/aro_summary.json",
+                # Robustes Portfolio-Netz (ARO-Ergebnis)
+                "robust_network":     f"{_ARO_RESULTS_BASE}/{ARO_RUN_NAME}/networks/aro_robust.nc",
+                "robust_network_std": f"{_ARO_RESULTS_BASE}/{ARO_RUN_NAME}/networks/aro_robust__std.nc",
+                # Basisjahr-Referenznetz für plot_installed_cap_new_vgl
+                # (rechte Seite = deterministischer Referenz-Run)
+                "reference_network":  f"{_PYPSA_RESULTS_BASE}/{REF_RUN_NAME}/networks/base_s_24___2050.nc",
                 "worst_case_dispatch":     None,
                 "worst_case_dispatch_std": None,
                 "dispatch_paths":          {},
-                # Optional: run-spezifische Dunkelflautenfenster pro Dispatch/Szenario.
-                # Beispiel:
-                # "dispatch_windows": {
-                #     "__default__": {"reference_year": 2028, "start_mmdd": "01-07", "end_mmdd": "01-28"},
-                #     "cutout_2012": {"reference_year": 2012, "start_mmdd": "01-15", "end_mmdd": "01-29"},
-                # },
-                "dispatch_windows":       {},
-                "scenarios": [],
+                "dispatch_windows":        {},
+                "scenarios":               [],
             },
         },
     },
@@ -258,15 +259,6 @@ class MasterConfig:
 
     # ---------- UNIFIED OUTPUT DIR ----------
     def get_run_output_dir(self, run_key: str, sub: Optional[str] = None) -> Path:
-        """
-        Gibt den kanonischen Output-Ordner für einen Run zurück und legt ihn an:
-
-          <plots_base>/<run_key>/           <- Root des Runs
-          <plots_base>/<run_key>/<sub>/     <- falls sub angegeben
-
-        Das ist die EINZIGE Funktion die Output-Pfade erzeugt.
-        Sowohl ARO- als auch Normal-Runs landen hier.
-        """
         p = Path(self.plots_base) / run_key
         if sub:
             p = p / sub
@@ -415,30 +407,45 @@ class MasterConfig:
         return "normal"
 
     def resolve_template(self, s: Optional[str]) -> Optional[str]:
+        """
+        Ersetzt {pypsa_results_base} / {aro_results_base} / {plots_base} /
+        {aro_plots_base} in einem String durch die konfigurierten Pfade.
+
+        Unbekannte Keys werden ignoriert (kein KeyError) — der Platzhalter
+        bleibt im String erhalten. Das verhindert Crashes bei Strings die
+        bereits als direkte f-Strings eingesetzt wurden und keine Platzhalter
+        mehr enthalten.
+        """
         if s is None:
             return None
-        return s.format(**self.paths)
+        try:
+            return s.format_map(_SafeDict(self.paths))
+        except Exception:
+            return s
 
     def get_reference_network_path(self, aro_run_key: Optional[str] = None) -> Optional[str]:
         """
-        Gibt den Pfad zum deterministischen Referenznetz zurück.
-        Verwendet den `reference_network`-Eintrag im ARO-Run-Config.
-        Fallback: Netzwerk des REF_RUN_NAME aus scenarios.registry.
+        Gibt den Pfad zum deterministischen Referenznetz zurück
+        (= Basisjahr-Planungsnetz für plot_installed_cap_new_vgl, rechte Seite).
 
-        Dies ist das Netz das in Vergleichsplots als "n_roth" / Basisrun
-        genutzt wird – immer Basisrun-rcp45-2028, nicht das robuste Portfolio.
+        Priorität:
+          1. reference_network im ARO-Run-Config
+          2. Erstes Netzwerk von REF_RUN_NAME in scenarios.registry
         """
         rk = aro_run_key or self.aro_selected_run
         run_conf = self.aro_runs.get(rk, {})
 
-        # 1. Explizit im ARO-Run-Eintrag konfiguriert
         ref_raw = run_conf.get("reference_network")
         if ref_raw:
             resolved = self.resolve_template(ref_raw)
-            if resolved:
+            if resolved and resolved != ref_raw or (resolved and "{" not in resolved):
                 return resolved
+            # Kein Template-Platzhalter mehr — direkt zurückgeben
+            if resolved and Path(resolved).is_file():
+                return resolved
+            if ref_raw and "{" not in ref_raw:
+                return ref_raw
 
-        # 2. Fallback: erstes Netzwerk des REF_RUN_NAME aus scenarios.registry
         ref_entry = self.scenarios_registry.get(REF_RUN_NAME, {})
         if isinstance(ref_entry, dict):
             nets = ref_entry.get("networks", [])
@@ -522,6 +529,15 @@ class MasterConfig:
 
 
 # -----------------------------------------------------------------------------
+# _SafeDict: format_map-Helper der unbekannte Keys unveraendert laesst
+# Beispiel: "{pypsa_results_base}/foo/{unknown}" → "/pfad/foo/{unknown}"
+# -----------------------------------------------------------------------------
+class _SafeDict(dict):
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
+# -----------------------------------------------------------------------------
 # Backwards-compatible wrappers
 # -----------------------------------------------------------------------------
 class PlottingConfig:
@@ -588,6 +604,7 @@ class AROPlottingConfig:
 
     def get_current_run_config(self) -> Dict[str, Any]:
         cfg = dict(self.ARO_RUNS[self.SELECTED_RUN])
+        # resolve_template ist jetzt sicher gegen unbekannte Keys
         for k in ["summary_json", "robust_network", "robust_network_std",
                   "worst_case_dispatch", "worst_case_dispatch_std",
                   "reference_network"]:
@@ -693,16 +710,21 @@ def validate_config(master: Optional[MasterConfig] = None, strict: bool = False)
     if aro_sel not in aro_runs:
         warn(f"aro.selected_run='{aro_sel}' ist nicht in aro.runs.")
     else:
-        cfg = dict(aro_runs[aro_sel])
+        run_conf_raw = dict(aro_runs[aro_sel])
         for key in ["summary_json", "robust_network", "reference_network",
                     "worst_case_dispatch", "worst_case_dispatch_std"]:
-            if key in cfg:
-                resolved = master.resolve_template(cfg[key])
-                if resolved is None and key not in ("worst_case_dispatch", "worst_case_dispatch_std"):
+            if key not in run_conf_raw:
+                continue
+            raw_val = run_conf_raw[key]
+            if raw_val is None:
+                if key not in ("worst_case_dispatch", "worst_case_dispatch_std"):
                     warn(f"ARO '{aro_sel}': '{key}' ist None.")
-                elif resolved and key in ("summary_json", "robust_network", "reference_network") \
-                        and not Path(resolved).is_file():
-                    warn(f"ARO '{aro_sel}': Datei fehlt: {key}={resolved}")
+                continue
+            # resolve_template ist jetzt sicher — kein KeyError mehr
+            resolved = master.resolve_template(raw_val)
+            if resolved and key in ("summary_json", "robust_network", "reference_network") \
+                    and not Path(resolved).is_file():
+                warn(f"ARO '{aro_sel}': Datei fehlt: {key}={resolved}")
 
         scenarios = master.get_aro_scenarios_for_run(aro_sel)
         if not scenarios:
@@ -710,7 +732,6 @@ def validate_config(master: Optional[MasterConfig] = None, strict: bool = False)
         else:
             info(f"ARO '{aro_sel}': {len(scenarios)} Szenarien: {scenarios[:5]}{'...' if len(scenarios)>5 else ''}")
 
-        # Referenznetz validieren
         ref_path = master.get_reference_network_path(aro_sel)
         if ref_path and not Path(ref_path).is_file():
             warn(f"ARO '{aro_sel}': Referenznetz fehlt: {ref_path}")
@@ -733,9 +754,6 @@ def validate_config(master: Optional[MasterConfig] = None, strict: bool = False)
 
 
 def make_run_output_dir(master: Optional[MasterConfig] = None, run_name: str = "run") -> Path:
-    """
-    Rückwärtskompatible Funktion — delegiert an get_run_output_dir().
-    """
     master = master or MasterConfig()
     return master.get_run_output_dir(run_name)
 
