@@ -16,7 +16,7 @@ Output-Struktur (unified per-run):
     country/<land>/        <- CountryAnalyzer (normal + ARO worst-case)
     aro_metrics/           <- ARO Konvergenz, Gap, ...
     capacity/              <- robuste Kapazitäten
-    scenario_comparison/   <- Kosten-Vergleich über Szenarien
+    scenario_comparison/   <- Kapazitäts-Vergleich Robust vs. Basisjahr
     worst_case/            <- Worst-Case Dispatch-Analyse
     annual_dispatch/       <- Jährlicher Dispatch je Szenario
     capacity_by_country/   <- Kapazitäten nach Land (ARO)
@@ -331,29 +331,94 @@ def _load_and_run_script(
             result["traceback"] = traceback.format_exc()
         return result
 
-    # Skripte die im ARO-Modus direkt über main(aro_network=...) aufgerufen werden
-    # (installed_cap_vgl, delta_prices_map).
-    # Das Skript wertet aro_network selbst aus und bestimmt seinen Modus intern.
-    if script_key in ARO_DIRECT_CALL_SCRIPTS and aro_dispatch_path is not None:
-        if not Path(aro_dispatch_path).is_file():
-            result["error"] = f"ARO-Dispatch nicht gefunden: {aro_dispatch_path}"
+    # installed_cap_vgl: Robust (links) vs. Basisjahr (rechts)
+    # aro_robust_path  = robustes Portfolio-Netz  → linke Balken
+    # aro_robust_path  wird auch als Basisjahr-Referenz verwendet wenn kein
+    # dediziertes Basisjahr-Netz vorhanden ist — _resolve_robust_path() gibt
+    # bereits das Basisjahr-Netz zurueck (Priorität 3/4).
+    # Das aro_dispatch_path (Worst-Case) wird hier NICHT übergeben.
+    if script_key == "installed_cap_vgl":
+        # Wir brauchen robustes Portfolio-Netz (aro_robust_path) für beide Seiten:
+        #   aro_robust_network = Pfad zum n_robust  (linke Balken)
+        #   aro_basis_network  = Pfad zum Basisjahr (rechte Balken)
+        # _resolve_robust_path() gibt entweder n_robust oder das Referenznetz
+        # zurück. Für den Vergleich "Robust vs. Basis" brauchen wir zwei
+        # unterschiedliche Pfade. Wenn analyzer vorhanden ist, holen wir
+        # n_robust direkt; sonst fällt aro_robust_path für beide Seiten gleich
+        # aus (trivialer Vergleich).
+        path_robust = None
+        path_basis  = aro_robust_path  # Basisjahr-Netz (aus _resolve_robust_path)
+
+        if analyzer is not None and analyzer.n_robust is not None:
+            # n_robust direkt als Pfad auflösen
+            if hasattr(analyzer.n_robust, "_source_path"):
+                p = str(analyzer.n_robust._source_path)
+                if Path(p).is_file():
+                    path_robust = p
+            # Fallback: run_config[robust_network_std]
+            if path_robust is None:
+                run_conf = analyzer.config.get_current_run_config()
+                for key in ("robust_network_std", "robust_network"):
+                    p = run_conf.get(key)
+                    if p and Path(p).is_file():
+                        path_robust = str(p)
+                        break
+
+        if path_robust is None:
+            # Kein separates robustes Netz gefunden — aro_robust_path als
+            # einzige Seite, kein sinnvoller Vergleich möglich.
+            print(
+                "  [installed_cap_vgl] Kein robustes Portfolio-Pfad gefunden "
+                "— installed_cap_vgl wird uebersprungen."
+            )
+            result["error"] = "Kein robustes Portfolio-Pfad verfuegbar."
             return result
+
+        if path_basis is None:
+            print(
+                "  [installed_cap_vgl] Kein Basisjahr-Netz gefunden "
+                "— installed_cap_vgl wird uebersprungen."
+            )
+            result["error"] = "Kein Basisjahr-Planungsnetz verfuegbar."
+            return result
+
+        if path_robust == path_basis:
+            print(
+                "  [installed_cap_vgl] Warnung: robustes Portfolio und Basisjahr "
+                "zeigen auf dieselbe Datei — trivialer Vergleich, Plot wird trotzdem erstellt."
+            )
+
         try:
-            spec = importlib.util.spec_from_file_location(f"_standalone_{script_key}", script_path)
+            spec = importlib.util.spec_from_file_location("_standalone_installed_cap_vgl", script_path)
             mod  = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
             if not hasattr(mod, "main"):
                 result["error"] = "Kein main() gefunden"
                 return result
-            # installed_cap_vgl braucht aro_network + aro_robust_network,
-            # delta_prices_map braucht nur aro_network.
-            if script_key == "installed_cap_vgl":
-                mod.main(
-                    aro_network=aro_dispatch_path,
-                    aro_robust_network=aro_robust_path,
-                )
-            else:
-                mod.main(aro_network=aro_dispatch_path)
+            mod.main(
+                aro_robust_network=path_robust,
+                aro_basis_network=path_basis,
+            )
+            result["ok"] = True
+        except Exception as e:
+            import traceback
+            result["error"] = str(e)
+            result["traceback"] = traceback.format_exc()
+        return result
+
+    # delta_prices_map: nur aro_network (Dispatch-Pfad)
+    if script_key == "delta_prices_map" and aro_dispatch_path is not None:
+        if not Path(aro_dispatch_path).is_file():
+            result["error"] = f"ARO-Dispatch nicht gefunden: {aro_dispatch_path}"
+            return result
+        try:
+            spec = importlib.util.spec_from_file_location("_standalone_delta_prices_map", script_path)
+            mod  = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            if not hasattr(mod, "main"):
+                result["error"] = "Kein main() gefunden"
+                return result
+            mod.main(aro_network=aro_dispatch_path)
             result["ok"] = True
         except Exception as e:
             import traceback
@@ -432,71 +497,76 @@ def run_standalone_scripts(
 
 
 # -----------------------------------------------------------------------
-# Hilfsfunktion: robusten Portfolio-Pfad ermitteln
-# FIX: pypsa.Network hat kein _source_path-Attribut → Pfad direkt aus
-#      run_config lesen. Wenn kein robustes Portfolio vorhanden, wird
-#      das Basisrun-Referenznetz (Basisrun-rcp45-2028) als Vergleich
-#      für installed_cap_vgl verwendet.
+# Hilfsfunktion: Basisjahr-Referenznetz ermitteln
+# Fuer installed_cap_vgl: rechte Seite = Basisjahr-Planungsnetz
+# (nicht das robuste Portfolio, nicht der Worst-Case Dispatch)
 # -----------------------------------------------------------------------
 
 def _resolve_robust_path(analyzer: "AROAnalyzer") -> Optional[str]:
     """
-    Ermittelt den Dateipfad des robusten Portfolio-Netzwerks für Standalone-
-    Skripte (insb. installed_cap_vgl).
+    Ermittelt den Dateipfad des Basisjahr-Planungsnetzes fuer installed_cap_vgl.
+    Dieses Netz bildet die RECHTE Seite im Vergleich (= Basisjahr-Referenz).
+
+    Das robuste Portfolio (n_robust) wird separat direkt aus analyzer.n_robust
+    in _load_and_run_script() gezogen.
 
     Priorität:
-      1. run_config["robust_network"] / run_config["robust_network_std"]
-         (direkt aus AROPlottingConfig, kein _source_path nötig)
-      2. BASE_RESULTS_PATH/<run_name>/networks/robust_*.nc  (glob-Suche)
-      3. Basisrun-Referenznetz aus AROPlottingConfig.REFERENCE_NETWORK_PATH
-         (Basisrun-rcp45-2028 — Kernidee: ARO-Kapazitäten vs. Basisrun)
-      4. Fallback: erstes Netz aus config.REFERENCE_NETWORK_PATH
+      1. run_config["basis_network"] / run_config["reference_network"] /
+         run_config["base_network"] — direkt in master_config.py setzen
+      2. AROPlottingConfig.REFERENCE_NETWORK_PATH
+      3. config.get_reference_networks()[0]
+      4. Glob: BASE_RESULTS_PATH/<run_name>/networks/base_s_*.nc
+         (ohne 'dispatch' im Namen)
     """
     run_conf = analyzer.config.get_current_run_config()
 
     # 1. Direkt aus run_config
-    for key in ("robust_network_std", "robust_network"):
+    for key in ("basis_network", "reference_network", "base_network"):
         p = run_conf.get(key)
         if p and Path(p).is_file():
-            print(f"  [robust_path] Aus run_config['{key}']: {Path(p).name}")
+            print(f"  [basis_path] Aus run_config['{key}']: {Path(p).name}")
             return str(p)
 
-    # 2. Glob-Suche im Run-Verzeichnis
-    try:
-        base = Path(analyzer.config.BASE_RESULTS_PATH)
-        run_name = analyzer.run_config.get("name", "")
-        if run_name:
-            run_dir = base / run_name / "networks"
-            for pattern in ("robust_*.nc", "*robust*.nc", "n_robust*.nc"):
-                hits = sorted(run_dir.glob(pattern))
-                if hits:
-                    print(f"  [robust_path] Gefunden via glob ({pattern}): {hits[0].name}")
-                    return str(hits[0])
-    except Exception:
-        pass
-
-    # 3. Basisrun-Referenznetz (Kernidee: ARO vs. Basisrun)
-    #    Basisrun-rcp45-2028 enthält das optimierte Basisportfolio als Vergleich.
+    # 2. REFERENCE_NETWORK_PATH aus Config
     try:
         ref_path = getattr(analyzer.config, "REFERENCE_NETWORK_PATH", None)
         if ref_path and Path(ref_path).is_file():
-            print(f"  [robust_path] Basisrun-Referenznetz: {Path(ref_path).name}")
+            print(f"  [basis_path] REFERENCE_NETWORK_PATH: {Path(ref_path).name}")
             return str(ref_path)
     except Exception:
         pass
 
-    # 4. Fallback: Referenznetzwerke aus Config-Methode
+    # 3. Referenznetzwerke aus Config-Methode
     try:
         ref_networks = analyzer.config.get_reference_networks()
         if ref_networks:
             first = ref_networks[0] if isinstance(ref_networks, list) else next(iter(ref_networks.values()))[0]
             if Path(first).is_file():
-                print(f"  [robust_path] Referenznetz-Fallback: {Path(first).name}")
+                print(f"  [basis_path] get_reference_networks(): {Path(first).name}")
                 return str(first)
     except Exception:
         pass
 
-    print("  [robust_path] WARNUNG: Kein robustes Portfolio / Referenznetz gefunden.")
+    # 4. Glob-Suche: base_s_*.nc ohne 'dispatch' im Namen
+    try:
+        base = Path(analyzer.config.BASE_RESULTS_PATH)
+        run_name = analyzer.run_config.get("name", "")
+        if run_name:
+            run_dir = base / run_name / "networks"
+            hits = [
+                p for p in sorted(run_dir.glob("base_s_*.nc"))
+                if "dispatch" not in p.name
+            ]
+            if hits:
+                print(f"  [basis_path] Glob base_s_*.nc: {hits[0].name}")
+                return str(hits[0])
+    except Exception:
+        pass
+
+    print(
+        "  [basis_path] WARNUNG: Kein Basisjahr-Planungsnetz gefunden.\n"
+        "  Tipp: Setze run_config['basis_network'] = '<Pfad>' in master_config.py"
+    )
     return None
 
 
@@ -623,7 +693,8 @@ def run_aro(
     # Standalone Skripte
     if run_standalone:
         wc_dispatch_path: Optional[str] = _resolve_wc_dispatch_path(analyzer)
-        robust_path:      Optional[str] = _resolve_robust_path(analyzer)
+        # basis_path = Basisjahr-Planungsnetz (rechte Seite in installed_cap_vgl)
+        basis_path: Optional[str] = _resolve_robust_path(analyzer)
 
         if wc_dispatch_path:
             print(f"\n  [ARO] Worst-Case-Dispatch für Standalone-Skripte: "
@@ -632,12 +703,12 @@ def run_aro(
             print("\n  [ARO] Warnung: Kein Worst-Case-Dispatch gefunden – "
                   "Standalone-Skripte laufen ohne Dispatch-Netz (Ergebnisse werden leer sein)")
 
-        if robust_path:
-            print(f"  [ARO] Referenz/Robust-Portfolio für installed_cap_vgl: "
-                  f"{Path(robust_path).name}")
+        if basis_path:
+            print(f"  [ARO] Basisjahr-Planungsnetz für installed_cap_vgl: "
+                  f"{Path(basis_path).name}")
         else:
-            print("  [ARO] Warnung: Kein robustes Portfolio / Referenznetz gefunden – "
-                  "installed_cap_vgl wird übersprungen.")
+            print("  [ARO] Warnung: Kein Basisjahr-Planungsnetz gefunden – "
+                  "installed_cap_vgl wird uebersprungen.")
 
         print("\n=== Standalone plot_*.py Skripte (ARO-kompatibel) ===")
         standalone_report = run_standalone_scripts(
@@ -645,7 +716,7 @@ def run_aro(
             aro_only=(standalone_keys is None),
             override_scenario=run_key,
             aro_dispatch_path=wc_dispatch_path,
-            aro_robust_path=robust_path,
+            aro_robust_path=basis_path,   # <-- Basisjahr, nicht Worst-Case
             analyzer=analyzer,
         )
         report["standalone"] = standalone_report
