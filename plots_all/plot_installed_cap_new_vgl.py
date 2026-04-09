@@ -4,8 +4,10 @@
 """
 Plot_scenario_comparison_installed_capacity
 ============================================================
-Vergleicht installierte Kapazitäten zwischen zwei Szenarien.
+Vergleicht installierte Kapazitaeten zwischen zwei Szenarien.
 
+ARO-Modus: robustes Portfolio (average) vs. Worst-Case-Dispatch (dunkelflaute)
+Klassischer Modus: 'both' aus config (average vs. dunkelflaute)
 """
 
 import os
@@ -47,7 +49,7 @@ CARRIER_TRANSLATION = {
     "nuclear": "Kernkraft",
     "lignite": "Braunkohle",
     "coal": "Steinkohle",
-    "oil": "Öl",
+    "oil": "Oel",
     "CCGT": "Erdgas (GuD)",
     "OCGT": "Erdgas (Gasturbine)",
     "PHS": "Pumpspeicher",
@@ -64,19 +66,18 @@ COUNTRY_NAMES = {
     "FR": "Frankreich",
     "ES": "Spanien",
     "IT": "Italien",
-    "GB": "Großbritannien",
+    "GB": "Grossbritannien",
     "PL": "Polen",
     "SE": "Schweden",
     "NO": "Norwegen",
     "NL": "Niederlande",
     "BE": "Belgien",
-    "AT": "Österreich",
+    "AT": "Oesterreich",
     "CH": "Schweiz",
-    "DK": "Dänemark",
+    "DK": "Daenemark",
     "CZ": "Tschechien"
 }
 
-# Schriftgrößen (+4 gegenüber Standard)
 FONT_SIZES = {
     "title": 20,
     "subtitle": 16,
@@ -92,6 +93,22 @@ FONT_SIZES = {
 # --- HILFSFUNKTIONEN ---
 # =====================================================================
 
+def _extract_year_from_network(n: pypsa.Network, path: str) -> int | None:
+    """
+    Extrahiert das Jahr robust:
+    1. Aus n.snapshots (funktioniert auch bei ARO-Dispatch-Pfaden)
+    2. Fallback: Regex auf den Dateinamen
+    """
+    try:
+        return int(n.snapshots[0].year)
+    except Exception:
+        pass
+    m = re.search(r"_(\d{4})[\._ ]", os.path.basename(path))
+    if m:
+        return int(m.group(1))
+    return None
+
+
 def get_country_codes(network):
     all_buses = network.buses.index
     prefixes = set(b[:2] for b in all_buses)
@@ -104,7 +121,6 @@ def get_installed_capacity(n: pypsa.Network, country_code: str) -> pd.Series:
     pcol = "p_nom_opt"
 
     valid_countries = get_country_codes(n)
-    # Regex für Länderfilterung (Bus-Namen)
     regex_countries = "^(" + "|".join(valid_countries) + ")"
 
     # 1. Generatoren
@@ -114,7 +130,6 @@ def get_installed_capacity(n: pypsa.Network, country_code: str) -> pd.Series:
     else:
         gens = gens[gens.bus.str.contains(regex_countries)]
     gens = gens[gens.carrier.isin(ELECTRICITY_CARRIERS)]
-
     if not gens.empty:
         parts.append(gens.groupby("carrier")[pcol].sum())
 
@@ -125,8 +140,6 @@ def get_installed_capacity(n: pypsa.Network, country_code: str) -> pd.Series:
     else:
         links = links[links.bus1.str.contains(regex_countries)]
     links = links[links.carrier.isin(ELECTRICITY_CARRIERS)]
-
-    # Nuclear aus Links entfernen
     links = links[links.carrier != "nuclear"]
 
     if not links.empty:
@@ -169,16 +182,10 @@ def get_installed_capacity(n: pypsa.Network, country_code: str) -> pd.Series:
         parts.append(sus.groupby("carrier")[pcol].sum())
 
     hydro_sus = n.storage_units
-
-    # EU-Busse immer ausschließen
     hydro_sus = hydro_sus[~hydro_sus.bus.str.contains("EU", case=False, na=False)]
-
     if country_code != "ALL":
         hydro_sus = hydro_sus[hydro_sus.bus.str.startswith(country_code)]
-
-    # NUR Wasserkraft
     hydro_sus = hydro_sus[hydro_sus.carrier.isin(["hydro", "ror"])]
-
     if not hydro_sus.empty:
         parts.append(hydro_sus.groupby("carrier")[pcol].sum())
 
@@ -188,16 +195,15 @@ def get_installed_capacity(n: pypsa.Network, country_code: str) -> pd.Series:
     raw = pd.concat(parts).groupby(level=0).sum() / 1000.0
     clean = {}
 
-    # Aggregation Solar (regex=False wo möglich oder Pattern sicherstellen)
-    # Hier nutzen wir filter(regex=...), das erwartet Regex.
     solar_sum = raw.filter(regex="solar").sum()
-    # Beim Drop regex=True lassen, aber Pattern ist simple
     raw = raw.drop(raw.index[raw.index.str.contains("solar")], errors="ignore")
-    if solar_sum > 0: clean["Photovoltaik"] = solar_sum
+    if solar_sum > 0:
+        clean["Photovoltaik"] = solar_sum
 
     biomass_sum = raw.filter(regex="biomass").sum()
     raw = raw.drop(raw.index[raw.index.str.contains("biomass")], errors="ignore")
-    if biomass_sum > 0: clean["Biomasse"] = biomass_sum
+    if biomass_sum > 0:
+        clean["Biomasse"] = biomass_sum
 
     for c, v in raw.items():
         name = CARRIER_TRANSLATION.get(c, c)
@@ -217,7 +223,7 @@ def plot_scenario_comparison(df_avg, df_df, years, country, config):
     df_df = df_df.reindex(all_techs, fill_value=0)
 
     ALWAYS_KEEP = [
-        "Braunkohle", "Steinkohle", "Biomasse", "Öl", "Kernkraft",
+        "Braunkohle", "Steinkohle", "Biomasse", "Oel", "Kernkraft",
         "Laufwasser", "Wasserkraft", "Erdgas (GuD)", "Erdgas (Gasturbine)",
         "Pumpspeicher", "Batteriespeicher", "Heimspeicher"
     ]
@@ -225,9 +231,9 @@ def plot_scenario_comparison(df_avg, df_df, years, country, config):
     MIN_SHARE = 0.01
 
     keep_mask = (
-            (df_avg.max(axis=1) >= MIN_SHARE * total_max) |
-            (df_df.max(axis=1) >= MIN_SHARE * total_max) |
-            (df_avg.index.isin(ALWAYS_KEEP))
+        (df_avg.max(axis=1) >= MIN_SHARE * total_max) |
+        (df_df.max(axis=1) >= MIN_SHARE * total_max) |
+        (df_avg.index.isin(ALWAYS_KEEP))
     )
     df_avg = df_avg[keep_mask].copy()
     df_df = df_df[keep_mask].copy()
@@ -236,10 +242,11 @@ def plot_scenario_comparison(df_avg, df_df, years, country, config):
         "Kernkraft", "Photovoltaik",
         "Wind Onshore", "Wind Offshore (AC)", "Wind Offshore (DC)",
         "Laufwasser", "Wasserkraft", "Biomasse",
-        "Braunkohle", "Steinkohle", "Öl",
+        "Braunkohle", "Steinkohle", "Oel",
         "Erdgas (GuD)", "Erdgas (Gasturbine)",
         "Pumpspeicher", "Batteriespeicher", "Heimspeicher",
-        "H2-Turbine", "H2-Gasturbine"    ]
+        "H2-Turbine", "H2-Gasturbine"
+    ]
     common_index = df_avg.index
     final_order = [t for t in order if t in common_index]
     final_order.extend([t for t in common_index if t not in final_order])
@@ -284,16 +291,15 @@ def plot_scenario_comparison(df_avg, df_df, years, country, config):
         bottom_df += vals_df
 
     c_name = COUNTRY_NAMES.get(country, country)
-    ax.set_title(f"Installierte Kapazität: {c_name}\n(Links: Basisszenario | Rechts: Dunkelflaute)",
-                 fontsize=FONT_SIZES["title"], pad=20)
-
-    ax.set_ylabel("Kapazität (GW)", fontsize=FONT_SIZES["axis_label"])
+    ax.set_title(
+        f"Installierte Kapazitaet: {c_name}\n(Links: Robustes Portfolio | Rechts: Worst-Case Dispatch)",
+        fontsize=FONT_SIZES["title"], pad=20
+    )
+    ax.set_ylabel("Kapazitaet (GW)", fontsize=FONT_SIZES["axis_label"])
     ax.set_xlabel("Jahr", fontsize=FONT_SIZES["axis_label"])
-
     ax.set_xticks(x)
     ax.set_xticklabels(years, fontsize=FONT_SIZES["ticks"])
     ax.tick_params(axis='y', labelsize=FONT_SIZES["ticks"])
-
     ax.grid(axis="y", linestyle="--", alpha=0.5)
     ax.set_axisbelow(True)
 
@@ -314,32 +320,108 @@ def plot_scenario_comparison(df_avg, df_df, years, country, config):
 
 
 # =====================================================================
-# --- MAIN ---
+# --- MAIN (standalone + ARO-kompatibel via run_analysis.py) ---
 # =====================================================================
 
-def main():
+def main(aro_network=None, aro_robust_network=None):
+    """
+    Parameters
+    ----------
+    aro_network : str or None
+        Im ARO-Modus: Pfad zum Worst-Case-Dispatch-Netzwerk (= 'dunkelflaute'-Seite).
+    aro_robust_network : str or None
+        Im ARO-Modus: Pfad zum robusten Portfolio-Netzwerk (= 'average'-Seite).
+        Falls None aber aro_network gesetzt, wird nur ein Balken gezeigt.
+    """
     config = PlottingConfig()
+
+    # ----------------------------------------------------------------
+    # ARO-Modus
+    # ----------------------------------------------------------------
+    if aro_network is not None:
+        paths_avg = [aro_robust_network] if aro_robust_network and os.path.isfile(aro_robust_network) else []
+        paths_df  = [aro_network]        if os.path.isfile(aro_network) else []
+
+        if not paths_df:
+            print(f"\u26a0\ufe0f  ARO-Netzwerk nicht gefunden: {aro_network}")
+            return
+        if not paths_avg:
+            print("\u26a0\ufe0f  Kein robustes Portfolio angegeben — Vergleich nicht moeglich, uebersprungen.")
+            return
+
+        countries = config.get_countries()
+        data_avg = {c: {} for c in countries}
+        data_df  = {c: {} for c in countries}
+        years_avg, years_df = [], []
+
+        for path in paths_avg:
+            try:
+                n = pypsa.Network(path)
+                year = _extract_year_from_network(n, path)
+                if year is None:
+                    continue
+                years_avg.append(year)
+                for c in countries:
+                    data_avg[c][year] = get_installed_capacity(n, c)
+            except Exception as e:
+                print(f"Err {path}: {e}")
+
+        for path in paths_df:
+            try:
+                n = pypsa.Network(path)
+                year = _extract_year_from_network(n, path)
+                if year is None:
+                    continue
+                years_df.append(year)
+                for c in countries:
+                    data_df[c][year] = get_installed_capacity(n, c)
+            except Exception as e:
+                print(f"Err {path}: {e}")
+
+        common_years = sorted(set(years_avg) & set(years_df))
+        if not common_years:
+            print("\u26a0\ufe0f  Keine gemeinsamen Jahre gefunden (ARO-Modus).")
+            return
+
+        save_dir = os.path.join(config.BASE_SAVE_PATH, "scenario_comparison", "installed_capacities")
+        os.makedirs(save_dir, exist_ok=True)
+
+        for c in countries:
+            df_a = pd.DataFrame(data_avg[c]).fillna(0)
+            df_d = pd.DataFrame(data_df[c]).fillna(0)
+            if df_a.empty and df_d.empty:
+                continue
+            fig = plot_scenario_comparison(df_a, df_d, common_years, c, config)
+            fname = f"Compare_Capacity_ARO_{c}.png"
+            fig.savefig(os.path.join(save_dir, fname), dpi=300, bbox_inches="tight")
+            plt.close(fig)
+            print(f"\u2705 {fname}")
+        return
+
+    # ----------------------------------------------------------------
+    # Klassischer Standalone-Modus (mode='both')
+    # ----------------------------------------------------------------
     config.SCENARIO_SELECTION = "both"
     networks = config.get_networks()
 
     if not isinstance(networks, dict) or 'average' not in networks:
-        print("❌ Fehler: SCENARIO_SELECTION muss 'both' sein.")
+        print("\u274c Fehler: SCENARIO_SELECTION muss 'both' sein.")
         return
 
     countries = config.get_countries()
     data_avg = {c: {} for c in countries}
-    data_df = {c: {} for c in countries}
+    data_df  = {c: {} for c in countries}
     years_avg, years_df = [], []
 
     print("\n--- Lade Szenario: AVERAGE ---")
     for path in networks['average']:
-        m = re.search(r"_(\d{4})\.nc$", path)
-        if not m: continue
-        year = int(m.group(1))
-        years_avg.append(year)
         try:
-            print(f"Lade {year}...")
             n = pypsa.Network(path)
+            year = _extract_year_from_network(n, path)
+            if year is None:
+                continue
+            years_avg.append(year)
+            print(f"Lade {year}...")
             for c in countries:
                 data_avg[c][year] = get_installed_capacity(n, c)
         except Exception as e:
@@ -347,13 +429,13 @@ def main():
 
     print("\n--- Lade Szenario: DUNKELFLAUTE ---")
     for path in networks['dunkelflaute']:
-        m = re.search(r"_(\d{4})\.nc$", path)
-        if not m: continue
-        year = int(m.group(1))
-        years_df.append(year)
         try:
-            print(f"Lade {year}...")
             n = pypsa.Network(path)
+            year = _extract_year_from_network(n, path)
+            if year is None:
+                continue
+            years_df.append(year)
+            print(f"Lade {year}...")
             for c in countries:
                 data_df[c][year] = get_installed_capacity(n, c)
         except Exception as e:
@@ -368,14 +450,12 @@ def main():
     os.makedirs(save_dir, exist_ok=True)
 
     diff_records = []
-
-    print(f"\nGeneriere Plots & Analyse für: {common_years}")
+    print(f"\nGeneriere Plots & Analyse fuer: {common_years}")
 
     for c in countries:
         df_a = pd.DataFrame(data_avg[c]).fillna(0)
         df_d = pd.DataFrame(data_df[c]).fillna(0)
 
-        # Berechnungen für Statistik
         all_techs = df_a.index.union(df_d.index)
         df_a_sync = df_a.reindex(all_techs, fill_value=0)
         df_d_sync = df_d.reindex(all_techs, fill_value=0)
@@ -385,7 +465,7 @@ def main():
             for year in common_years:
                 if year in diff_df.columns:
                     for tech, val in diff_df[year].items():
-                        if abs(val) > 0.05:  # Schwelle 50 MW
+                        if abs(val) > 0.05:
                             diff_records.append({
                                 "Land": c,
                                 "Jahr": year,
@@ -393,59 +473,46 @@ def main():
                                 "Differenz_GW": val
                             })
 
-        if df_a.empty and df_d.empty: continue
+        if df_a.empty and df_d.empty:
+            continue
 
-        # Plot
         fig = plot_scenario_comparison(df_a, df_d, common_years, c, config)
         fname = f"Compare_Capacity_{c}.png"
         fig.savefig(os.path.join(save_dir, fname), dpi=300, bbox_inches="tight")
         plt.close(fig)
 
-    # --- STATISTIK AUSGABE ---
     print("\n" + "=" * 80)
-    print("📊 VERGLEICHS-STATISTIK (Dunkelflaute vs. Basisszenario)")
+    print("\U0001f4ca VERGLEICHS-STATISTIK (Dunkelflaute vs. Basisszenario)")
     print("=" * 80)
 
     if diff_records:
         stats_df = pd.DataFrame(diff_records)
-
-        # A) Gesamtsystem
         total_diff_gw = stats_df["Differenz_GW"].sum()
         total_abs_diff_gw = stats_df["Differenz_GW"].abs().sum()
         print(f"\n>>> EU-WEITES GESAMTSYSTEM:")
-        print(f"    Netto-Kapazitätsänderung: {total_diff_gw:+.2f} GW")
-        print(f"    Absolutes Umbau-Volumen:  {total_abs_diff_gw:.2f} GW")
+        print(f"    Netto-Kapazitaetsaenderung: {total_diff_gw:+.2f} GW")
+        print(f"    Absolutes Umbau-Volumen:   {total_abs_diff_gw:.2f} GW")
 
-        # B) Pro Land: Top 10 Zuwachs & Top 10 Rückgang
-        unique_countries = sorted(stats_df["Land"].unique())
-
-        for country in unique_countries:
+        for country in sorted(stats_df["Land"].unique()):
             c_name = COUNTRY_NAMES.get(country, country)
             print(f"\n" + "-" * 60)
-            print(f"📍 {c_name} ({country})")
+            print(f"\U0001f4cd {c_name} ({country})")
             print("-" * 60)
-
             c_data = stats_df[stats_df["Land"] == country]
-
-            # Plus: Dunkelflaute > Basis
-            plus = c_data[c_data["Differenz_GW"] > 0].sort_values("Differenz_GW", ascending=False).head(10)
-            # Minus: Dunkelflaute < Basis
+            plus  = c_data[c_data["Differenz_GW"] > 0].sort_values("Differenz_GW", ascending=False).head(10)
             minus = c_data[c_data["Differenz_GW"] < 0].sort_values("Differenz_GW", ascending=True).head(10)
-
             if not plus.empty:
                 print(f"  [+] Zuwachs in Dunkelflaute (Top 10):")
                 for _, r in plus.iterrows():
                     print(f"      {r['Jahr']} | {r['Technologie']:<28} | {r['Differenz_GW']:>+8.2f} GW")
             else:
-                print("  [+] Keine signifikanten Zuwächse.")
-
+                print("  [+] Keine signifikanten Zuwachse.")
             if not minus.empty:
-                print(f"\n  [-] Rückgang in Dunkelflaute (Top 10):")
+                print(f"\n  [-] Rueckgang in Dunkelflaute (Top 10):")
                 for _, r in minus.iterrows():
                     print(f"      {r['Jahr']} | {r['Technologie']:<28} | {r['Differenz_GW']:>+8.2f} GW")
             else:
-                print("  [-] Keine signifikanten Rückgänge.")
-
+                print("  [-] Keine signifikanten Rueckgaenge.")
     else:
         print("Keine signifikanten Unterschiede (> 50 MW) gefunden.")
 
