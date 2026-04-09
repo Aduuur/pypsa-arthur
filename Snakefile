@@ -62,9 +62,15 @@ RESULTS = RESULTS.replace("//", "/")
 
 shared_resources = run["shared_resources"]["policy"]
 exclude_from_shared = run["shared_resources"]["exclude"]
-logs = path_provider("logs/", RDIR, shared_resources, exclude_from_shared)
-benchmarks = path_provider("benchmarks/", RDIR, shared_resources, exclude_from_shared)
-resources = path_provider("resources/", RDIR, shared_resources, exclude_from_shared)
+
+# ── Unified output layout ──────────────────────────────────────────────────
+# All run-specific outputs (logs, benchmarks, resources) land under
+# results/<RDIR>/ so that each run is self-contained in one folder.
+# When shared_resources policy redirects to a shared prefix (e.g. "base"),
+# path_provider handles that transparently via get_run_path().
+logs       = path_provider(RESULTS + "logs/",       RDIR, shared_resources, exclude_from_shared)
+benchmarks = path_provider(RESULTS + "benchmarks/", RDIR, shared_resources, exclude_from_shared)
+resources  = path_provider(RESULTS + "resources/",  RDIR, shared_resources, exclude_from_shared)
 
 
 PLAIN_DONE = RESULTS + "postprocess/__plain_workflow.done"
@@ -630,10 +636,10 @@ elif MODE == "aro":
 
 rule analyze_aro_results:
     input:
-        summary = "results/{run}/aro_summary.json",
-        network = "results/{run}/robust_portfolio.nc"
+        summary = RESULTS + "aro_summary.json",
+        network = RESULTS + "networks/aro_robust.nc",
     output:
-        convergence = "results/{run}/plots/aro_metrics/aro_convergence.png",
-        capacity = "results/{run}/plots/capacity/robust_capacity_breakdown.png"
+        convergence = RESULTS + "plots/aro_metrics/aro_convergence.png",
+        capacity    = RESULTS + "plots/capacity/robust_capacity_breakdown.png",
     script:
         "plots_all/aro_analysis.py"
