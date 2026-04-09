@@ -35,6 +35,12 @@ def _first_existing(paths: List[Optional[Path]]) -> Optional[Path]:
     return None
 
 
+def _is_dispatch_network(p: Path) -> bool:
+    """Gibt True zurück wenn der Pfad auf ein Dispatch-Netz hindeutet."""
+    name = p.name.lower()
+    return "dispatch" in name or "_wc" in name or "worst_case" in name
+
+
 # ---------------------------------------------------------------------------
 # Kapazitätsextraktion (Planungsnetz)
 # ---------------------------------------------------------------------------
@@ -225,6 +231,11 @@ class AROAnalyzer:
         """
         Sucht das Basisjahr-Planungsnetz für den Robust-vs-Basis-Vergleich.
 
+        WICHTIG: Dispatch-Netze werden in ALLEN Schritten explizit ausgeschlossen,
+        damit n_basis niemals versehentlich mit einem Dispatch-Netz befüllt wird
+        (was zur Folge hätte, dass beide Seiten des Vergleichs identisch aussehen,
+        weil Dispatch-Netze dieselben p_nom_opt-Werte tragen wie n_robust).
+
         Suchpfade (Priorität):
           1. run_config["basis_network"]              — explizit in master_config gesetzt
           2. run_config["reference_network"]          — Alternativschlüssel
@@ -234,36 +245,54 @@ class AROAnalyzer:
         """
         # 1+2: run_config-Schlüssel
         for key in ("basis_network", "reference_network", "base_network"):
-            p = _safe_path(self.run_config.get(key))
-            if p is not None and p.is_file():
-                print(f"  [basis_network] Aus run_config['{key}']: {p.name}")
-                return pypsa.Network(str(p))
+            raw = self.run_config.get(key)
+            p = _safe_path(raw)
+            if p is not None:
+                # Immer den geprüften Pfad ausgeben, damit Fehler sofort sichtbar sind
+                print(f"  [basis_network] run_config['{key}'] → {p}")
+                if _is_dispatch_network(p):
+                    print(f"  [basis_network] ÜBERSPRUNGEN: sieht aus wie ein Dispatch-Netz!")
+                    continue
+                if p.is_file():
+                    print(f"  [basis_network] Geladen: {p.name}")
+                    return pypsa.Network(str(p))
+                else:
+                    print(f"  [basis_network] WARNUNG: Datei existiert nicht: {p}")
 
         # 3: Globaler REFERENCE_NETWORK_PATH
         ref_path = getattr(self.config, "REFERENCE_NETWORK_PATH", None)
         if ref_path:
             p = Path(str(ref_path))
-            if p.is_file():
-                print(f"  [basis_network] REFERENCE_NETWORK_PATH: {p.name}")
+            print(f"  [basis_network] REFERENCE_NETWORK_PATH → {p}")
+            if _is_dispatch_network(p):
+                print(f"  [basis_network] ÜBERSPRUNGEN: sieht aus wie ein Dispatch-Netz!")
+            elif p.is_file():
+                print(f"  [basis_network] Geladen: {p.name}")
                 return pypsa.Network(str(p))
+            else:
+                print(f"  [basis_network] WARNUNG: Datei existiert nicht: {p}")
 
-        # 4: get_reference_networks()
+        # 4: get_reference_networks() — nur wenn verfügbar und kein Dispatch
         try:
             ref_networks = self.config.get_reference_networks()
             if ref_networks:
-                first = (
-                    ref_networks[0]
+                candidates = (
+                    ref_networks
                     if isinstance(ref_networks, list)
-                    else next(iter(ref_networks.values()))[0]
+                    else [v[0] for v in ref_networks.values() if v]
                 )
-                p = Path(str(first))
-                if p.is_file():
-                    print(f"  [basis_network] get_reference_networks()[0]: {p.name}")
-                    return pypsa.Network(str(p))
+                for cand in candidates:
+                    p = Path(str(cand))
+                    if _is_dispatch_network(p):
+                        print(f"  [basis_network] get_reference_networks(): ÜBERSPRUNGEN Dispatch: {p.name}")
+                        continue
+                    if p.is_file():
+                        print(f"  [basis_network] get_reference_networks(): {p.name}")
+                        return pypsa.Network(str(p))
         except Exception:
             pass
 
-        # 5: Glob-Suche
+        # 5: Glob-Suche im Run-Verzeichnis — explizit kein Dispatch
         try:
             base = Path(self.config.BASE_RESULTS_PATH)
             run_name = self.run_config.get("name", "")
@@ -271,15 +300,18 @@ class AROAnalyzer:
                 run_net_dir = base / run_name / "networks"
                 for pattern in ("base_s_*.nc", "*base*.nc", "*reference*.nc"):
                     hits = sorted(run_net_dir.glob(pattern))
-                    # Dispatch-Netze ausschließen
-                    hits = [h for h in hits if "dispatch" not in h.name]
+                    hits = [h for h in hits if not _is_dispatch_network(h)]
                     if hits:
                         print(f"  [basis_network] Glob ({pattern}): {hits[0].name}")
                         return pypsa.Network(str(hits[0]))
         except Exception:
             pass
 
-        print("  [basis_network] WARNUNG: Kein Basisjahr-Planungsnetz gefunden.")
+        print(
+            "  [basis_network] WARNUNG: Kein Basisjahr-Planungsnetz gefunden.\n"
+            "  Bitte 'reference_network' oder 'basis_network' in master_config.py\n"
+            "  für den ARO-Run korrekt konfigurieren (Pfad zur Basisrun-Planungsnetz-Datei)."
+        )
         return None
 
     def load_networks(self, auto_find_dispatch: bool = True):
@@ -311,7 +343,10 @@ class AROAnalyzer:
         if self.n_basis is not None:
             print(f"Basisjahr-Netz geladen: {len(self.n_basis.generators)} Generatoren")
         else:
-            print("WARNUNG: Basisjahr-Planungsnetz nicht verfügbar — Robust-vs-Basis-Plots werden übersprungen.")
+            print(
+                "WARNUNG: Basisjahr-Planungsnetz nicht verfügbar.\n"
+                "  → plot_robust_vs_basis() erzeugt einen Hinweis-Plot statt eines Vergleichs."
+            )
 
         # ---- Alle Szenario-Dispatch-Netzwerke ----
         self.scenario_networks: Dict[str, pypsa.Network] = {}
@@ -498,8 +533,7 @@ class AROAnalyzer:
         plt.close()
 
     # ------------------------------------------------------------------
-    # NEUER HAUPTPLOT: Robust vs. Basisjahr
-    # Ersetzt das alte Robust-vs-WorstCase im scenario_comparison-Ordner.
+    # HAUPTPLOT: Robust vs. Basisjahr
     # ------------------------------------------------------------------
 
     def plot_robust_vs_basis(
@@ -520,6 +554,11 @@ class AROAnalyzer:
         Das Basisjahr-Netz wird aus self.n_basis genommen (geladen via
         _find_basis_network() in load_networks). Optional kann ein eigenes
         Netz über n_basis_override übergeben werden.
+
+        WICHTIG: Wenn n_basis None ist, wird ein Fehler-Plot erzeugt — KEIN
+        stiller Fallback auf plot_robust_capacity_breakdown(). So ist das
+        Fehlen des Basisnetzes sofort sichtbar, statt zwei identische
+        ARO-Plots zu produzieren.
         """
         n_robust = self.n_robust
         n_basis  = n_basis_override or self.n_basis
@@ -527,10 +566,41 @@ class AROAnalyzer:
         if n_robust is None:
             print("[robust_vs_basis] Robustes Portfolio nicht verfügbar — übersprungen.")
             return
+
         if n_basis is None:
-            print("[robust_vs_basis] Basisjahr-Netz nicht verfügbar — übersprungen.")
-            # Fallback: nur Robust-Breakdown zeigen
-            self.plot_robust_capacity_breakdown(save=save)
+            # --- Fehler-Plot statt stillem Fallback ---
+            # (verhindert dass zwei identische ARO-Plots erscheinen)
+            print(
+                "[robust_vs_basis] FEHLER: Basisjahr-Netz nicht verfügbar.\n"
+                "  Bitte 'reference_network' in master_config.py konfigurieren.\n"
+                "  Erzeuge Fehler-Hinweis-Plot statt Vergleich."
+            )
+            fig, ax = plt.subplots(figsize=(12, 6))
+            ax.axis("off")
+            run_name = self.run_config.get("name", "")
+            ref_key = self.run_config.get("reference_network", "<nicht konfiguriert>")
+            msg = (
+                f"⚠ Kein Basisjahr-Planungsnetz gefunden\n\n"
+                f"ARO-Run: {run_name}\n"
+                f"Gesuchter Pfad (reference_network):\n  {ref_key}\n\n"
+                f"Bitte in master_config.py unter\n"
+                f"  aro → runs → {run_name} → reference_network\n"
+                f"den korrekten Pfad zum deterministischen Basisjahr-Planungsnetz\n"
+                f"(z.B. base_s_24___2050.nc von Basisrun-rcp45-2028) eintragen.\n\n"
+                f"Der Pfad muss auf ein Planungsnetz zeigen (nicht auf ein Dispatch-Netz)."
+            )
+            ax.text(0.05, 0.95, msg, transform=ax.transAxes,
+                    fontsize=11, verticalalignment="top", family="monospace",
+                    bbox=dict(boxstyle="round", facecolor="#fff3cd", alpha=0.9))
+            plt.suptitle(
+                f"Robust vs. Basisjahr — FEHLER: Basisnetz fehlt — {run_name}",
+                fontsize=13, color="red"
+            )
+            if save:
+                p = self.config.get_plot_output_dir("scenario_comparison") / "robust_vs_basis_FEHLER.png"
+                plt.savefig(p, dpi=150, bbox_inches="tight")
+                print(f"Fehler-Plot gespeichert: {p}")
+            plt.close()
             return
 
         cap_robust = _extract_capacity(n_robust, label_robust)
@@ -608,8 +678,6 @@ class AROAnalyzer:
         total_rob = rob.sum()
         total_bas = bas.sum()
         if total_rob > 0 and total_bas > 0:
-            # Donut: äußerer Ring = Robust, innerer Ring = Basis
-            # Nur Top-8 Carrier zeigen (Rest als "Sonstige")
             top_n = 8
             top_idx = rob.abs().nlargest(top_n).index.tolist()
             other_idx = [c for c in all_carriers if c not in top_idx]
@@ -628,7 +696,6 @@ class AROAnalyzer:
             ax3.text(0,  0.14, "ARO",   ha="center", va="center", fontsize=11, fontweight="bold")
             ax3.text(0, -0.14, "Basis", ha="center", va="center", fontsize=10, color="#555")
 
-            # Legende
             handles = [plt.Rectangle((0,0),1,1, fc=c) for c in cols_d]
             ax3.legend(handles, labels_d, loc="lower center",
                        bbox_to_anchor=(0.5, -0.18), ncol=3, fontsize=8)
@@ -712,8 +779,8 @@ class AROAnalyzer:
     def plot_scenario_capacity_comparison(self, save=True):
         """
         scenario_comparison/-Ordner:
-          1. Robust vs. Basisjahr (Kapazitätsvergleich)  ← NEU, Hauptplot
-          2. Dispatch-Performance je Klimaszenario        ← wie bisher
+          1. Robust vs. Basisjahr (Kapazitätsvergleich)
+          2. Dispatch-Performance je Klimaszenario
         """
         # --- 1. Robust vs. Basisjahr ---
         self.plot_robust_vs_basis(save=save)
@@ -846,15 +913,26 @@ class AROAnalyzer:
                     print(f"    ✗ {country}: {e}")
 
     def generate_all_aro_plots(self, save=True):
-        """Generiert alle ARO-spezifischen Plots."""
+        """
+        Generiert alle ARO-spezifischen Plots.
+
+        HINWEIS zur Reihenfolge:
+        - plot_robust_capacity_breakdown:    Einzelplot des ARO-Portfolios → capacity/
+        - plot_robust_vs_basis:              Vergleich ARO vs. Basisjahr → scenario_comparison/
+          (bei fehlendem n_basis: Fehler-Plot statt stiller Fallback)
+        - plot_scenario_capacity_comparison: Dispatch-Szenariovergleich → scenario_comparison/
+          (ruft intern plot_robust_vs_basis auf — kein Doppelaufruf nötig)
+        """
         print(f"\n=== Generiere ARO-Plots für {self.run_config.get('name', '')} ===\n")
 
         plot_functions = [
             ("ARO Konvergenz",              self.plot_aro_convergence),
             ("Szenario-Kostenvergleich",     self.plot_scenario_cost_comparison),
+            # plot_robust_capacity_breakdown: Einzelplot des ARO-Portfolios (capacity/)
             ("Robuste Kapazitäten",          self.plot_robust_capacity_breakdown),
-            ("Robust vs. Basisjahr",          self.plot_robust_vs_basis),
-            ("Szenario-Dispatch-Vergleich",   self.plot_scenario_capacity_comparison),
+            # plot_scenario_capacity_comparison: ruft intern plot_robust_vs_basis() auf
+            # → kein separater Aufruf von plot_robust_vs_basis nötig (verhindert Doppelung)
+            ("Szenario-Dispatch-Vergleich",  self.plot_scenario_capacity_comparison),
         ]
 
         for name, func in plot_functions:
@@ -896,7 +974,7 @@ class AROAnalyzer:
         n_basis_info = (
             f"{len(self.n_basis.generators)} Generatoren"
             if self.n_basis is not None
-            else "nicht gefunden"
+            else "nicht gefunden — reference_network in master_config.py prüfen!"
         )
         print(f"\nBasisjahr-Netz: {n_basis_info}")
 
