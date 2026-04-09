@@ -119,6 +119,16 @@ ARO_DIRECT_CALL_SCRIPTS: set = {
     "delta_prices_map",
 }
 
+# Skripte, die im ARO-Modus explizit den Vergleich
+# Basisjahr (average) vs. Worst-Case-Dispatch (dunkelflaute) nutzen sollen.
+# Dafür wird SCENARIO_SELECTION temporär auf "both" gesetzt.
+ARO_BASIS_WC_COMPARISON_SCRIPTS: set = {
+    "co2_emissionen",
+    "co2_emissionen_analyse",
+    "dec_delta_dispatch",
+}
+
+
 SCRIPTS_DIR = Path(__file__).parent
 
 
@@ -160,31 +170,70 @@ def _year_from_path(path: str) -> Optional[int]:
 # BUG B FIX: _inject_aro_dispatch_network
 # -----------------------------------------------------------------------
 
-def _inject_aro_dispatch_network(aro_dispatch_path: str) -> dict:
+def _inject_aro_dispatch_network(
+    aro_dispatch_path: str,
+    aro_basis_path: Optional[str] = None,
+    selected_run_key: Optional[str] = None,
+) -> dict:
     """
-    Temporarily override the network path in MASTER_CONFIG so standalone
-    scripts pick up the ARO worst-case dispatch network instead of the
-    planning network (base_s_24___2050.nc).
+    Temporarily patch MASTER_CONFIG for ARO standalone scripts.
+
+    - selected run -> Worst-Case-Dispatch
+    - optional synthetic "both"-Vergleich:
+      average     -> Basisjahr-Referenznetz
+      dunkelflaute-> Worst-Case-Dispatch
     """
     from master_config import MASTER_CONFIG
 
     saved: dict = {}
-    p = str(aro_dispatch_path)
+    p_wc = str(aro_dispatch_path)
+    p_basis = str(aro_basis_path) if aro_basis_path else None
 
     registry = MASTER_CONFIG.get("scenarios", {}).get("registry", {})
     if isinstance(registry, dict):
         for run_key, run_cfg in registry.items():
             if isinstance(run_cfg, dict) and "networks" in run_cfg:
                 saved[("scenarios", "registry", run_key, "networks")] = list(run_cfg["networks"])
-                run_cfg["networks"] = [p]
+                # Nur den aktiven ARO-Run auf WC umbiegen; andere Einträge bleiben.
+                if selected_run_key and run_key == selected_run_key:
+                    run_cfg["networks"] = [p_wc]
+
+            # synthetische Vergleichs-Szenarien für "both"
+            cmp_basis_key = "__aro_basis_reference__"
+            cmp_wc_key = "__aro_worst_case_dispatch__"
+
+            saved[("scenarios", "registry", cmp_basis_key, "__exists__")] = cmp_basis_key in registry
+            saved[("scenarios", "registry", cmp_wc_key, "__exists__")] = cmp_wc_key in registry
+            if cmp_basis_key in registry:
+                saved[("scenarios", "registry", cmp_basis_key, "__entry__")] = dict(registry[cmp_basis_key])
+            if cmp_wc_key in registry:
+                saved[("scenarios", "registry", cmp_wc_key, "__entry__")] = dict(registry[cmp_wc_key])
+
+            if p_basis:
+                registry[cmp_basis_key] = {
+                    "run_type": "normal",
+                    "description": "ARO Basisjahr-Referenz (temporär)",
+                    "networks": [p_basis],
+                }
+            registry[cmp_wc_key] = {
+                "run_type": "normal",
+                "description": "ARO Worst-Case-Dispatch (temporär)",
+                "networks": [p_wc],
+            }
+
+            both_mapping = MASTER_CONFIG.get("scenarios", {}).get("both_mapping", {})
+            saved[("scenarios", "both_mapping", "average")] = both_mapping.get("average")
+            saved[("scenarios", "both_mapping", "dunkelflaute")] = both_mapping.get("dunkelflaute")
+            both_mapping["average"] = cmp_basis_key if p_basis else cmp_wc_key
+            both_mapping["dunkelflaute"] = cmp_wc_key
 
     if "network_path" in MASTER_CONFIG:
         saved[("network_path",)] = MASTER_CONFIG["network_path"]
-        MASTER_CONFIG["network_path"] = p
+        MASTER_CONFIG["network_path"] = p_wc
 
     if "network_2050" in MASTER_CONFIG:
         saved[("network_2050",)] = MASTER_CONFIG["network_2050"]
-        MASTER_CONFIG["network_2050"] = p
+        MASTER_CONFIG["network_2050"] = p_wc
 
     return saved
 
@@ -194,14 +243,43 @@ def _restore_network_config(saved: dict) -> None:
     from master_config import MASTER_CONFIG
 
     for key_tuple, original in saved.items():
-        if len(key_tuple) == 4 and key_tuple[:3] == ("scenarios", "registry") and key_tuple[3] == "networks":
+        if len(key_tuple) == 4 and key_tuple[:2] == ("scenarios", "registry") and key_tuple[3] == "networks":
             run_key = key_tuple[2]
             registry = MASTER_CONFIG.get("scenarios", {}).get("registry", {})
             if isinstance(registry, dict) and run_key in registry:
                 if isinstance(registry[run_key], dict):
                     registry[run_key]["networks"] = original
+        elif len(key_tuple) == 4 and key_tuple[:2] == ("scenarios", "registry") and key_tuple[3] == "__exists__":
+            run_key = key_tuple[2]
+            exists_before = bool(original)
+            registry = MASTER_CONFIG.get("scenarios", {}).get("registry", {})
+            if isinstance(registry, dict) and not exists_before and run_key in registry:
+                registry.pop(run_key, None)
+        elif len(key_tuple) == 4 and key_tuple[:2] == ("scenarios", "registry") and key_tuple[3] == "__entry__":
+            run_key = key_tuple[2]
+            registry = MASTER_CONFIG.get("scenarios", {}).get("registry", {})
+            if isinstance(registry, dict):
+                registry[run_key] = original
+        elif len(key_tuple) == 3 and key_tuple[:2] == ("scenarios", "both_mapping"):
+            mapping_key = key_tuple[2]
+            both_mapping = MASTER_CONFIG.get("scenarios", {}).get("both_mapping", {})
+            if isinstance(both_mapping, dict):
+                if original is None:
+                    both_mapping.pop(mapping_key, None)
+                else:
+                    both_mapping[mapping_key] = original
+
         elif len(key_tuple) == 1:
             MASTER_CONFIG[key_tuple[0]] = original
+
+            # Zusätzliche Absicherung: temporäre ARO-Vergleichskeys entfernen,
+            # falls sie vor dem Patchen nicht existierten.
+        registry = MASTER_CONFIG.get("scenarios", {}).get("registry", {})
+        if isinstance(registry, dict):
+            for tmp_key in ("__aro_basis_reference__", "__aro_worst_case_dispatch__"):
+                marker = ("scenarios", "registry", tmp_key, "__exists__")
+                if marker in saved and not bool(saved[marker]):
+                    registry.pop(tmp_key, None)
 
 
 # -----------------------------------------------------------------------
@@ -263,6 +341,31 @@ def _resolve_wc_dispatch_path(analyzer: "AROAnalyzer") -> Optional[str]:
 
     return None
 
+def _resolve_basis_network_path(analyzer: "AROAnalyzer") -> Optional[str]:
+    """
+    Return the filesystem path of the configured basis/reference planning network.
+    """
+    n_basis = getattr(analyzer, "n_basis", None)
+    if n_basis is not None and hasattr(n_basis, "_source_path"):
+        p = str(n_basis._source_path)
+        if Path(p).is_file():
+            return p
+
+    run_conf = analyzer.config.get_current_run_config()
+    for key in ("basis_network", "reference_network", "base_network"):
+        p = run_conf.get(key)
+        if p and Path(p).is_file():
+            return str(p)
+
+    try:
+        ref_path = getattr(analyzer.config, "REFERENCE_NETWORK_PATH", None)
+        if ref_path and Path(ref_path).is_file():
+            return str(ref_path)
+    except Exception:
+        pass
+
+    return None
+
 
 # -----------------------------------------------------------------------
 # Standalone Dispatcher
@@ -272,6 +375,8 @@ def _load_and_run_script(
     script_key: str,
     override_scenario: Optional[str] = None,
     aro_dispatch_path: Optional[str] = None,
+    aro_basis_path: Optional[str] = None,
+    aro_selected_run: Optional[str] = None,
     aro_robust_path: Optional[str] = None,
     analyzer: Optional["AROAnalyzer"] = None,
 ) -> Dict[str, Any]:
@@ -397,13 +502,21 @@ def _load_and_run_script(
     _orig_sel = None
     _network_backup: dict = {}
 
-    if override_scenario is not None:
+    effective_override = override_scenario
+    if script_key in ARO_BASIS_WC_COMPARISON_SCRIPTS and aro_basis_path is not None:
+        effective_override = "both"
+
+    if effective_override is not None:
         _orig_sel = MASTER_CONFIG["scenarios"]["selection"]
-        MASTER_CONFIG["scenarios"]["selection"] = override_scenario
+        MASTER_CONFIG["scenarios"]["selection"] = effective_override
 
     if aro_dispatch_path is not None:
         if Path(aro_dispatch_path).is_file():
-            _network_backup = _inject_aro_dispatch_network(aro_dispatch_path)
+            _network_backup = _inject_aro_dispatch_network(
+                aro_dispatch_path=aro_dispatch_path,
+                aro_basis_path=aro_basis_path,
+                selected_run_key=aro_selected_run,
+            )
             print(f"     [ARO] Netzwerk → {Path(aro_dispatch_path).name}")
         else:
             print(f"     [ARO] Warnung: Worst-Case-Dispatch nicht gefunden: {aro_dispatch_path}")
@@ -435,6 +548,8 @@ def run_standalone_scripts(
     aro_only: bool = False,
     override_scenario: Optional[str] = None,
     aro_dispatch_path: Optional[str] = None,
+    aro_basis_path: Optional[str] = None,
+    aro_selected_run: Optional[str] = None,
     aro_robust_path: Optional[str] = None,
     analyzer: Optional["AROAnalyzer"] = None,
 ) -> Dict[str, Any]:
@@ -451,6 +566,8 @@ def run_standalone_scripts(
             override_scenario=override_scenario,
             aro_dispatch_path=aro_dispatch_path,
             aro_robust_path=aro_robust_path,
+            aro_basis_path=aro_basis_path,
+            aro_selected_run=aro_selected_run,
             analyzer=analyzer,
         )
         report["scripts"][key] = res
@@ -666,6 +783,8 @@ def run_aro(
     # nicht mehr enthalten — läuft bereits oben über den Analyzer)
     if run_standalone:
         wc_dispatch_path: Optional[str] = _resolve_wc_dispatch_path(analyzer)
+        basis_network_path: Optional[str] = _resolve_basis_network_path(analyzer)
+
 
         if wc_dispatch_path:
             print(f"\n  [ARO] Worst-Case-Dispatch für Standalone-Skripte: "
@@ -673,6 +792,8 @@ def run_aro(
         else:
             print("\n  [ARO] Warnung: Kein Worst-Case-Dispatch gefunden – "
                   "Standalone-Skripte laufen ohne Dispatch-Netz (Ergebnisse werden leer sein)")
+        if basis_network_path:
+            print(f"  [ARO] Basisjahr-Referenz für Vergleichsplots: {Path(basis_network_path).name}")
 
         print("\n=== Standalone plot_*.py Skripte (ARO-kompatibel) ===")
         standalone_report = run_standalone_scripts(
@@ -680,6 +801,8 @@ def run_aro(
             aro_only=(standalone_keys is None),
             override_scenario=run_key,
             aro_dispatch_path=wc_dispatch_path,
+            aro_basis_path=basis_network_path,
+            aro_selected_run=run_key,
             aro_robust_path=None,   # nicht mehr benötigt (installed_cap_vgl läuft über Analyzer)
             analyzer=analyzer,
         )

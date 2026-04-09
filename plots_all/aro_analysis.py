@@ -291,10 +291,17 @@ class AROAnalyzer:
           - n_worst_case:      Worst-Case-Dispatch (Rückwärtskompatibilität)
         """
         # ---- Robustes Portfolio ----
+        portfolio_key = "robust_network"
         portfolio_path = _safe_path(self.run_config.get("robust_network"))
+        if portfolio_path is None or not portfolio_path.exists():
+            portfolio_key = "robust_network_std"
+            portfolio_path = _safe_path(self.run_config.get("robust_network_std"))
         if portfolio_path and portfolio_path.exists():
             self.n_robust = pypsa.Network(str(portfolio_path))
-            print(f"Robustes Portfolio geladen: {len(self.n_robust.generators)} Generatoren")
+            print(
+                f"Robustes Portfolio geladen ({portfolio_key}): "
+                f"{len(self.n_robust.generators)} Generatoren"
+            )
         else:
             self.n_robust = None
             print(f"WARNUNG: Portfolio nicht gefunden: {portfolio_path}")
