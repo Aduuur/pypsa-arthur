@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # master_config.py
 # =============================================================================
 # Zentrale Master-Konfigurationsdatei für PyPSA-Eur Auswertung
@@ -38,7 +39,7 @@ def _mkdir(p: Union[str, Path]) -> Path:
 # RUN_NAME       : aktiv selektierter Run (für normale Plot-Skripte)
 # -----------------------------------------------------------------------------
 ARO_RUN_NAME: str = _env("ARO_RUN_NAME", "big-aro-run-2")       # type: ignore[assignment]
-REF_RUN_NAME: str = _env("REF_RUN_NAME", "Basisrun-rcp45-2028") # type: ignore[assignment]
+REF_RUN_NAME: str = _env("REF_RUN_NAME", "basisrun-rcp45-2028") # type: ignore[assignment]
 RUN_NAME: str = _env("RUN_NAME", ARO_RUN_NAME)                   # type: ignore[assignment]
 
 
@@ -160,9 +161,20 @@ MASTER_CONFIG: Dict[str, Any] = {
             },
         },
 
+        # FIX #2: both_mapping muss auf tatsächlich existierende Registry-Keys
+        # zeigen. Früher standen hier "new_avg" / "dunkelflaute_neu_2" — die
+        # nicht im registry waren, was get_networks("both") immer leer ließ.
+        #
+        # Bedeutung im Vergleichsmodus (SCENARIO_SELECTION = "both"):
+        #   "average"      → linke Säule  = deterministischer Basisrun
+        #   "dunkelflaute" → rechte Säule = ARO-Robustes-Portfolio
+        #
+        # Im ARO-Worst-Case-Vergleich (via _inject_aro_dispatch_network) werden
+        # diese Keys temporär auf "__aro_basis_reference__" / "__aro_worst_case_dispatch__"
+        # umgebogen — das bleibt unverändert.
         "both_mapping": {
-            "average":       "new_avg",
-            "dunkelflaute":  "dunkelflaute_neu_2",
+            "average":      REF_RUN_NAME,   # deterministischer Basisrun (rechte Seite Vergleich)
+            "dunkelflaute": ARO_RUN_NAME,   # robustes ARO-Portfolio  (linke Seite Vergleich)
         },
     },
 
@@ -232,6 +244,48 @@ MASTER_CONFIG: Dict[str, Any] = {
 # Dataclasses wrapping the dict
 # -----------------------------------------------------------------------------
 @dataclass
+
+def get_dunkelflaute_window(network_path: str, duration_days: int = 7) -> tuple[str, str]:
+    """
+    Leitet das Dunkelflaute-Fenster aus dem Dispatch-Dateinamen ab.
+
+    Dateiname-Muster: ...stress_04_from_2040_12_12...
+    → Monat/Tag = 12-12, Jahr aus n.snapshots[0].year
+    → start = YYYY-12-12, end = start + 7 Tage
+
+    Fallback: erste 7 Tage des Netzwerks wenn kein Datum im Namen.
+    """
+    import re
+    from pathlib import Path
+    import pandas as pd
+
+    fname = Path(network_path).name
+
+    # Datum aus Dateiname parsen: _from_YYYY_MM_DD
+    m = re.search(r"_from_\d{4}_(\d{2})_(\d{2})", fname)
+
+    # Jahr aus Snapshots lesen
+    try:
+        import pypsa
+        n = pypsa.Network(network_path)
+        snap_year = int(n.snapshots[0].year)
+    except Exception:
+        snap_year = 2028  # Fallback
+
+    if m:
+        month, day = int(m.group(1)), int(m.group(2))
+        start = pd.Timestamp(year=snap_year, month=month, day=day)
+    else:
+        # Fallback: erste Snapshots
+        try:
+            start = pd.Timestamp(n.snapshots[0])
+        except Exception:
+            start = pd.Timestamp(f"{snap_year}-01-07")
+
+    end = start + pd.Timedelta(days=duration_days - 1)
+    return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+
+
 class MasterConfig:
     raw: Dict[str, Any] = field(default_factory=lambda: MASTER_CONFIG)
 
@@ -541,9 +595,14 @@ class PlottingConfig:
         self.AVAILABLE_PLOTS    = self.master.available_plots
         self.DARK_SKY_START     = self.master.dark_sky_start
         self.DARK_SKY_END       = self.master.dark_sky_end
-        self.PLOT_OUTPUT_PATH   = str(
-            self.master.get_run_output_dir(self.SCENARIO_SELECTION)
-        )
+        # FIX: "both" und "all" sind Vergleichsmodi, keine Run-Keys.
+        # Ordner wie plots_base/both/ sind sinnlos — stattdessen den
+        # tatsächlichen Run-Ordner (ARO oder erster Registry-Eintrag) nutzen.
+        _sel = self.SCENARIO_SELECTION
+        if _sel in ("both", "all"):
+            _sel = (self.master.aro_selected_run
+                    or next(iter(self.master.scenarios_registry), _sel))
+        self.PLOT_OUTPUT_PATH   = str(self.master.get_run_output_dir(_sel))
 
     def get_networks(self):
         return self.master.get_networks()
@@ -663,7 +722,17 @@ def validate_config(master: Optional[MasterConfig] = None, strict: bool = False)
     if "ALL" not in master.default_countries_to_plot:
         warn("countries.default_countries_to_plot enthält kein 'ALL'.")
 
+    # FIX #2 Validation: both_mapping auf Registry-Existenz prüfen
+    both_mapping = master.raw["scenarios"].get("both_mapping", {})
     reg = master.scenarios_registry
+    for mapping_label, registry_key in both_mapping.items():
+        if registry_key not in reg:
+            warn(
+                f"scenarios.both_mapping['{mapping_label}'] = '{registry_key}' "
+                f"existiert nicht im scenarios.registry. "
+                f"get_networks('both') wird für diesen Key leer zurückgeben."
+            )
+
     for k, v in reg.items():
         if isinstance(v, dict):
             rt = v.get("run_type", "")

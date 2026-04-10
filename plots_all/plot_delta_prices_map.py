@@ -41,8 +41,11 @@ from config_final import PlottingConfig
 # PARAMETER
 # =====================================================================
 # Dunkelflaute-Fenster (innerhalb des Netzwerk-Zeitraums)
+# START/END werden zur Laufzeit aus dem Netzwerk-Dateinamen abgeleitet
+# (via master_config.get_dunkelflaute_window). Diese Defaults werden nur
+# im Nicht-ARO-Modus genutzt.
 START = "2005-01-07"
-END   = "2005-01-28"
+END   = "2005-01-13"  # 7 Tage ab START
 
 SAVE_STEM = "price_delta_map_Jan7_3weeks_final"
 
@@ -258,8 +261,15 @@ def _run_aro_mode(aro_network_path: str) -> None:
         """Ersetzt das Jahr in einem Datumsstring durch target_year."""
         return f"{target_year}{date_str[4:]}"
 
-    df_start = START
-    df_end   = END
+    # Dynamisches DF-Fenster aus Dateiname ableiten (ARO: 1 Woche)
+    try:
+        from master_config import get_dunkelflaute_window
+        _npath = getattr(n, "_source_path", None) or network_path
+        df_start, df_end = get_dunkelflaute_window(_npath, duration_days=7)
+        print(f"[ARO] DF-Fenster aus Dateiname: {df_start} – {df_end}")
+    except Exception:
+        df_start = START
+        df_end   = END
 
     # Prüfe ob START/END im Netzwerk-Zeitraum liegt
     snap_idx = pd.DatetimeIndex(snaps)

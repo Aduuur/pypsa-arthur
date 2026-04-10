@@ -8,6 +8,12 @@ Vergleicht installierte Kapazitaeten zwischen zwei Szenarien.
 
 ARO-Modus: robustes Portfolio (links) vs. Basisjahr-Planungsnetz (rechts)
 Klassischer Modus: 'both' aus config (average vs. dunkelflaute)
+
+FIXES:
+  #1 — Import war `from config_final import PlottingConfig` → jetzt korrekt
+       `from master_config import PlottingConfig`
+  #4 — Speicherpfad im ARO-Modus nutzt jetzt `config.PLOT_OUTPUT_PATH`
+       (run-spezifisch) statt `config.BASE_SAVE_PATH` (globaler Root)
 """
 
 import os
@@ -16,7 +22,10 @@ import pypsa
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from config_final import PlottingConfig
+
+# FIX #1: war `from config_final import PlottingConfig` — config_final existiert nicht.
+# PlottingConfig ist in master_config definiert.
+from master_config import PlottingConfig
 
 # =====================================================================
 # --- KONFIGURATION ---
@@ -360,7 +369,7 @@ def main(aro_network=None, aro_robust_network=None, aro_basis_network=None):
 
         if path_basis is None and aro_network is not None:
             print(
-                "\u26a0\ufe0f  aro_basis_network nicht gesetzt — Fallback auf aro_network.\n"
+                "⚠️  aro_basis_network nicht gesetzt — Fallback auf aro_network.\n"
                 "   Bitte run_analysis.py aktualisieren: aro_basis_network=<Basisjahr-Pfad>."
             )
             path_basis = aro_network
@@ -369,10 +378,10 @@ def main(aro_network=None, aro_robust_network=None, aro_basis_network=None):
         paths_basis  = [path_basis]  if path_basis  and os.path.isfile(path_basis)  else []
 
         if not paths_robust:
-            print("\u26a0\ufe0f  Kein robustes Portfolio angegeben — Vergleich nicht moeglich, uebersprungen.")
+            print("⚠️  Kein robustes Portfolio angegeben — Vergleich nicht moeglich, uebersprungen.")
             return
         if not paths_basis:
-            print("\u26a0\ufe0f  Kein Basisjahr-Planungsnetz angegeben — Vergleich nicht moeglich, uebersprungen.")
+            print("⚠️  Kein Basisjahr-Planungsnetz angegeben — Vergleich nicht moeglich, uebersprungen.")
             return
 
         countries = config.get_countries()
@@ -409,16 +418,21 @@ def main(aro_network=None, aro_robust_network=None, aro_basis_network=None):
         # verfuegbaren Jahre und haengen sie nebeneinander.
         common_years = sorted(set(years_robust) & set(years_basis))
         if not common_years:
-            # Kein gemeinsames Jahr: beide Seiten trotzdem plotten mit
-            # 0-Auffuellung fuer fehlendes Jahr.
             all_years = sorted(set(years_robust) | set(years_basis))
             print(
-                f"\u26a0\ufe0f  Keine gemeinsamen Jahre (Robust: {years_robust}, Basis: {years_basis}).\n"
+                f"⚠️  Keine gemeinsamen Jahre (Robust: {years_robust}, Basis: {years_basis}).\n"
                 f"   Plotte alle verfuegbaren Jahre nebeneinander: {all_years}"
             )
             common_years = all_years
 
-        save_dir = os.path.join(config.BASE_SAVE_PATH, "scenario_comparison", "installed_capacities")
+        # FIX #4: im ARO-Modus PLOT_OUTPUT_PATH (run-spezifisch) statt
+        # BASE_SAVE_PATH (globaler Root) verwenden, damit Plots in den
+        # richtigen Run-Unterordner geschrieben werden.
+        save_dir = os.path.join(
+            config.PLOT_OUTPUT_PATH,          # ← FIX: war config.BASE_SAVE_PATH
+            "scenario_comparison",
+            "installed_capacities",
+        )
         os.makedirs(save_dir, exist_ok=True)
 
         for c in countries:
@@ -434,7 +448,7 @@ def main(aro_network=None, aro_robust_network=None, aro_basis_network=None):
             fname = f"Compare_Capacity_ARO_{c}.png"
             fig.savefig(os.path.join(save_dir, fname), dpi=300, bbox_inches="tight")
             plt.close(fig)
-            print(f"\u2705 {fname}")
+            print(f"✅ {fname}")
         return
 
     # ----------------------------------------------------------------
@@ -444,7 +458,7 @@ def main(aro_network=None, aro_robust_network=None, aro_basis_network=None):
     networks = config.get_networks()
 
     if not isinstance(networks, dict) or 'average' not in networks:
-        print("\u274c Fehler: SCENARIO_SELECTION muss 'both' sein.")
+        print("❌ Fehler: SCENARIO_SELECTION muss 'both' sein.")
         return
 
     countries = config.get_countries()
@@ -485,7 +499,12 @@ def main(aro_network=None, aro_robust_network=None, aro_basis_network=None):
         print("Keine gemeinsamen Jahre!")
         return
 
-    save_dir = os.path.join(config.BASE_SAVE_PATH, "scenario_comparison", "installed_capacities")
+    # FIX #4: auch im klassischen Modus run-spezifischen Pfad nutzen
+    save_dir = os.path.join(
+        config.PLOT_OUTPUT_PATH,              # ← FIX: war config.BASE_SAVE_PATH
+        "scenario_comparison",
+        "installed_capacities",
+    )
     os.makedirs(save_dir, exist_ok=True)
 
     diff_records = []
@@ -525,7 +544,7 @@ def main(aro_network=None, aro_robust_network=None, aro_basis_network=None):
         plt.close(fig)
 
     print("\n" + "=" * 80)
-    print("\U0001f4ca VERGLEICHS-STATISTIK (Dunkelflaute vs. Basisszenario)")
+    print("📊 VERGLEICHS-STATISTIK (Dunkelflaute vs. Basisszenario)")
     print("=" * 80)
 
     if diff_records:
@@ -539,7 +558,7 @@ def main(aro_network=None, aro_robust_network=None, aro_basis_network=None):
         for country in sorted(stats_df["Land"].unique()):
             c_name = COUNTRY_NAMES.get(country, country)
             print(f"\n" + "-" * 60)
-            print(f"\U0001f4cd {c_name} ({country})")
+            print(f"📍 {c_name} ({country})")
             print("-" * 60)
             c_data = stats_df[stats_df["Land"] == country]
             plus  = c_data[c_data["Differenz_GW"] > 0].sort_values("Differenz_GW", ascending=False).head(10)

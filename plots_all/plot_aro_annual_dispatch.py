@@ -5,16 +5,20 @@ plot_aro_annual_dispatch.py
 ============================
 Jährlicher Dispatch-Vergleich über alle ARO-Szenarien.
 
-Szenario-Labels werden auf 'stress_xy' gekürzt (gleiche Logik wie
-plot_aro_capacity_by_country._shorten_scenario_name).
+FIXES:
+  A — _extract_annual_generation(): snapshot_weightings wurde mit values[0]
+      als skalarer Faktor auf eine bereits aufsummierte Zeitreihe angewendet
+      → bei dt > 1 h war die TWh-Zahl um Faktor dt zu groß.
+      Fix: Zeitreihe zuerst mit weights multiplizieren, dann summieren.
+  B — Links (OCGT, CCGT, H2 Fuel Cell etc.) wurden nicht erfasst.
+      Fix: links_t.p1 (positive Einspeisung ins Stromnetz) wird jetzt
+      ebenfalls ausgelesen.
+  C — _capacity_factor(): gleicher dt-Bug wie in A.
 
 Plots:
   1. Gestapelter Balken: jährliche Erzeugung je Szenario (stress_xy)
   2. Heatmap: Erzeugung × Szenario  (Carrier-Zeilen, Szenario-Spalten)
   3. Scatter: Kapazitätsfaktor vs. Systemkosten je Szenario
-
-Standalone::
-    python plots_all/plot_aro_annual_dispatch.py [--run KEY] [--output DIR]
 """
 
 from __future__ import annotations
@@ -32,13 +36,12 @@ import numpy as np
 import pandas as pd
 import pypsa
 
-# reuse shorten logic from capacity module
 sys.path.insert(0, str(Path(__file__).parent))
 from plot_aro_capacity_by_country import _shorten_scenario_name, build_scenario_label_map
 
 
 # ---------------------------------------------------------------------------
-# Carrier-Reihenfolge (Erzeugung oben, Last unten)
+# Carrier-Reihenfolge
 # ---------------------------------------------------------------------------
 GEN_CARRIER_ORDER = [
     "solar", "solar rooftop", "onwind", "offwind-ac", "offwind-dc",
@@ -72,82 +75,145 @@ DEFAULT_GEN_COLORS: Dict[str, str] = {
     "PHS":               "#3182bd",
 }
 
+# Carrier, die Erzeugungsleistung über Links einspeisen (bus1 = Stromnetz)
+LINK_GEN_CARRIERS = {
+    "OCGT", "CCGT", "gas", "oil", "nuclear",
+    "H2 Fuel Cell", "H2 turbine", "H2 OCGT",
+    "urban central solid biomass CHP",
+    "urban central solid biomass CHP CC",
+}
+
+
+# ---------------------------------------------------------------------------
+# Hilfsfunktion: snapshot-gewichtete Summe
+# ---------------------------------------------------------------------------
+
+def _weighted_sum(timeseries: pd.DataFrame, n: pypsa.Network) -> pd.Series:
+    """
+    Summiert eine Zeitreihe korrekt über alle Snapshots unter Berücksichtigung
+    der snapshot_weightings.
+
+    FIX A/C: Statt `series.sum() * dt_single` (falsch bei variablen/nicht-1h
+    Gewichtungen) wird die Zeitreihe zuerst mit den Gewichten multipliziert
+    und dann summiert. Das entspricht dem echten Energieinhalt.
+    """
+    if timeseries.empty:
+        return pd.Series(dtype=float)
+    weights = n.snapshot_weightings.generators.reindex(timeseries.index).fillna(1.0)
+    return timeseries.multiply(weights, axis=0).sum()
+
 
 # ---------------------------------------------------------------------------
 # Daten-Extraktion
 # ---------------------------------------------------------------------------
 
-def _extract_annual_generation(
-    n: pypsa.Network,
-) -> pd.Series:
+def _extract_annual_generation(n: pypsa.Network) -> pd.Series:
     """
-    Jährliche Erzeugung [TWh] je Carrier aus generators_t.p.
-    Speicher werden separat als positiver Dispatch erfasst.
+    Jährliche Erzeugung [TWh] je Carrier.
+
+    Quellen:
+      - generators_t.p          (positive Werte = Einspeisung)
+      - storage_units_t.p       (positive Werte = Entladung)
+      - links_t.p1              (negative p1 = Einspeisung aus Link-Sicht;
+                                 abs() liefert eingespeiste Leistung)
+
+    FIX A: Gewichtung über _weighted_sum() statt values[0]-Skalierung.
+    FIX B: Links werden jetzt berücksichtigt.
     """
     result: Dict[str, float] = {}
 
-    # Generatoren
-    if hasattr(n, "generators_t") and hasattr(n.generators_t, "p") and not n.generators_t.p.empty:
-        gen_p = n.generators_t.p
-        for gen_name in gen_p.columns:
-            if gen_name in n.generators.index:
+    # --- Generatoren ---
+    if (hasattr(n, "generators_t") and hasattr(n.generators_t, "p")
+            and not n.generators_t.p.empty):
+        gen_p = n.generators_t.p.clip(lower=0)
+        ws = _weighted_sum(gen_p, n)
+        for gen_name, val in ws.items():
+            if gen_name in n.generators.index and val > 0:
                 carrier = n.generators.loc[gen_name, "carrier"]
-                result[carrier] = result.get(carrier, 0.0) + gen_p[gen_name].clip(lower=0).sum()
+                result[carrier] = result.get(carrier, 0.0) + val
 
-    # Speicher (nur Entladung positiv)
-    if hasattr(n, "storage_units_t") and hasattr(n.storage_units_t, "p") \
-            and not n.storage_units_t.p.empty:
-        sto_p = n.storage_units_t.p
-        for su_name in sto_p.columns:
-            if su_name in n.storage_units.index:
+    # --- Speicher (nur Entladung = positive p) ---
+    if (hasattr(n, "storage_units_t") and hasattr(n.storage_units_t, "p")
+            and not n.storage_units_t.p.empty):
+        sto_p = n.storage_units_t.p.clip(lower=0)
+        ws = _weighted_sum(sto_p, n)
+        for su_name, val in ws.items():
+            if su_name in n.storage_units.index and val > 0:
                 carrier = n.storage_units.loc[su_name, "carrier"]
-                result[carrier] = result.get(carrier, 0.0) + sto_p[su_name].clip(lower=0).sum()
+                result[carrier] = result.get(carrier, 0.0) + val
+
+    # FIX B: Links — p1 ist aus Link-Sicht negativ wenn Strom ins Netz fließt.
+    # abs(p1) liefert die tatsächlich eingespeiste Leistung.
+    if (hasattr(n, "links_t") and hasattr(n.links_t, "p1")
+            and not n.links_t.p1.empty and not n.links.empty):
+        # Nur Strom-erzeugende Links (bus1 = AC-Stromnetz)
+        gen_links = n.links[n.links.carrier.isin(LINK_GEN_CARRIERS)]
+        avail = n.links_t.p1.columns.intersection(gen_links.index)
+        if not avail.empty:
+            link_p = n.links_t.p1[avail].abs()
+            ws = _weighted_sum(link_p, n)
+            for lk_name, val in ws.items():
+                if lk_name in gen_links.index and val > 0:
+                    carrier = gen_links.loc[lk_name, "carrier"]
+                    result[carrier] = result.get(carrier, 0.0) + val
 
     # MWh → TWh
-    dt = n.snapshot_weightings.generators.values[0] if not n.snapshot_weightings.empty else 1.0
-    return pd.Series({k: v * dt / 1e6 for k, v in result.items()})
+    return pd.Series({k: v / 1e6 for k, v in result.items()})
 
 
-def _extract_system_cost(
-    n: pypsa.Network,
-) -> float:
-    """Gesamtsystemkosten [Mrd. EUR] — Summe aller Kapitalkosten + variable Kosten."""
+def _extract_system_cost(n: pypsa.Network) -> float:
+    """Gesamtsystemkosten [Mrd. EUR] — Kapitalkosten + variable Kosten."""
     total = 0.0
     try:
-        # Kapitalkosten
         for comp_name in ("generators", "storage_units", "links", "lines"):
             comp = getattr(n, comp_name)
             if comp.empty:
                 continue
             if "capital_cost" in comp.columns and "p_nom_opt" in comp.columns:
                 total += (comp["capital_cost"] * comp["p_nom_opt"]).sum()
-        # Variable Kosten (approx über generators_t.p und marginal_cost)
+
+        # Variable Kosten Generatoren
         if not n.generators_t.p.empty:
-            mc = n.generators.get("marginal_cost", pd.Series(0, index=n.generators.index))
-            dt = n.snapshot_weightings.generators.values[0] if not n.snapshot_weightings.empty else 1.0
-            total += (n.generators_t.p.multiply(mc, axis=1).sum().sum() * dt)
+            mc = n.generators.get(
+                "marginal_cost",
+                pd.Series(0.0, index=n.generators.index),
+            )
+            # FIX A: gewichtete Summe statt einfache Summe × dt
+            weighted_p = _weighted_sum(n.generators_t.p, n)
+            total += (weighted_p * mc.reindex(weighted_p.index, fill_value=0.0)).sum()
+
     except Exception:
         pass
     return total / 1e9  # EUR → Mrd. EUR
 
 
-def _capacity_factor(
-    n: pypsa.Network,
-) -> float:
-    """Mittlerer Kapazitätsfaktor der VRE-Generatoren."""
+def _capacity_factor(n: pypsa.Network) -> float:
+    """
+    Mittlerer Kapazitätsfaktor der VRE-Generatoren.
+
+    FIX C: _weighted_sum() statt values[0]-Skalierung.
+    """
     vre_carriers = {"solar", "solar rooftop", "onwind", "offwind-ac", "offwind-dc", "ror"}
     try:
         mask = n.generators["carrier"].isin(vre_carriers)
         gens = n.generators[mask]
         if gens.empty or n.generators_t.p.empty:
             return float("nan")
+
         vre_cols = [g for g in gens.index if g in n.generators_t.p.columns]
         if not vre_cols:
             return float("nan")
-        dt = n.snapshot_weightings.generators.values[0] if not n.snapshot_weightings.empty else 1.0
-        p_nom_opt = gens.loc[vre_cols, "p_nom_opt"] if "p_nom_opt" in gens.columns else gens.loc[vre_cols, "p_nom"]
-        total_gen  = n.generators_t.p[vre_cols].sum().sum() * dt
-        total_cap  = p_nom_opt.sum() * len(n.snapshots) * dt
+
+        pcol = "p_nom_opt" if "p_nom_opt" in gens.columns else "p_nom"
+        p_nom_opt = gens.loc[vre_cols, pcol]
+
+        # FIX C: gewichtete Energie
+        total_gen = _weighted_sum(n.generators_t.p[vre_cols], n).sum()
+
+        # Maximale mögliche Energie = p_nom_opt × Summe der Zeitgewichte
+        total_hours = float(n.snapshot_weightings.generators.sum())
+        total_cap = p_nom_opt.sum() * total_hours
+
         return float(total_gen / total_cap) if total_cap > 0 else float("nan")
     except Exception:
         return float("nan")
@@ -158,7 +224,7 @@ def _capacity_factor(
 # ---------------------------------------------------------------------------
 
 def plot_annual_generation_stacked(
-    gen_data: Dict[str, pd.Series],   # {scenario_label → Series[carrier → TWh]}
+    gen_data: Dict[str, pd.Series],
     all_carriers: List[str],
     title: str,
     out_path: Path,
@@ -214,7 +280,7 @@ def plot_generation_heatmap(
     out_path: Path,
     save: bool = True,
 ) -> None:
-    """Heatmap: Zeilen = Carrier, Spalten = Szenarien (stress_xy), Werte = TWh."""
+    """Heatmap: Zeilen = Carrier, Spalten = Szenarien, Werte = TWh."""
     if not gen_data:
         return
 
@@ -223,12 +289,13 @@ def plot_generation_heatmap(
         {sl: [gen_data[sl].get(c, 0.0) for c in all_carriers] for sl in slabels},
         index=all_carriers,
     )
-    # Nur Carrier mit nennenswerter Erzeugung
     matrix = matrix.loc[matrix.max(axis=1) > 0.1]
     if matrix.empty:
         return
 
-    fig, ax = plt.subplots(figsize=(max(6, len(slabels) * 1.0 + 2), max(5, len(matrix) * 0.5 + 1)))
+    fig, ax = plt.subplots(
+        figsize=(max(6, len(slabels) * 1.0 + 2), max(5, len(matrix) * 0.5 + 1))
+    )
     im = ax.imshow(matrix.values, aspect="auto", cmap="YlOrRd")
 
     ax.set_xticks(range(len(slabels)))
@@ -240,7 +307,6 @@ def plot_generation_heatmap(
     cbar = plt.colorbar(im, ax=ax, fraction=0.03, pad=0.04)
     cbar.set_label("TWh", fontsize=9)
 
-    # Werte eintragen wenn Zellen groß genug
     if len(slabels) * len(matrix) <= 80:
         for i in range(len(matrix)):
             for j in range(len(slabels)):
@@ -262,13 +328,12 @@ def plot_generation_heatmap(
 # ---------------------------------------------------------------------------
 
 def plot_cf_vs_cost_scatter(
-    cf_data: Dict[str, float],      # {scenario_label → CF}
-    cost_data: Dict[str, float],    # {scenario_label → Mrd. EUR}
+    cf_data: Dict[str, float],
+    cost_data: Dict[str, float],
     title: str,
     out_path: Path,
     save: bool = True,
 ) -> None:
-    """Scatter: x = Kapazitätsfaktor, y = Systemkosten, beschriftet mit stress_xy."""
     slabels = list(cf_data.keys())
     xs = [cf_data[sl] for sl in slabels]
     ys = [cost_data.get(sl, float("nan")) for sl in slabels]
@@ -317,13 +382,11 @@ def run_annual_dispatch(
     ----------
     cost_dict : dict, optional
         {cutout_name → Kosten [Mrd. EUR/a]} aus aro_final_evaluation.all_costs.
-        Wird für den Scatter-Plot (CF vs. Systemkosten) genutzt.
         Falls None: Kosten werden aus den Netzwerken selbst berechnet.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Netzwerke zusammenstellen
     all_networks: Dict[str, pypsa.Network] = {}
     if n_robust is not None:
         all_networks["robust"] = n_robust
@@ -335,10 +398,8 @@ def run_annual_dispatch(
         print("  [annual_dispatch] Keine Netzwerke verfügbar.")
         return
 
-    # Kurzlabels
     label_map = build_scenario_label_map(list(all_networks.keys()))
 
-    # Daten extrahieren
     gen_data:  Dict[str, pd.Series] = {}
     cf_data:   Dict[str, float]     = {}
     cost_data: Dict[str, float]     = {}
@@ -347,8 +408,6 @@ def run_annual_dispatch(
         slabel = label_map[full_name]
         gen_data[slabel]  = _extract_annual_generation(n)
         cf_data[slabel]   = _capacity_factor(n)
-        # Kosten: aus cost_dict bevorzugen (direkter ARO-Summary-Wert),
-        # sonst aus Netzwerk berechnen
         if cost_dict and full_name in cost_dict:
             cost_data[slabel] = float(cost_dict[full_name])
         else:
@@ -381,7 +440,6 @@ def run_annual_dispatch(
     )
 
     # Plot 3: Scatter
-    # Titel mit Hinweis ob Kosten aus Summary oder Netzwerk kommen
     cost_source = "ARO-Summary" if cost_dict else "berechnet aus Netzwerk"
     plot_cf_vs_cost_scatter(
         cf_data=cf_data,

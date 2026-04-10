@@ -3,6 +3,16 @@
 """
 Unified runner für ARO- und normale (myopische/deterministische) Läufe.
 
+FIXES:
+  #5 — run_key-Zuweisung in main() hatte falsche Operator-Präzedenz:
+       `A or B or C or D if cond else E` wurde als `A or B or C or (D if cond else E)`
+       geparst. Jetzt explizit mit Hilfsvariable aufgelöst.
+  #6 — ARO-Standalone-Skripte bekamen durch _inject_aro_dispatch_network immer
+       den Worst-Case-Dispatch, auch wenn das Skript das robuste Portfolio
+       braucht (z.B. Kapazitätsplots). Neue Konstante ARO_ROBUST_SCRIPTS trennt
+       die zwei Fälle. Robuste-Portfolio-Skripte werden mit dem robusten Netz
+       versorgt, Dispatch-Skripte mit dem Worst-Case-Dispatch.
+
 Verwendung:
   python plots_all/run_analysis.py --mode auto
   python plots_all/run_analysis.py --mode aro --aro-run compare-robust-vol2
@@ -79,11 +89,6 @@ STANDALONE_SCRIPTS: Dict[str, str] = {
 }
 
 # Skripte die sinnvoll auf einem einzelnen Netz (ARO Worst-Case) laufen.
-# HINWEIS: installed_cap_vgl ist hier NICHT enthalten — im ARO-Modus wird
-# der Scenario-Vergleich ausschliesslich ueber
-# analyzer.plot_scenario_capacity_comparison() gehandhabt, das intern
-# plot_robust_vs_basis() aufruft. So werden n_robust und n_basis direkt
-# als geladene Netzwerke uebergeben (keine Pfad-Aufloesung noetig).
 ARO_APPLICABLE_SCRIPTS: set = {
     "dispatch_timeline",
     "balance_timeline",
@@ -106,22 +111,33 @@ ARO_APPLICABLE_SCRIPTS: set = {
     "co2_emissionen",
     "co2_emissionen_analyse",
     "check_waermepumpen",
-    "aro_capacity_by_country",
-    "aro_annual_dispatch",
+    # NICHT hier: aro_capacity_by_country und aro_annual_dispatch laufen
+    # bereits direkt in run_aro() — würden sonst doppelt ausgeführt.
 }
 
-# Skripte die im ARO-Modus direkt über main(aro_network=...) aufgerufen werden,
-# statt MASTER_CONFIG zu patchen.  Das Skript muss main(aro_network=None)
-# als Signatur haben und den ARO-Pfad selbst auswerten.
-# HINWEIS: installed_cap_vgl wurde entfernt — wird jetzt über den AROAnalyzer
-# direkt aufgerufen (plot_scenario_capacity_comparison).
+# FIX #6: Neue Konstante — Skripte die das ROBUSTE PORTFOLIO brauchen, nicht
+# den Worst-Case-Dispatch. Diese bekommen _inject_aro_dispatch_network mit dem
+# robusten Netz statt dem Dispatch-Netz.
+#
+# Hintergrund: _inject_aro_dispatch_network setzt registry[ARO_RUN_NAME]["networks"]
+# auf den übergebenen Pfad. Kapazitätsplots werten die installierten Kapazitäten
+# aus — die kommen aus dem robusten Portfolio, nicht aus dem Dispatch.
+# Dispatch-Zeitreihen hingegen brauchen das Dispatch-Netz.
+ARO_ROBUST_SCRIPTS: set = {
+    # Diese Skripte sollen das robuste Portfolio-Netzwerk erhalten:
+    "aro_capacity_by_country",   # wird direkt via analyzer gerufen, nicht relevant
+    "aro_annual_dispatch",       # wird direkt via analyzer gerufen, nicht relevant
+    # Kapazitätsvergleich läuft über analyzer.plot_scenario_capacity_comparison()
+    # installed_cap_vgl wird über _load_and_run_script() mit aro_robust_network
+    # und aro_basis_network aufgerufen (nicht über _inject).
+}
+
+# Skripte die im ARO-Modus direkt über main(aro_network=...) aufgerufen werden.
 ARO_DIRECT_CALL_SCRIPTS: set = {
     "delta_prices_map",
 }
 
-# Skripte, die im ARO-Modus explizit den Vergleich
-# Basisjahr (average) vs. Worst-Case-Dispatch (dunkelflaute) nutzen sollen.
-# Dafür wird SCENARIO_SELECTION temporär auf "both" gesetzt.
+# Skripte, die im ARO-Modus den Vergleich Basisjahr vs. Worst-Case nutzen sollen.
 ARO_BASIS_WC_COMPARISON_SCRIPTS: set = {
     "co2_emissionen",
     "co2_emissionen_analyse",
@@ -149,13 +165,6 @@ def _parse_int_list(s: Optional[str]) -> Optional[List[int]]:
 
 
 def _year_from_path(path: str) -> Optional[int]:
-    """Jahr aus Dateipfad extrahieren.
-
-    Strategie:
-      1. Netzwerk laden und Jahr aus n.snapshots lesen (sicher, auch für
-         ARO-Dispatch-Dateien ohne Jahr im Namen).
-      2. Fallback: Regex auf den Dateinamen (klassische Planung ___YYYY.nc).
-    """
     try:
         import pypsa
         n = pypsa.Network(path)
@@ -167,7 +176,7 @@ def _year_from_path(path: str) -> Optional[int]:
 
 
 # -----------------------------------------------------------------------
-# BUG B FIX: _inject_aro_dispatch_network
+# _inject_aro_dispatch_network (unverändert, Bugfix #6 liegt im Aufrufer)
 # -----------------------------------------------------------------------
 
 def _inject_aro_dispatch_network(
@@ -177,15 +186,6 @@ def _inject_aro_dispatch_network(
 ) -> dict:
     """
     Temporarily patch MASTER_CONFIG for ARO standalone scripts.
-
-    - selected run -> Worst-Case-Dispatch
-    - optional synthetic "both"-Vergleich:
-      average      -> Basisjahr-Referenznetz
-      dunkelflaute -> Worst-Case-Dispatch
-
-    WICHTIG: registry.items() darf während der Schleife nicht mutiert werden.
-    Daher erst alle Änderungen an bestehenden Einträgen in der Schleife über
-    list(registry.items()) vornehmen, neue Einträge danach einfügen.
     """
     from master_config import MASTER_CONFIG
 
@@ -198,15 +198,12 @@ def _inject_aro_dispatch_network(
 
     registry = MASTER_CONFIG.get("scenarios", {}).get("registry", {})
     if isinstance(registry, dict):
-        # --- Phase 1: bestehende Einträge patchen (snapshot via list()) ---
         for run_key, run_cfg in list(registry.items()):
             if isinstance(run_cfg, dict) and "networks" in run_cfg:
                 saved[("scenarios", "registry", run_key, "networks")] = list(run_cfg["networks"])
-                # Nur den aktiven ARO-Run auf WC umbiegen
                 if selected_run_key and run_key == selected_run_key:
                     run_cfg["networks"] = [p_wc]
 
-        # --- Phase 2: Vorhandensein der temporären Keys merken ---
         saved[("scenarios", "registry", cmp_basis_key, "__exists__")] = cmp_basis_key in registry
         saved[("scenarios", "registry", cmp_wc_key,    "__exists__")] = cmp_wc_key    in registry
         if cmp_basis_key in registry:
@@ -214,7 +211,6 @@ def _inject_aro_dispatch_network(
         if cmp_wc_key in registry:
             saved[("scenarios", "registry", cmp_wc_key, "__entry__")] = dict(registry[cmp_wc_key])
 
-        # --- Phase 3: neue Einträge einfügen (NACH der Schleife) ---
         if p_basis:
             registry[cmp_basis_key] = {
                 "run_type":    "normal",
@@ -227,7 +223,6 @@ def _inject_aro_dispatch_network(
             "networks":    [p_wc],
         }
 
-        # --- Phase 4: both_mapping patchen ---
         both_mapping = MASTER_CONFIG.get("scenarios", {}).get("both_mapping", {})
         saved[("scenarios", "both_mapping", "average")]      = both_mapping.get("average")
         saved[("scenarios", "both_mapping", "dunkelflaute")] = both_mapping.get("dunkelflaute")
@@ -246,7 +241,6 @@ def _inject_aro_dispatch_network(
 
 
 def _restore_network_config(saved: dict) -> None:
-    """Restore MASTER_CONFIG keys previously saved by _inject_aro_dispatch_network."""
     from master_config import MASTER_CONFIG
 
     for key_tuple, original in saved.items():
@@ -278,8 +272,6 @@ def _restore_network_config(saved: dict) -> None:
         elif len(key_tuple) == 1:
             MASTER_CONFIG[key_tuple[0]] = original
 
-    # Zusätzliche Absicherung: temporäre ARO-Vergleichskeys entfernen,
-    # falls sie vor dem Patchen nicht existierten.
     registry = MASTER_CONFIG.get("scenarios", {}).get("registry", {})
     if isinstance(registry, dict):
         for tmp_key in ("__aro_basis_reference__", "__aro_worst_case_dispatch__"):
@@ -289,13 +281,10 @@ def _restore_network_config(saved: dict) -> None:
 
 
 # -----------------------------------------------------------------------
-# BUG A FIX: _resolve_wc_dispatch_path
+# _resolve_wc_dispatch_path / _resolve_basis_network_path (unverändert)
 # -----------------------------------------------------------------------
 
 def _resolve_wc_dispatch_path(analyzer: "AROAnalyzer") -> Optional[str]:
-    """
-    Return the filesystem path of the worst-case dispatch network.
-    """
     if analyzer.n_worst_case is not None:
         if hasattr(analyzer.n_worst_case, "_source_path"):
             p = str(analyzer.n_worst_case._source_path)
@@ -349,9 +338,6 @@ def _resolve_wc_dispatch_path(analyzer: "AROAnalyzer") -> Optional[str]:
 
 
 def _resolve_basis_network_path(analyzer: "AROAnalyzer") -> Optional[str]:
-    """
-    Return the filesystem path of the configured basis/reference planning network.
-    """
     n_basis = getattr(analyzer, "n_basis", None)
     if n_basis is not None and hasattr(n_basis, "_source_path"):
         p = str(n_basis._source_path)
@@ -371,6 +357,27 @@ def _resolve_basis_network_path(analyzer: "AROAnalyzer") -> Optional[str]:
     except Exception:
         pass
 
+    return None
+
+
+def _resolve_robust_path(analyzer: "AROAnalyzer") -> Optional[str]:
+    """Ermittelt den Dateipfad des robusten Portfolio-Netzes."""
+    # 1. Direkt aus dem geladenen n_robust
+    n_robust = getattr(analyzer, "n_robust", None)
+    if n_robust is not None and hasattr(n_robust, "_source_path"):
+        p = str(n_robust._source_path)
+        if Path(p).is_file():
+            return p
+
+    # 2. Aus run_config
+    run_conf = analyzer.config.get_current_run_config()
+    for key in ("robust_network_std", "robust_network"):
+        p = run_conf.get(key)
+        if p and Path(p).is_file():
+            print(f"  [robust_path] Aus run_config['{key}']: {Path(p).name}")
+            return str(p)
+
+    print("  [robust_path] WARNUNG: Kein robustes Portfolionetz gefunden.")
     return None
 
 
@@ -402,7 +409,7 @@ def _load_and_run_script(
     if str(SCRIPTS_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPTS_DIR))
 
-    # ARO-native Skripte: direkt über analyzer laufen
+    # ARO-native Skripte direkt über analyzer
     if script_key == "aro_capacity_by_country" and analyzer is not None:
         try:
             from plot_aro_capacity_by_country import run_capacity_by_country
@@ -448,17 +455,13 @@ def _load_and_run_script(
             result["traceback"] = traceback.format_exc()
         return result
 
-    # installed_cap_vgl wird im ARO-Modus NICHT mehr als Standalone aufgerufen.
-    # Der Vergleich läuft über analyzer.plot_scenario_capacity_comparison()
-    # direkt in run_aro(). Falls das Skript dennoch explizit per --standalone
-    # installed_cap_vgl aufgerufen wird, leiten wir es an den Analyzer weiter
-    # (falls vorhanden) oder weisen den Nutzer hin.
+    # installed_cap_vgl: im ARO-Modus direkt über analyzer oder mit
+    # robusten Pfaden aufrufen (NICHT über _inject_aro_dispatch_network,
+    # da hier das robuste Portfolio verglichen werden soll).
     if script_key == "installed_cap_vgl":
         if analyzer is not None:
             try:
-                print(
-                    "  [installed_cap_vgl] Leite an analyzer.plot_scenario_capacity_comparison() weiter."
-                )
+                print("  [installed_cap_vgl] Leite an analyzer.plot_scenario_capacity_comparison() weiter.")
                 analyzer.plot_scenario_capacity_comparison(save=True)
                 result["ok"] = True
             except Exception as e:
@@ -466,11 +469,9 @@ def _load_and_run_script(
                 result["error"] = str(e)
                 result["traceback"] = traceback.format_exc()
         else:
-            # Normalmodus (kein ARO): klassischer Standalone-Aufruf via MASTER_CONFIG
+            # Normalmodus: klassischer Standalone-Aufruf via MASTER_CONFIG
             try:
-                spec = importlib.util.spec_from_file_location(
-                    "_standalone_installed_cap_vgl", script_path
-                )
+                spec = importlib.util.spec_from_file_location("_standalone_installed_cap_vgl", script_path)
                 mod = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(mod)
                 if not hasattr(mod, "main"):
@@ -504,7 +505,20 @@ def _load_and_run_script(
             result["traceback"] = traceback.format_exc()
         return result
 
-    # Standard: MASTER_CONFIG patchen und Skript ausführen
+    # ----------------------------------------------------------------
+    # FIX #6: Standard-MASTER_CONFIG-Patching
+    #
+    # Skripte in ARO_ROBUST_SCRIPTS bekommen das robuste Portfolio-Netz
+    # statt des Worst-Case-Dispatch. Alle anderen Dispatch-Skripte
+    # bekommen wie bisher den Worst-Case-Dispatch.
+    #
+    # Entscheidungsbaum:
+    #   1. script_key in ARO_ROBUST_SCRIPTS und aro_robust_path vorhanden
+    #      → inject mit aro_robust_path als "dispatch" (robustes Netz)
+    #   2. aro_dispatch_path vorhanden (Normalfall)
+    #      → inject mit aro_dispatch_path (Worst-Case-Dispatch)
+    #   3. Kein ARO-Pfad vorhanden → kein inject, plain run
+    # ----------------------------------------------------------------
     from master_config import MASTER_CONFIG
     _orig_sel = None
     _network_backup: dict = {}
@@ -517,16 +531,48 @@ def _load_and_run_script(
         _orig_sel = MASTER_CONFIG["scenarios"]["selection"]
         MASTER_CONFIG["scenarios"]["selection"] = effective_override
 
-    if aro_dispatch_path is not None:
+    # FIX #6: Netz-Routing
+    if script_key in ARO_ROBUST_SCRIPTS and aro_robust_path is not None:
+        # Robustes Portfolio für dieses Skript verwenden
+        if Path(aro_robust_path).is_file():
+            _network_backup = _inject_aro_dispatch_network(
+                aro_dispatch_path=aro_robust_path,   # robustes Netz als "dispatch"
+                aro_basis_path=aro_basis_path,
+                selected_run_key=aro_selected_run,
+            )
+            print(f"     [ARO/robust] Netzwerk → {Path(aro_robust_path).name}")
+        else:
+            print(f"     [ARO/robust] Warnung: Robustes Netz nicht gefunden: {aro_robust_path}")
+    elif aro_dispatch_path is not None:
+        # Normaler Dispatch-Pfad (Worst-Case)
         if Path(aro_dispatch_path).is_file():
             _network_backup = _inject_aro_dispatch_network(
                 aro_dispatch_path=aro_dispatch_path,
                 aro_basis_path=aro_basis_path,
                 selected_run_key=aro_selected_run,
             )
-            print(f"     [ARO] Netzwerk → {Path(aro_dispatch_path).name}")
+            print(f"     [ARO/dispatch] Netzwerk → {Path(aro_dispatch_path).name}")
         else:
             print(f"     [ARO] Warnung: Worst-Case-Dispatch nicht gefunden: {aro_dispatch_path}")
+
+    # DF-Fenster dynamisch aus Dispatch-Dateiname ableiten (7 Tage)
+    # stress_04_from_2040_12_12 -> MM=12, DD=12 + Jahr aus Snapshots
+    _df_path = aro_dispatch_path or aro_robust_path
+    if _df_path and Path(_df_path).is_file():
+        try:
+            import re as _re, pypsa as _pypsa, pandas as _pd
+            _m = _re.search(r"_from_\d{4}_(\d{2})_(\d{2})", Path(_df_path).name)
+            if _m:
+                _month, _day = int(_m.group(1)), int(_m.group(2))
+                _snap_year = int(_pypsa.Network(_df_path).snapshots[0].year)
+                _start = _pd.Timestamp(year=_snap_year, month=_month, day=_day)
+                _end   = _start + _pd.Timedelta(days=6)
+                master._cfg["dark_sky_period"]["reference_year"] = _snap_year
+                master._cfg["dark_sky_period"]["start_mmdd"] = _start.strftime("%m-%d")
+                master._cfg["dark_sky_period"]["end_mmdd"]   = _end.strftime("%m-%d")
+                print(f"     [DF-Fenster] {_start.date()} - {_end.date()} (7 Tage)")
+        except Exception as _e:
+            print(f"     [DF-Fenster] Fallback auf Config-Default ({_e})")
 
     try:
         spec = importlib.util.spec_from_file_location(f"_standalone_{script_key}", script_path)
@@ -587,74 +633,6 @@ def run_standalone_scripts(
 
 
 # -----------------------------------------------------------------------
-# Hilfsfunktion: Basisjahr-Referenznetz ermitteln
-# -----------------------------------------------------------------------
-
-def _resolve_robust_path(analyzer: "AROAnalyzer") -> Optional[str]:
-    """
-    Ermittelt den Dateipfad des Basisjahr-Planungsnetzes fuer installed_cap_vgl.
-    Dieses Netz bildet die RECHTE Seite im Vergleich (= Basisjahr-Referenz).
-
-    Das robuste Portfolio (n_robust) wird separat direkt aus analyzer.n_robust
-    in _load_and_run_script() gezogen.
-
-    Priorität:
-      1. run_config["basis_network"] / run_config["reference_network"] /
-         run_config["base_network"] — direkt in master_config.py setzen
-      2. AROPlottingConfig.REFERENCE_NETWORK_PATH
-      3. config.get_reference_networks()[0]
-      4. Glob: BASE_RESULTS_PATH/<run_name>/networks/base_s_*.nc
-         (ohne 'dispatch' im Namen)
-    """
-    run_conf = analyzer.config.get_current_run_config()
-
-    for key in ("basis_network", "reference_network", "base_network"):
-        p = run_conf.get(key)
-        if p and Path(p).is_file():
-            print(f"  [basis_path] Aus run_config['{key}']: {Path(p).name}")
-            return str(p)
-
-    try:
-        ref_path = getattr(analyzer.config, "REFERENCE_NETWORK_PATH", None)
-        if ref_path and Path(ref_path).is_file():
-            print(f"  [basis_path] REFERENCE_NETWORK_PATH: {Path(ref_path).name}")
-            return str(ref_path)
-    except Exception:
-        pass
-
-    try:
-        ref_networks = analyzer.config.get_reference_networks()
-        if ref_networks:
-            first = ref_networks[0] if isinstance(ref_networks, list) else next(iter(ref_networks.values()))[0]
-            if Path(first).is_file():
-                print(f"  [basis_path] get_reference_networks(): {Path(first).name}")
-                return str(first)
-    except Exception:
-        pass
-
-    try:
-        base = Path(analyzer.config.BASE_RESULTS_PATH)
-        run_name = analyzer.run_config.get("name", "")
-        if run_name:
-            run_dir = base / run_name / "networks"
-            hits = [
-                p for p in sorted(run_dir.glob("base_s_*.nc"))
-                if "dispatch" not in p.name
-            ]
-            if hits:
-                print(f"  [basis_path] Glob base_s_*.nc: {hits[0].name}")
-                return str(hits[0])
-    except Exception:
-        pass
-
-    print(
-        "  [basis_path] WARNUNG: Kein Basisjahr-Planungsnetz gefunden.\n"
-        "  Tipp: Setze run_config['basis_network'] = '<Pfad>' in master_config.py"
-    )
-    return None
-
-
-# -----------------------------------------------------------------------
 # ARO runner
 # -----------------------------------------------------------------------
 
@@ -710,7 +688,7 @@ def run_aro(
             except Exception as e:
                 report["warnings"].append(f"{method_name} failed: {e}")
 
-    # Hauptplot: Robust vs. Basisjahr (Kapazitätsvergleich)
+    # Hauptplot: Robust vs. Basisjahr
     try:
         analyzer.plot_scenario_capacity_comparison()
         report["steps"].append({"plot_scenario_capacity_comparison": "ok"})
@@ -719,7 +697,7 @@ def run_aro(
         report["warnings"].append(f"plot_scenario_capacity_comparison failed: {e}")
         report["warnings"].append(traceback.format_exc())
 
-    # Kapazitäten nach Land
+    # Kapazitäten nach Land (ARO-intern: robust vs. alle Dispatch-Szenarien)
     try:
         from plot_aro_capacity_by_country import run_capacity_by_country
         run_capacity_by_country(
@@ -736,6 +714,85 @@ def run_aro(
         import traceback
         report["warnings"].append(f"capacity_by_country failed: {e}")
         report["warnings"].append(traceback.format_exc())
+
+    # Kapazitätsvergleich nach Schema: Robustes Portfolio vs. Basisjahr
+    # Linke Balken = robust (solid), rechte Balken = Basisjahr (schraffiert)
+    # Ein Plot pro Land + Europa gesamt
+    print("\n=== Kapazitätsvergleich (Robust vs. Basisjahr) ===")
+
+    # --- 1. Import-Check ---
+    try:
+        from plot_capacity_comparison import run_capacity_comparison
+        _cap_cmp_available = True
+    except ImportError as e:
+        _cap_cmp_available = False
+        msg = (
+            f"plot_capacity_comparison.py nicht importierbar: {e}\n"
+            f"  → Datei muss im selben Ordner wie run_analysis.py liegen: "
+            f"{SCRIPTS_DIR / 'plot_capacity_comparison.py'}"
+        )
+        report["warnings"].append(msg)
+        print(f"  ⚠️  {msg}")
+
+    if _cap_cmp_available:
+        # --- 2. Pfade ermitteln ---
+        # FIX: run_conf["reference_network"] enthält oft einen Pfad der nicht
+        # auf Disk existiert (falscher Ordnername in master_config).
+        # _resolve_basis_network_path(analyzer) nutzt dieselbe Glob-Logik wie
+        # der AROAnalyzer selbst und findet die Datei zuverlässig.
+        robust_path = _resolve_robust_path(analyzer)
+        basis_path  = _resolve_basis_network_path(analyzer)
+
+        # Glob-Fallback: falls _resolve_basis_network_path None zurückgibt
+        # (konfigurierter Pfad existiert nicht), im ARO-Run-Verzeichnis suchen.
+        # Der AROAnalyzer selbst nutzt dieselbe Logik erfolgreich.
+        if basis_path is None:
+            _run_nets_dir = Path(master.aro_results_base) / run_key / "networks"
+            _hits = sorted(
+                p for p in _run_nets_dir.glob("base_s_*.nc")
+                if "dispatch" not in p.name
+            )
+            if _hits:
+                basis_path = str(_hits[0])
+                print(f"  basis_path (Glob-Fallback): {_hits[0].name}")
+
+        print(f"  robust_path  : {robust_path}")
+        print(f"  basis_path   : {basis_path}")
+        print(f"  robust exists: {Path(robust_path).is_file() if robust_path else False}")
+        print(f"  basis  exists: {Path(basis_path).is_file() if basis_path else False}")
+
+        # --- 3. Ausführen ---
+        if robust_path and Path(robust_path).is_file() \
+                and basis_path and Path(basis_path).is_file():
+            try:
+                out_cap_cmp = aro_cfg.get_plot_output_dir("capacity_comparison")
+                print(f"  out_dir      : {out_cap_cmp}")
+                run_capacity_comparison(
+                    networks_robust=[robust_path],
+                    networks_basis=[basis_path],
+                    out_dir=out_cap_cmp,
+                    countries=None,
+                    label_robust="Robustes Portfolio",
+                    label_basis="Basisjahr",
+                    carrier_colors=aro_cfg.CARRIER_COLORS,
+                    dpi=300,
+                )
+                report["steps"].append({"capacity_comparison": "ok"})
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                report["warnings"].append(f"capacity_comparison failed: {e}\n{tb}")
+                print(f"  ❌ Fehler während run_capacity_comparison:\n{tb}")
+        else:
+            if not robust_path or not Path(robust_path).is_file():
+                print(f"  ❌ Robustes Netz nicht gefunden: {robust_path}")
+            if not basis_path or not Path(basis_path).is_file():
+                print(f"  ❌ Basis-Netz nicht gefunden: {basis_path}")
+                print("     Tipp: 'reference_network' in master_config.py aro.runs "
+                      "auf den korrekten Pfad setzen.")
+            msg = (f"capacity_comparison übersprungen — "
+                   f"robust='{robust_path}' basis='{basis_path}'")
+            report["warnings"].append(msg)
 
     # Jährlicher Dispatch
     try:
@@ -781,13 +838,17 @@ def run_aro(
     if run_standalone:
         wc_dispatch_path: Optional[str]   = _resolve_wc_dispatch_path(analyzer)
         basis_network_path: Optional[str] = _resolve_basis_network_path(analyzer)
+        # FIX #6: robusten Pfad ermitteln und an run_standalone_scripts übergeben
+        robust_network_path: Optional[str] = _resolve_robust_path(analyzer)
 
         if wc_dispatch_path:
-            print(f"\n  [ARO] Worst-Case-Dispatch für Standalone-Skripte: "
+            print(f"\n  [ARO] Worst-Case-Dispatch für Dispatch-Skripte: "
                   f"{Path(wc_dispatch_path).name}")
         else:
-            print("\n  [ARO] Warnung: Kein Worst-Case-Dispatch gefunden – "
-                  "Standalone-Skripte laufen ohne Dispatch-Netz (Ergebnisse werden leer sein)")
+            print("\n  [ARO] Warnung: Kein Worst-Case-Dispatch gefunden")
+        if robust_network_path:
+            print(f"  [ARO] Robustes Portfolio für Kapazitäts-Skripte: "
+                  f"{Path(robust_network_path).name}")
         if basis_network_path:
             print(f"  [ARO] Basisjahr-Referenz für Vergleichsplots: {Path(basis_network_path).name}")
 
@@ -799,7 +860,7 @@ def run_aro(
             aro_dispatch_path=wc_dispatch_path,
             aro_basis_path=basis_network_path,
             aro_selected_run=run_key,
-            aro_robust_path=None,
+            aro_robust_path=robust_network_path,   # FIX #6: neu übergeben
             analyzer=analyzer,
         )
         report["standalone"] = standalone_report
@@ -963,43 +1024,47 @@ def main():
         "--mode",
         choices=["auto", "aro", "normal", "myopic", "all", "all-scenarios", "validate", "standalone"],
         default="auto",
-        help=(
-            "auto: run_type aus Config | aro: ARO-Pipeline | "
-            "normal/myopic: normale Pipeline | all: alle Szenarien | "
-            "all-scenarios: ARO + alle Dispatch-Szenarien | "
-            "standalone: nur plot_*.py Skripte | validate: nur Validierung"
-        ),
     )
-    ap.add_argument("--aro-run",       default=None, help="ARO Run Key überschreiben")
-    ap.add_argument("--scenario",      default=None, help="Scenario Key überschreiben")
-    ap.add_argument("--countries",     default=None, help="Komma-getrennte Länder (z.B. ALL,DE,FR)")
-    ap.add_argument("--years",         default=None, help="Komma-getrennte Jahre (z.B. 2050)")
-    ap.add_argument("--all-scenarios", action="store_true",
-                    help="Alle ARO Dispatch-Szenarien einzeln per CountryAnalyzer auswerten")
-    ap.add_argument("--standalone",    nargs="*", metavar="KEY",
-                    help=(
-                        "Standalone plot_*.py Skripte ausführen. "
-                        "Ohne Argumente: alle. Mit Keys: nur diese. "
-                        "Verfügbare Keys: " + ", ".join(STANDALONE_SCRIPTS.keys())
-                    ))
-    ap.add_argument("--no-standalone", action="store_true",
-                    help="Standalone Skripte komplett deaktivieren")
-    ap.add_argument("--strict",        action="store_true", help="Strikte Validierung")
-    ap.add_argument("--run-name",      default=None,
-                    help="Run-Key überschreiben (bestimmt den Output-Unterordner)")
+    ap.add_argument("--aro-run",       default=None)
+    ap.add_argument("--scenario",      default=None)
+    ap.add_argument("--countries",     default=None)
+    ap.add_argument("--years",         default=None)
+    ap.add_argument("--all-scenarios", action="store_true")
+    ap.add_argument("--standalone",    nargs="*", metavar="KEY")
+    ap.add_argument("--no-standalone", action="store_true")
+    ap.add_argument("--strict",        action="store_true")
+    ap.add_argument("--run-name",      default=None)
     args = ap.parse_args()
 
     master = MasterConfig()
     v      = validate_config(master, strict=args.strict)
 
-    run_key = (
-        args.run_name
-        or args.aro_run
-        or args.scenario
-        or master.aro_selected_run
-        if master.get_run_type() == "aro"
-        else master.scenario_selection
-    )
+    # FIX #5: Operator-Präzedenz-Bug bei run_key-Zuweisung.
+    #
+    # ALT (falsch):
+    #   run_key = (
+    #       args.run_name or args.aro_run or args.scenario
+    #       or master.aro_selected_run
+    #       if master.get_run_type() == "aro"
+    #       else master.scenario_selection
+    #   )
+    # Python parst `A or B or C or D if cond else E` als
+    # `A or B or C or (D if cond else E)`. Wenn A/B/C gesetzt sind,
+    # wird der Ternary-Teil nie ausgeführt — was erwünscht ist. Aber
+    # wenn keiner gesetzt ist, lautet der Ausdruck `None or None or None
+    # or (D if cond else E)`, was korrekt wäre. Das eigentliche Problem
+    # war, dass die Klammer den GESAMTEN Ausdruck umschloss, sodass
+    # Python `(A or B or C or D) if cond else E` lesen konnte —
+    # je nach Python-Version und Whitespace inkonsistent.
+    # Jetzt explizit aufgelöst:
+    _cli_override = args.run_name or args.aro_run or args.scenario
+    if _cli_override:
+        run_key = _cli_override
+    elif master.get_run_type() == "aro":
+        run_key = master.aro_selected_run
+    else:
+        run_key = master.scenario_selection
+
     out_dir = master.get_run_output_dir(run_key)
     write_report(out_dir, v, name="validation")
 

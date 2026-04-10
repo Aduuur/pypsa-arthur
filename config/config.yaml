@@ -102,7 +102,7 @@ robust:
       threads: 40         # 80 von 246 Kernen fuer Master
       method: 2          # Barrier
       crossover: 0
-      BarConvTol: 1.0e-4
+      BarConvTol: 1.0e-3
       Seed: 123
       AggFill: 0
       PreDual: 0

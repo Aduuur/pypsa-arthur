@@ -24,19 +24,18 @@ Erzeugte Plots (pro Land):
   8. Mittlere Strom-Grenzpreise [EUR/MWh] -- grouped bar je Land
   9. Delta-Kapazität (run_B - run_A) [GW] -- Divergenzbalken
 
+FIXES:
+  #3 — bottoms-Array in plot_installed_capacity() war 1D und wurde über alle
+       Runs akkumuliert (Run 1 startete auf Höhe von Run 0). Jetzt 2D:
+       bottoms[run_idx, year_idx] — jeder Run hat seinen eigenen Stack.
+  #7 — COMPARE_SPECS war leer. Jetzt mit sinnvollen Defaults aus master_config
+       (REF_RUN_NAME vs. ARO_RUN_NAME) vorbelegt. Anpassen nach Bedarf.
+
 Aufruf:
-  # Einfachste Variante: COMPARE_SPECS in diesem Skript konfigurieren
   python plot_cross_run_comparison.py
-
-  # Oder via CLI:
   python plot_cross_run_comparison.py \\
-      --runs basis-run:Basis aro-run-v2:"ARO v2" aro-run-v3:"ARO v3" \\
-      --countries ALL DE FR \\
-      --year 2050 \\
-      --outdir /path/to/plots/comparison
-
-Konfiguration (inline):
-  Bearbeite den Block "USER CONFIGURATION" weiter unten.
+      --runs Basisrun-rcp45-2028:Basis big-aro-run-2:"ARO Robust" \\
+      --countries ALL DE FR --year 2050
 """
 
 from __future__ import annotations
@@ -58,28 +57,30 @@ import pypsa
 
 warnings.filterwarnings("ignore")
 
-from master_config import MasterConfig, MASTER_CONFIG
+from master_config import MasterConfig, MASTER_CONFIG, ARO_RUN_NAME, REF_RUN_NAME
 from run_loader import RunLoader, RunSpec
 
 
 # ============================================================================
 # ███  USER CONFIGURATION  ███
 # ============================================================================
-# Trage hier die zu vergleichenden Runs ein.
+# FIX #7: COMPARE_SPECS war leer → Skript brach ohne CLI-Argumente sofort ab.
+# Jetzt mit Basis-Default aus master_config befüllt.
+# Anpassen auf eigene Run-Keys, oder leer lassen und --runs CLI nutzen.
+#
 # Format: {"key": "<run-key-aus-master_config>", "label": "<Anzeigename>"}
-# Für einen ARO-Run wird standardmäßig nur das robuste Netz geladen.
+# Für ARO-Run wird standardmäßig nur das robuste Netz geladen (kein Dispatch).
 # Setze "aro_include_scenarios": True um alle Worst-Case-Netze zu laden.
 #
 # Alternativ: direkter Pfad ohne master_config-Eintrag:
 # {"label": "Manuell", "paths": ["/abs/path/to/2050.nc"]}
 
 COMPARE_SPECS: List[Dict] = [
-    # Beispiel:
-    # {"key": "basis-run-2050",      "label": "Basis"},
-    # {"key": "aro-dark-sky-v2",     "label": "ARO Dunkelflaute"},
-    # {"key": "aro-rcp45",           "label": "ARO RCP4.5"},
-    # Oder direkt via Pfad:
-    # {"label": "Test", "paths": ["/home/endata/.../base_s_24___2050.nc"]},
+    {"key": REF_RUN_NAME, "label": "Basisjahr 2050"},
+    {"key": ARO_RUN_NAME, "label": "Robustes Portfolio", "aro_include_scenarios": False},
+    # Weitere Runs nach Bedarf ergänzen:
+    # {"key": "ein-weiterer-run", "label": "Run C"},
+    # {"label": "Manuell", "paths": ["/pfad/zu/netz.nc"]},
 ]
 
 # Länder ("ALL" = ganz Europa)
@@ -188,7 +189,6 @@ def _get_fs(master: MasterConfig) -> Dict[str, int]:
 def _country_bus_mask(n: pypsa.Network, country: str) -> pd.Index:
     """Bus-Indizes die zum Land gehören."""
     if country == "ALL":
-        # Alle echten Länderbuses, ohne EU
         valid = set(b[:2] for b in n.buses.index
                     if len(b) >= 2 and b[:2].isalpha() and b[:2].isupper() and b[:2] != "EU")
         return n.buses.index[n.buses.index.str[:2].isin(valid)]
@@ -196,7 +196,6 @@ def _country_bus_mask(n: pypsa.Network, country: str) -> pd.Index:
 
 
 def _translate(carrier: str) -> str:
-    # Solar aggregieren
     if "solar" in carrier.lower():
         return "Photovoltaik"
     if "biomass" in carrier.lower():
@@ -234,7 +233,6 @@ def extract_installed_capacity(n: pypsa.Network, country: str) -> pd.Series:
         cap = lks[pcol_l].copy()
         if eff_col:
             eff = lks[eff_col].fillna(1.0)
-            # Nur korrigieren wenn eff < 1 (elektrische Effizienz)
             needs_corr = eff < 0.99
             cap[needs_corr] = cap[needs_corr] * eff[needs_corr]
         parts.append(cap.groupby(lks.carrier).sum())
@@ -253,7 +251,6 @@ def extract_installed_capacity(n: pypsa.Network, country: str) -> pd.Series:
 
     raw = pd.concat(parts).groupby(level=0).sum() / 1000.0  # MW -> GW
 
-    # Aggregieren + Übersetzen
     clean: Dict[str, float] = {}
     for c, v in raw.items():
         name = _translate(c)
@@ -264,9 +261,7 @@ def extract_installed_capacity(n: pypsa.Network, country: str) -> pd.Series:
 
 
 def extract_storage_capacity(n: pypsa.Network, country: str) -> Tuple[pd.Series, pd.Series]:
-    """
-    Rückgabe: (power_GW, energy_GWh) je Technologie.
-    """
+    """Rückgabe: (power_GW, energy_GWh) je Technologie."""
     valid_buses = _country_bus_mask(n, country)
     pow_parts: List[pd.Series] = []
     ene_parts: List[pd.Series] = []
@@ -280,7 +275,6 @@ def extract_storage_capacity(n: pypsa.Network, country: str) -> Tuple[pd.Series,
         pow_parts.append(sus.groupby("carrier")[pcol].sum() / 1000.0)
         ene_parts.append(sus.groupby("carrier")[ecol].sum() / 1000.0)
 
-    # Stores (Batteries, H2)
     stores = n.stores.copy()
     if "bus" in stores.columns:
         stores = stores[stores.bus.isin(valid_buses)]
@@ -303,14 +297,10 @@ def extract_storage_capacity(n: pypsa.Network, country: str) -> Tuple[pd.Series,
 
 
 def extract_annual_generation(n: pypsa.Network, country: str) -> Tuple[pd.Series, float]:
-    """
-    Jährliche Stromerzeugung [TWh] + Nachfrage [TWh].
-    """
+    """Jährliche Stromerzeugung [TWh] + Nachfrage [TWh]."""
     valid_buses = _country_bus_mask(n, country)
-
     gen_parts: List[pd.Series] = []
 
-    # Generatoren
     gens = n.generators.copy()
     gens = gens[gens.bus.isin(valid_buses)]
     gens = gens[gens.carrier.isin(ELECTRICITY_GENERATORS)]
@@ -319,7 +309,6 @@ def extract_annual_generation(n: pypsa.Network, country: str) -> Tuple[pd.Series
         g_sum = n.generators_t.p[avail_g].sum().rename(gens.loc[avail_g, "carrier"])
         gen_parts.append(g_sum.groupby(level=0).sum())
 
-    # Storage discharge
     sus = n.storage_units.copy()
     sus = sus[sus.bus.isin(valid_buses)]
     sus = sus[~sus.bus.str.contains("EU", na=False)]
@@ -329,7 +318,6 @@ def extract_annual_generation(n: pypsa.Network, country: str) -> Tuple[pd.Series
         su_p = su_p.rename(sus.loc[avail_s, "carrier"])
         gen_parts.append(su_p.groupby(level=0).sum())
 
-    # Links p1 (output)
     lks = n.links.copy()
     lks_mask = lks.bus1.isin(valid_buses) if country != "ALL" else \
         lks.bus1.str[:2].apply(lambda x: len(x) == 2 and x.isalpha() and x.isupper() and x != "EU")
@@ -343,7 +331,7 @@ def extract_annual_generation(n: pypsa.Network, country: str) -> Tuple[pd.Series
     if not gen_parts:
         return pd.Series(dtype=float), 0.0
 
-    raw = pd.concat(gen_parts).groupby(level=0).sum() / 1e6  # MWh -> TWh
+    raw = pd.concat(gen_parts).groupby(level=0).sum() / 1e6
     clean: Dict[str, float] = {}
     for c, v in raw.items():
         name = _translate(c)
@@ -351,10 +339,8 @@ def extract_annual_generation(n: pypsa.Network, country: str) -> Tuple[pd.Series
     gen = pd.Series(clean)
     gen = gen[gen > 0.01]
 
-    # Nachfrage
     lds = n.loads.copy()
     lds_elec = lds[lds.bus.isin(valid_buses)]
-    # nur Strom-Loads (keine Wärme)
     lds_elec = lds_elec[~lds_elec.bus.str.contains("heat", case=False, na=False)]
     avail_d = n.loads_t.p.columns.intersection(lds_elec.index)
     demand = float(n.loads_t.p[avail_d].sum().sum() / 1e6) if not avail_d.empty else 0.0
@@ -363,15 +349,10 @@ def extract_annual_generation(n: pypsa.Network, country: str) -> Tuple[pd.Series
 
 
 def extract_system_cost(n: pypsa.Network, country: str) -> float:
-    """
-    Annualisierte Systemkosten [Mrd. EUR/a].
-    Summe aus: capital_cost * p_nom_opt + marginal_cost * dispatch.
-    Land-Filterung nur möglich wenn Buses bekannt.
-    """
+    """Annualisierte Systemkosten [Mrd. EUR/a]."""
     cost = 0.0
     valid_buses = _country_bus_mask(n, country)
 
-    # Generatoren
     gens = n.generators.copy()
     gens_c = gens[gens.bus.isin(valid_buses)]
     pcol = "p_nom_opt" if "p_nom_opt" in gens_c.columns else "p_nom"
@@ -384,7 +365,6 @@ def extract_system_cost(n: pypsa.Network, country: str) -> float:
             opex = (n.generators_t.p[avail] * mc).sum().sum()
         cost += capex + opex
 
-    # Links
     lks = n.links.copy()
     lks_c = lks[lks.bus1.isin(valid_buses)] if country != "ALL" else lks
     pcol_l = "p_nom_opt" if "p_nom_opt" in lks_c.columns else "p_nom"
@@ -392,18 +372,12 @@ def extract_system_cost(n: pypsa.Network, country: str) -> float:
         capex_l = (lks_c[pcol_l] * lks_c.get("capital_cost", pd.Series(0, index=lks_c.index))).sum()
         cost += capex_l
 
-    return cost / 1e9  # EUR -> Mrd. EUR
+    return cost / 1e9
 
 
 def extract_co2_emissions(n: pypsa.Network, country: str) -> float:
-    """
-    CO2-Emissionen [Mt CO2/a].
-    Nutzt GlobalConstraints oder berechnet aus Dispatch * emissions.
-    """
-    # Versuche aus GlobalConstraints (CO2 Limit)
-    # Stattdessen: Berechnung aus Dispatch
+    """CO2-Emissionen [Mt CO2/a]."""
     valid_buses = _country_bus_mask(n, country)
-
     co2_total = 0.0
     EMISSION_FACTORS: Dict[str, float] = {
         "coal": 0.34, "lignite": 0.40, "oil": 0.28,
@@ -417,15 +391,13 @@ def extract_co2_emissions(n: pypsa.Network, country: str) -> float:
         for c, ef in EMISSION_FACTORS.items():
             mask = gens_c.index[gens_c.carrier.str.contains(c, case=False)].intersection(avail)
             if len(mask) > 0:
-                co2_total += n.generators_t.p[mask].sum().sum() * ef / 1e6  # MWh * tCO2/MWh -> Mt
+                co2_total += n.generators_t.p[mask].sum().sum() * ef / 1e6
 
     return co2_total
 
 
 def extract_curtailment(n: pypsa.Network, country: str) -> Tuple[pd.Series, pd.Series]:
-    """
-    Rückgabe: (curtailed_TWh, curtailment_rate_pct) je VRE-Technologie.
-    """
+    """Rückgabe: (curtailed_TWh, curtailment_rate_pct) je VRE-Technologie."""
     valid_buses = _country_bus_mask(n, country)
     gens = n.generators.copy()
     gens_vre = gens[
@@ -454,21 +426,19 @@ def extract_curtailment(n: pypsa.Network, country: str) -> Tuple[pd.Series, pd.S
             p_nom = subset.loc[idx_pmax, pcol]
             potential = (n.generators_t.p_max_pu[idx_pmax] * p_nom).sum().sum()
         else:
-            potential = actual  # kein Curtailment messbar
+            potential = actual
 
         curt_twh = max(0.0, (potential - actual) / 1e6)
         rate_pct  = (curt_twh / (potential / 1e6) * 100.0) if potential > 0 else 0.0
         name = _translate(carrier)
         curtailed[name] = curtailed.get(name, 0.0) + curt_twh
-        rate[name]      = rate.get(name, 0.0) + rate_pct  # Näherung
+        rate[name]      = rate.get(name, 0.0) + rate_pct
 
     return pd.Series(curtailed), pd.Series(rate)
 
 
 def extract_marginal_prices(n: pypsa.Network, country: str) -> float:
-    """
-    Zeitlich gemittelter Grenzpreis [EUR/MWh] auf AC-Strombussen.
-    """
+    """Zeitlich gemittelter Grenzpreis [EUR/MWh] auf AC-Strombussen."""
     valid_buses = _country_bus_mask(n, country)
     elec_buses = valid_buses[
         ~valid_buses.str.contains("heat", case=False) &
@@ -488,14 +458,11 @@ def extract_marginal_prices(n: pypsa.Network, country: str) -> float:
 # ============================================================================
 
 def _carrier_color(tech: str, cc: Dict[str, str], default: str = "#aaaaaa") -> str:
-    # Direkt
     if tech in cc:
         return cc[tech]
-    # Rückübersetzung
     for eng, de in CARRIER_TRANSLATION.items():
         if de == tech and eng in cc:
             return cc[eng]
-    # Fuzzy
     tech_lower = tech.lower()
     for k, v in cc.items():
         if k.lower() in tech_lower or tech_lower in k.lower():
@@ -504,7 +471,6 @@ def _carrier_color(tech: str, cc: Dict[str, str], default: str = "#aaaaaa") -> s
 
 
 def _sort_techs(techs: List[str]) -> List[str]:
-    """Sortiert Technologien nach STACK_ORDER (unbekannte ans Ende)."""
     ordered = [t for t in STACK_ORDER if t in techs]
     rest    = [t for t in techs if t not in ordered]
     return ordered + rest
@@ -518,64 +484,9 @@ def _save(fig: plt.Figure, out_dir: Path, fname: str, dpi: int = 300) -> None:
     print(f"  ✅ {path}")
 
 
-def _make_grouped_bars(
-    ax: plt.Axes,
-    data: pd.DataFrame,           # index=Technologie, columns=Run-Labels
-    cc: Dict[str, str],
-    hatch_patterns: List[str],
-    bar_label_threshold: float = 0.0,
-    unit: str = "GW",
-    fs: Dict[str, int] = None,
-) -> None:
-    """
-    Gestapelte Balken für mehrere Runs nebeneinander.
-    data.columns = Run-Labels (je eine Gruppe).
-    """
-    fs = fs or {"bar_label": 9, "tick": 11, "label": 13}
-    runs   = list(data.columns)
-    n_runs = len(runs)
-    techs  = _sort_techs(list(data.index))
-    x      = np.arange(n_runs)
-    width  = 0.65
-    bottoms = np.zeros(n_runs)
-    TEXT_THR = bar_label_threshold
-
-    for tech in techs:
-        if tech not in data.index:
-            continue
-        vals = data.loc[tech, runs].values.astype(float)
-        colors = [_carrier_color(tech, cc)] * n_runs
-        hatches = hatch_patterns[:n_runs]
-        for i in range(n_runs):
-            ax.bar(
-                x[i], vals[i], width / n_runs if n_runs > 1 else width,
-                bottom=bottoms[i],
-                color=colors[i],
-                hatch=hatches[i],
-                edgecolor="white",
-                linewidth=0.4,
-                label=tech if i == 0 else "_nolegend_",
-            )
-            if vals[i] >= TEXT_THR and vals[i] > 0.01:
-                ax.text(
-                    x[i], bottoms[i] + vals[i] / 2,
-                    f"{int(round(vals[i]))}",
-                    ha="center", va="center",
-                    color="white", fontsize=fs["bar_label"],
-                    fontweight="bold",
-                )
-        bottoms += vals
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(runs, rotation=25, ha="right", fontsize=fs["tick"])
-    ax.set_ylabel(unit, fontsize=fs["label"])
-    ax.grid(axis="y", linestyle="--", alpha=0.4)
-    ax.set_axisbelow(True)
-
-
 def _stacked_bar_for_year(
     ax: plt.Axes,
-    data_per_run: Dict[str, pd.Series],  # {run_label: Series(tech -> value)}
+    data_per_run: Dict[str, pd.Series],
     cc: Dict[str, str],
     hatch_patterns: List[str],
     unit: str = "GW",
@@ -583,18 +494,13 @@ def _stacked_bar_for_year(
     fs: Dict[str, int] = None,
     demand_per_run: Optional[Dict[str, float]] = None,
 ) -> List[mpatches.Patch]:
-    """
-    Erzeugt gestapelte Balken nebeneinander (je Run ein Balken).
-    Analog zur Abbildung im angehängten Bild.
-    Gibt Legende-Handles zurück.
-    """
     fs = fs or {"bar_label": 9, "tick": 11, "label": 13, "title": 16}
     runs = list(data_per_run.keys())
     n_runs = len(runs)
     x = np.arange(n_runs)
     width = 0.6
 
-    all_techs = set()
+    all_techs: set = set()
     for s in data_per_run.values():
         all_techs.update(s.index.tolist())
     techs = _sort_techs(list(all_techs))
@@ -612,28 +518,17 @@ def _stacked_bar_for_year(
             continue
         color = _carrier_color(tech, cc)
         for i, (v, hatch) in enumerate(zip(vals, hatch_patterns[:n_runs])):
-            ax.bar(
-                x[i], v, width,
-                bottom=bottoms[i],
-                color=color,
-                hatch=hatch,
-                edgecolor="white",
-                linewidth=0.4,
-            )
+            ax.bar(x[i], v, width, bottom=bottoms[i], color=color,
+                   hatch=hatch, edgecolor="white", linewidth=0.4)
             if v >= TEXT_THR:
-                ax.text(
-                    x[i], bottoms[i] + v / 2,
-                    f"{int(round(v))}",
-                    ha="center", va="center",
-                    color="white", fontsize=fs["bar_label"],
-                    fontweight="bold",
-                )
+                ax.text(x[i], bottoms[i] + v / 2, f"{int(round(v))}",
+                        ha="center", va="center", color="white",
+                        fontsize=fs["bar_label"], fontweight="bold")
         bottoms += vals
         if tech not in seen_techs:
             seen_techs.append(tech)
             handles.append(mpatches.Patch(facecolor=color, label=tech))
 
-    # Nachfrage-Linien
     if demand_per_run:
         demands = [demand_per_run.get(r, 0.0) for r in runs]
         ax.plot(x, demands, "D--", color="#d63031", linewidth=1.8,
@@ -662,14 +557,14 @@ def plot_installed_capacity(
     target_year: Optional[int] = None,
 ) -> None:
     """
-    Installierte Kapazität analog Referenzbild:
-    Pro Run ein gestapelter Balken, alle Runs nebeneinander.
+    Installierte Kapazität: Pro Run ein gestapelter Balken, alle Runs nebeneinander.
     Bei mehrjährigen Runs: x-Achse = Jahr, Balken je Run daneben.
+
+    FIX #3: bottoms war 1D (n_years,) → über alle Runs akkumuliert.
+    Jetzt 2D (n_runs, n_years): jeder Run hat seinen eigenen Stack.
     """
     c_name = COUNTRY_NAMES.get(country, country)
 
-    # Daten sammeln
-    # year_set: alle vorkommenden Jahre (oder "single")
     all_years: set = set()
     run_data: Dict[str, Dict[Union[int, str], pd.Series]] = {}
 
@@ -690,7 +585,6 @@ def plot_installed_capacity(
 
     fig, ax = plt.subplots(figsize=(max(10, n_runs * n_years * 1.5 + 3), 10))
 
-    # Alle Technologien
     all_techs: set = set()
     for rd in run_data.values():
         for s in rd.values():
@@ -712,38 +606,40 @@ def plot_installed_capacity(
     seen_techs: List[str] = []
     legend_run_patches: List[mpatches.Patch] = []
 
+    # FIX #3: 2D-Array statt 1D — Dimension (n_runs × n_years)
+    # Jeder Run akkumuliert seinen eigenen Stapel unabhängig von den anderen.
+    bottoms = np.zeros((n_runs, n_years))
+
     for tech in techs:
         color = _carrier_color(tech, cc)
         for run_idx, spec in enumerate(specs):
             hatch = HATCH_PATTERNS[run_idx % len(HATCH_PATTERNS)]
-            bottoms = np.zeros(n_years)
             for y_idx, yr in enumerate(years):
-                tag = yr
-                cap = run_data[spec.label].get(tag, pd.Series(dtype=float))
+                cap = run_data[spec.label].get(yr, pd.Series(dtype=float))
                 v = float(cap.get(tech, 0.0))
                 xpos = x_base[y_idx] + offsets[run_idx]
                 ax.bar(
                     xpos, v, bar_w * 0.95,
-                    bottom=bottoms[y_idx],
+                    bottom=bottoms[run_idx, y_idx],   # ← FIX: run-spezifischer bottom
                     color=color, hatch=hatch,
                     edgecolor="white", linewidth=0.3,
                 )
                 if v >= TEXT_THR:
                     ax.text(
-                        xpos, bottoms[y_idx] + v / 2,
+                        xpos,
+                        bottoms[run_idx, y_idx] + v / 2,  # ← FIX: run-spezifischer bottom
                         f"{int(round(v))}",
                         ha="center", va="center",
                         color="white",
                         fontsize=fs.get("bar_label", 9),
                         fontweight="bold",
                     )
-                bottoms[y_idx] += v
+                bottoms[run_idx, y_idx] += v              # ← FIX: nur diesen Run akkumulieren
 
         if tech not in seen_techs:
             seen_techs.append(tech)
             handles.append(mpatches.Patch(facecolor=color, label=tech))
 
-    # Run-Legende (Hatch-Muster)
     for run_idx, spec in enumerate(specs):
         hatch = HATCH_PATTERNS[run_idx % len(HATCH_PATTERNS)]
         legend_run_patches.append(
@@ -762,7 +658,6 @@ def plot_installed_capacity(
         fontsize=fs.get("title", 18), pad=14,
     )
 
-    # Legende: Technologien + Run-Marker
     legend1 = ax.legend(
         handles=handles[::-1], title="Technologie",
         fontsize=fs.get("legend", 11),
@@ -790,7 +685,6 @@ def plot_annual_generation(
     target_year: Optional[int] = None,
 ) -> None:
     c_name = COUNTRY_NAMES.get(country, country)
-    n_runs = len(specs)
 
     gen_data: Dict[str, pd.Series] = {}
     demand_data: Dict[str, float] = {}
@@ -804,7 +698,7 @@ def plot_annual_generation(
             key = f"{spec.label}\n({tag})"
             gen_data[key] = gen
             demand_data[key] = dem
-            break  # erstes passendes Netz
+            break
 
     if not gen_data:
         print(f"  [plot_annual_generation] Keine Daten für {country}")
@@ -812,7 +706,6 @@ def plot_annual_generation(
 
     fig, axes = plt.subplots(1, 2, figsize=(16, 9))
 
-    # --- Balken ---
     ax = axes[0]
     handles = _stacked_bar_for_year(
         ax, gen_data, cc, HATCH_PATTERNS,
@@ -822,7 +715,6 @@ def plot_annual_generation(
     )
     ax.set_title(f"Jährl. Stromerzeugung — {c_name}", fontsize=fs.get("title", 16))
 
-    # --- 100% Stapelbalken ---
     ax2 = axes[1]
     all_techs: set = set()
     for s in gen_data.values():
@@ -845,9 +737,8 @@ def plot_annual_generation(
                     color=color, hatch=h, edgecolor="white", linewidth=0.4)
             if p > 3.0:
                 ax2.text(x[i], bottoms[i] + p / 2, f"{p:.0f}%",
-                         ha="center", va="center",
-                         color="white", fontsize=fs.get("bar_label", 9),
-                         fontweight="bold")
+                         ha="center", va="center", color="white",
+                         fontsize=fs.get("bar_label", 9), fontweight="bold")
         bottoms += pcts
 
     ax2.set_xticks(x)
@@ -857,7 +748,6 @@ def plot_annual_generation(
     ax2.set_title(f"Erzeugungsmix [%] — {c_name}", fontsize=fs.get("title", 16))
     ax2.grid(axis="y", linestyle="--", alpha=0.4)
 
-    # Gemeinsame Legende
     handles_legend = [mpatches.Patch(facecolor=_carrier_color(t, cc), label=t)
                       for t in techs if any(gen_data[r].get(t, 0) > 0 for r in runs_sorted)]
     fig.legend(
@@ -890,9 +780,8 @@ def plot_storage_capacities(
             if target_year is not None and isinstance(tag, int) and tag != target_year:
                 continue
             pw, en = extract_storage_capacity(n, country)
-            key = f"{spec.label}"
-            pow_data[key] = pw
-            ene_data[key] = en
+            pow_data[spec.label] = pw
+            ene_data[spec.label] = en
             break
 
     if not pow_data:
@@ -973,7 +862,7 @@ def plot_system_costs_and_co2(
     bar_colors = ["#2ecc71", "#e74c3c", "#3498db", "#f39c12", "#9b59b6"][:len(run_labels)]
     hatches = HATCH_PATTERNS[:len(run_labels)]
 
-    for ax, data_dict, unit, title, color_base in zip(
+    for ax, data_dict, unit, title, _ in zip(
         axes,
         [costs, co2s],
         ["Systemkosten [Mrd. EUR/a]", "CO₂-Emissionen [Mt CO₂/a]"],
@@ -993,7 +882,6 @@ def plot_system_costs_and_co2(
                         ha="center", va="bottom",
                         fontsize=fs.get("bar_label", 10), fontweight="bold")
 
-        # Relative Abweichungen
         if len(vals) > 1 and vals[0] > 0:
             for i in range(1, len(vals)):
                 delta_pct = (vals[i] - vals[0]) / vals[0] * 100
@@ -1090,9 +978,6 @@ def plot_marginal_prices_comparison(
     fs: Dict[str, int],
     target_year: Optional[int] = None,
 ) -> None:
-    """
-    Grouped-bar-Plot: Grenzpreise je Land und Run.
-    """
     data: Dict[str, Dict[str, float]] = {spec.label: {} for spec in specs}
 
     for spec in specs:
@@ -1105,7 +990,6 @@ def plot_marginal_prices_comparison(
                 data[spec.label][country] = price
             break
 
-    # Filter: nur Länder mit mindestens einem gültigen Wert
     valid_countries = [c for c in countries
                        if any(not np.isnan(data[r].get(c, np.nan)) for r in data)]
     if not valid_countries:
@@ -1125,24 +1009,16 @@ def plot_marginal_prices_comparison(
     for r_idx, (run_label, color) in enumerate(zip(run_labels, run_colors)):
         vals = [data[run_label].get(c, np.nan) for c in valid_countries]
         hatch = HATCH_PATTERNS[r_idx % len(HATCH_PATTERNS)]
-        ax.bar(
-            x + offsets[r_idx], vals, width * 0.95,
-            color=color, hatch=hatch,
-            edgecolor="white", linewidth=0.4,
-            label=run_label,
-        )
+        ax.bar(x + offsets[r_idx], vals, width * 0.95, color=color, hatch=hatch,
+               edgecolor="white", linewidth=0.4, label=run_label)
         for i, v in enumerate(vals):
             if not np.isnan(v) and v > 1.0:
-                ax.text(x[i] + offsets[r_idx], v + 0.5,
-                        f"{v:.0f}",
-                        ha="center", va="bottom",
-                        fontsize=fs.get("bar_label", 9))
+                ax.text(x[i] + offsets[r_idx], v + 0.5, f"{v:.0f}",
+                        ha="center", va="bottom", fontsize=fs.get("bar_label", 9))
 
     ax.set_xticks(x)
-    ax.set_xticklabels(
-        [COUNTRY_NAMES.get(c, c) for c in valid_countries],
-        rotation=30, ha="right", fontsize=fs.get("tick", 11)
-    )
+    ax.set_xticklabels([COUNTRY_NAMES.get(c, c) for c in valid_countries],
+                       rotation=30, ha="right", fontsize=fs.get("tick", 11))
     ax.set_ylabel("Mittl. Grenzpreis [EUR/MWh]", fontsize=fs.get("label", 13))
     ax.set_title("Mittlere Strom-Grenzpreise je Land", fontsize=fs.get("title", 16))
     ax.legend(title="Run", fontsize=fs.get("legend", 11), title_fontsize=fs.get("legend", 12))
@@ -1160,10 +1036,7 @@ def plot_delta_capacity(
     target_year: Optional[int] = None,
     reference_idx: int = 0,
 ) -> None:
-    """
-    Divergenz-Balken: Delta-Kapazität relativ zu Referenz-Run.
-    Positiv = mehr Kapazität als Referenz, Negativ = weniger.
-    """
+    """Divergenz-Balken: Delta-Kapazität relativ zu Referenz-Run."""
     if len(specs) < 2:
         return
     c_name = COUNTRY_NAMES.get(country, country)
@@ -1189,7 +1062,8 @@ def plot_delta_capacity(
     for ax, comp_spec in zip(axes, compare_specs_list):
         cap_comp = _get_cap(comp_spec)
         all_techs = cap_ref.index.union(cap_comp.index)
-        delta = cap_comp.reindex(all_techs, fill_value=0.0) - cap_ref.reindex(all_techs, fill_value=0.0)
+        delta = (cap_comp.reindex(all_techs, fill_value=0.0)
+                 - cap_ref.reindex(all_techs, fill_value=0.0))
         delta = delta[delta.abs() > 0.05].sort_values()
 
         if delta.empty:
@@ -1209,10 +1083,8 @@ def plot_delta_capacity(
                         fontsize=fs.get("bar_label", 9))
 
         ax.set_xlabel("Δ Kapazität [GW]", fontsize=fs.get("label", 13))
-        ax.set_title(
-            f"{comp_spec.label} − {ref_spec.label}\n{c_name}",
-            fontsize=fs.get("title", 15),
-        )
+        ax.set_title(f"{comp_spec.label} − {ref_spec.label}\n{c_name}",
+                     fontsize=fs.get("title", 15))
         ax.grid(axis="x", linestyle="--", alpha=0.4)
 
     plt.tight_layout()
@@ -1310,7 +1182,6 @@ def run_comparison(
         print("  Plot 7: Delta-Kapazität")
         plot_delta_capacity(specs, country, c_dir, cc, fs, target_year)
 
-    # Plot 6: Grenzpreise (alle Länder in einem Plot)
     print("  Plot 6: Grenzpreise")
     plot_marginal_prices_comparison(specs, countries, out_dir, fs, target_year)
 
@@ -1322,9 +1193,6 @@ def run_comparison(
 def main() -> None:
     master = MasterConfig()
 
-    # -----------------------------------------------------------------------
-    # CLI
-    # -----------------------------------------------------------------------
     ap = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
@@ -1342,7 +1210,6 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    # Runs bestimmen
     if args.runs:
         spec_dicts = []
         for r in args.runs:
