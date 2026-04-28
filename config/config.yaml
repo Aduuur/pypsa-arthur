@@ -29,7 +29,7 @@ remote:
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#run
 run:
   prefix: ""
-  name: "big-aro-run-3"
+  name: "real-run-1"
   scenarios:
     enable: false
     file: config/scenarios.yaml
@@ -81,8 +81,11 @@ robust:
       #MemLimit: 1900
       #SoftMemLimit: 1600 # pro Dispatch-Instanz
       DualReductions: 0
-      NumericFocus: 2      # Höchste numerische Stabilität für Dispatch
+      PreDual: 0
+      NumericFocus: 1      # Höchste numerische Stabilität für Dispatch
       ScaleFlag: -1 # Aggressivere Skalierung
+      BarHomogeneous: 1
+
     initial_cutouts:
       - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_01_from_2031_12_06
       - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_02_from_2030_11_23
@@ -102,7 +105,7 @@ robust:
       threads: 40         # 80 von 246 Kernen fuer Master
       method: 2          # Barrier
       crossover: 0
-      BarConvTol: 1.0e-3
+      BarConvTol: 0.01
       Seed: 123
       AggFill: 0
       PreDual: 0

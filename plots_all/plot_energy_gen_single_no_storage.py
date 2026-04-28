@@ -295,8 +295,7 @@ def main():
     for path in network_paths:
         if not os.path.isfile(path): continue
         m = re.search(r"_(\d{4})\.nc$", path)
-        if not m: continue
-        year = int(m.group(1))
+        year = int(m.group(1)) if m else 2050  # ARO: kein Jahr im Namen
         all_years.append(year)
 
         print(f"📂 Lade Netzwerk {year}...")

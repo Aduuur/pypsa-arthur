@@ -20,7 +20,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
-from config_final import PlottingConfig
+from config_final import PlottingConfig, fill_leap_day
 
 
 # ------------------------------------------------------------
@@ -119,6 +119,12 @@ def plot_combined_storage(n, year, save_dir):
     de_charge, de_discharge, de_soc = get_battery_data(n, "DE")
     fr_pump, fr_gen, fr_soc = get_hydro_data(n, "FR")
 
+    de_charge = fill_leap_day(de_charge.to_frame()).iloc[:,0]
+    de_discharge = fill_leap_day(de_discharge.to_frame()).iloc[:,0]
+    de_soc = fill_leap_day(de_soc.to_frame()).iloc[:,0]
+    fr_pump = fill_leap_day(fr_pump.to_frame()).iloc[:,0]
+    fr_gen = fill_leap_day(fr_gen.to_frame()).iloc[:,0]
+    fr_soc = fill_leap_day(fr_soc.to_frame()).iloc[:,0]
     resample = "1D"
     de_charge = de_charge.resample(resample).mean()
     de_discharge = de_discharge.resample(resample).mean()

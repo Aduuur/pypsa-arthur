@@ -38,14 +38,17 @@ def _mkdir(p: Union[str, Path]) -> Path:
 #                  wird für Vergleichsplots (plot_installed_cap_new_vgl etc.) genutzt
 # RUN_NAME       : aktiv selektierter Run (für normale Plot-Skripte)
 # -----------------------------------------------------------------------------
-ARO_RUN_NAME: str = _env("ARO_RUN_NAME", "big-aro-run-2")       # type: ignore[assignment]
-REF_RUN_NAME: str = _env("REF_RUN_NAME", "basisrun-rcp45-2028") # type: ignore[assignment]
+ARO_RUN_NAME: str = _env("ARO_RUN_NAME", "baserun-rcp85-test")       # type: ignore[assignment]
+REF_RUN_NAME: str = _env("REF_RUN_NAME", "baserun-rcp85-test") # type: ignore[assignment]
 RUN_NAME: str = _env("RUN_NAME", ARO_RUN_NAME)                   # type: ignore[assignment]
 
 
 # -----------------------------------------------------------------------------
 # Master configuration block
 # -----------------------------------------------------------------------------
+# Globaler Plot-Output-Override fuer per-Szenario Auswertung
+_PLOT_OUTPUT_OVERRIDE: Optional[str] = None
+
 MASTER_CONFIG: Dict[str, Any] = {
     # =======================================================================
     # GLOBAL PATHS
@@ -81,6 +84,7 @@ MASTER_CONFIG: Dict[str, Any] = {
     # =======================================================================
     # DARK SKY / DUNKELFLAUTE ANALYSIS PERIOD
     # =======================================================================
+    "planning_year": int(_env("PLANNING_YEAR", "2050")),
     "dark_sky_period": {
         "reference_year": int(_env("DARK_SKY_YEAR", "2028")),
         "start_mmdd":     _env("DARK_SKY_START", "01-07"),
@@ -121,7 +125,7 @@ MASTER_CONFIG: Dict[str, Any] = {
             "H2": "#bf13a0", "hydrogen": "#bf13a0", "H2 storage": "#bf13a0",
             "H2 Electrolysis": "#ff29d9", "H2 Fuel Cell": "#c251ae", "H2 turbine": "#991f83",
             "battery": "#ace37f", "home battery": "#80c944",
-            "battery charger": "#76c7a3", "battery discharger": "#2a9d8f",
+            "battery charger": "#76c7a3", "battery discharger": "#7b2d8b",
             "load": "#1f77b4", "heat pump": "#ff9966", "resistive heater": "#ff7f50",
             "EV charger": "#9999ff", "export": "#808080",
             "geothermal": "#ba91b1", "other": "#000000",
@@ -215,7 +219,7 @@ MASTER_CONFIG: Dict[str, Any] = {
         "runs": {
             ARO_RUN_NAME: {
                 "name":                    ARO_RUN_NAME,
-                "summary_json":            f"{{aro_results_base}}/{ARO_RUN_NAME}/results/aro_summary.json",
+                "summary_json":            f"{{aro_results_base}}/{ARO_RUN_NAME}/aro_summary.json",
                 # Robustes Portfolio-Netzwerk (das ARO-Ergebnis selbst)
                 "robust_network":          f"{{aro_results_base}}/{ARO_RUN_NAME}/networks/aro_robust.nc",
                 "robust_network_std":      f"{{aro_results_base}}/{ARO_RUN_NAME}/networks/aro_robust__std.nc",
@@ -243,7 +247,6 @@ MASTER_CONFIG: Dict[str, Any] = {
 # -----------------------------------------------------------------------------
 # Dataclasses wrapping the dict
 # -----------------------------------------------------------------------------
-@dataclass
 
 def get_dunkelflaute_window(network_path: str, duration_days: int = 7) -> tuple[str, str]:
     """
@@ -286,6 +289,26 @@ def get_dunkelflaute_window(network_path: str, duration_days: int = 7) -> tuple[
     return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
 
 
+def get_planning_year(n=None, network_path: str = "", fallback: int = 2050) -> int:
+    """
+    Gibt das Planungsjahr zurueck (z.B. 2050), NICHT das Wetterjahr (2028).
+    
+    Prioritaet:
+    1. Jahreszahl im Dateinamen: base_s_24___2050.nc -> 2050
+    2. fallback-Parameter (default: 2050)
+    
+    n.snapshots[0].year wird NICHT verwendet da das das Wetterjahr ist.
+    """
+    import re
+    from pathlib import Path
+    if network_path:
+        m = re.search(r"_(\d{4})\.nc$", Path(network_path).name)
+        if m:
+            return int(m.group(1))
+    return fallback
+
+
+@dataclass
 class MasterConfig:
     raw: Dict[str, Any] = field(default_factory=lambda: MASTER_CONFIG)
 
@@ -342,6 +365,10 @@ class MasterConfig:
     @property
     def dark_sky_end(self) -> str:
         return f"{self.dark_sky_reference_year}-{self.dark_sky_period['end_mmdd']}"
+
+    @property
+    def planning_year(self) -> int:
+        return int(self.raw.get("planning_year", 2050))
 
     @property
     def dispatch_windows(self) -> Dict[str, Any]:
@@ -560,6 +587,12 @@ class MasterConfig:
             return list(scenarios)
 
         summary_path = self.resolve_template(run_conf.get("summary_json"))
+        # Fallback: aro_summary_iter1.json wenn aro_summary.json nicht existiert
+        if summary_path and not Path(summary_path).is_file():
+            fallback_path = summary_path.replace("aro_summary.json", "aro_summary_iter1.json")
+            if Path(fallback_path).is_file():
+                print(f"  [summary] aro_summary.json nicht gefunden, nutze: {Path(fallback_path).name}")
+                summary_path = fallback_path
         if summary_path and Path(summary_path).is_file():
             try:
                 with open(summary_path, "r", encoding="utf-8") as f:
@@ -595,6 +628,7 @@ class PlottingConfig:
         self.AVAILABLE_PLOTS    = self.master.available_plots
         self.DARK_SKY_START     = self.master.dark_sky_start
         self.DARK_SKY_END       = self.master.dark_sky_end
+        self.PLANNING_YEAR      = self.master.planning_year
         # FIX: "both" und "all" sind Vergleichsmodi, keine Run-Keys.
         # Ordner wie plots_base/both/ sind sinnlos — stattdessen den
         # tatsächlichen Run-Ordner (ARO oder erster Registry-Eintrag) nutzen.
@@ -603,6 +637,8 @@ class PlottingConfig:
             _sel = (self.master.aro_selected_run
                     or next(iter(self.master.scenarios_registry), _sel))
         self.PLOT_OUTPUT_PATH   = str(self.master.get_run_output_dir(_sel))
+        if _PLOT_OUTPUT_OVERRIDE is not None:
+            self.PLOT_OUTPUT_PATH = _PLOT_OUTPUT_OVERRIDE
 
     def get_networks(self):
         return self.master.get_networks()
@@ -630,6 +666,7 @@ class AROPlottingConfig:
         self.ARO_PLOTS            = self.master.aro_plot_toggles
         self.DARK_SKY_START       = self.master.dark_sky_start
         self.DARK_SKY_END         = self.master.dark_sky_end
+        self.PLANNING_YEAR        = self.master.planning_year
         # Pfad zum Referenznetz (Basisrun-rcp45-2028) für Vergleichsplots
         self.REFERENCE_NETWORK_PATH: Optional[str] = (
             self.master.get_reference_network_path(self.SELECTED_RUN)
@@ -675,6 +712,26 @@ class AROPlottingConfig:
 # =============================================================================
 # Validation + helpers
 # =============================================================================
+
+def fill_leap_day(df: "pd.DataFrame") -> "pd.DataFrame":
+    """
+    Füllt fehlende Stunden (z.B. 29.02. bei Nicht-Schaltjahr-Daten) in einem
+    stündlichen Zeitindex per forward-fill auf. Gibt den DataFrame unverändert
+    zurück wenn keine Lücken vorhanden sind.
+    """
+    import pandas as _pd
+    if df is None or df.empty:
+        return df
+    idx = _pd.to_datetime(df.index)
+    full = _pd.date_range(start=idx[0], end=idx[-1], freq="h")
+    if len(full) == len(idx):
+        return df
+    df2 = df.copy()
+    df2.index = idx
+    df2 = df2.reindex(full).ffill().bfill()
+    return df2
+
+
 def _now_stamp() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 

@@ -125,8 +125,8 @@ CARRIER_COLORS: Dict[str, str] = {
     "H2 OCGT":                             "#c251ae",
     "H2 Fuel Cell":                        "#bf13a0",
     "PHS":                                 "#51dbcc",
-    "battery discharger":                  "#ace37f",
-    "home battery discharger":             "#80c944",
+    "battery discharger":                  "#7b2d8b",
+    "home battery discharger":             "#b05cc7",
 }
 
 # Carrier die als Links modelliert sind (elektrische Einspeisung über bus1)
@@ -135,6 +135,8 @@ LINK_ELECTRICITY_CARRIERS = {
     "H2 Fuel Cell", "H2 turbine", "H2 OCGT",
     "urban central solid biomass CHP",
     "urban central solid biomass CHP CC",
+    "battery discharger", "home battery discharger",  # FIX: Batterien fehlten
+    "coal", "lignite", "biomass", "OCGT methanol",  # FIX: fehlende AC-Erzeuger
 }
 
 # Strings die auf Nicht-Strom-Busse hinweisen
@@ -168,12 +170,8 @@ FS = {
 # ---------------------------------------------------------------------------
 
 def _year_from_network(n: pypsa.Network, path: str) -> Optional[int]:
-    try:
-        return int(n.snapshots[0].year)
-    except Exception:
-        pass
-    m = re.search(r"_(\d{4})\.nc$", path)
-    return int(m.group(1)) if m else None
+    from master_config import get_planning_year
+    return get_planning_year(n, path)
 
 
 def _is_elec_bus(bus: str) -> bool:

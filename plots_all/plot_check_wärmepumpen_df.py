@@ -29,10 +29,8 @@ from master_config import PlottingConfig
 
 def _parse_year(n: pypsa.Network, path: str, fallback: int = 2050) -> int:
     """Jahr sicher aus Netzwerk oder Dateinamen lesen."""
-    try:
-        return int(n.snapshots[0].year)
-    except Exception:
-        pass
+    from master_config import get_planning_year
+    return get_planning_year(n, path, fallback)
     m = re.search(r"___(\d{4})\.nc$", path) or re.search(r"_(\d{4})\.nc", path)
     return int(m.group(1)) if m else fallback
 

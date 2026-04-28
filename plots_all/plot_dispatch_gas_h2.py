@@ -21,7 +21,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
-from config_final import PlottingConfig
+from config_final import PlottingConfig, fill_leap_day
 
 # ================================
 # Definition der Technologiegruppen
@@ -130,6 +130,8 @@ def plot_single(country, year, df, config: PlottingConfig, save_folder: str, sce
     roll = df.rolling(window=7 * 24, min_periods=1, center=True).mean()
 
     fig, ax = plt.subplots(figsize=(14, 7))
+    gas_sum = fill_leap_day(gas_sum.to_frame()).iloc[:,0]
+    h2_sum = fill_leap_day(h2_sum.to_frame()).iloc[:,0]
     ax.plot(roll.index, roll["Gas"], color="#d95f02", lw=2, label="Gas")
     ax.plot(roll.index, roll["H2"], color="#7570b3", lw=2, label="H₂")
 
@@ -176,9 +178,7 @@ def main():
             continue
 
         m = re.search(r"_(\d{4})\.nc$", path)
-        if not m:
-            continue
-        year = int(m.group(1))
+        year = int(m.group(1)) if m else 2050  # ARO: kein Jahr im Namen
 
         print(f"\n📂 Lade Netzwerk {year}: {path}")
         n = pypsa.Network(path)

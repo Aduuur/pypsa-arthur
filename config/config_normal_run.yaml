@@ -28,7 +28,7 @@ remote:
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#run
 run:
   prefix: ""
-  name: "demand-rcp85-2025"
+  name: "baserun-rcp85-test"
   scenarios:
     enable: false
     file: config/scenarios.yaml
@@ -39,7 +39,7 @@ run:
   use_shadow_directory: false
 
 workflow:
-  mode: "plain" #must be aro or robust or plain
+  mode: "aro" #must be aro or robust or plain
 
 robust:
   # diskrete Szenarien = manipulierten Cutouts
@@ -61,26 +61,39 @@ robust:
     co2_cost_mode: "off"      # "off" | "global_constraint_constant_cost"
     ls_penalty: 10000          # €/MWh — muss > max(marginal_cost) aller Generatoren
     convergence_tol: 0.001    # rel. Gap-Toleranz — 0.01%, auf 0.0 für klassisches ARO
-    dispatch_workers: 1
+    dispatch_workers: 3
+    dispatch_solver_options:
+      threads: 20         # 10 cutouts x 10 threads = 100 -> passt auf 60 phys. Kerne mit Hyperthreading
+      method: 2           # Barrier
+      crossover: 0
+      BarConvTol: 1.0e-3   # Dispatch: locker genug für numerisch schwieriges Problem
+      Seed: 123
+      #MemLimit: 1900
+      #SoftMemLimit: 1600 # pro Dispatch-Instanz
+      DualReductions: 0
+      NumericFocus: 2      # Höchste numerische Stabilität für Dispatch
+      ScaleFlag: -1 # Aggressivere Skalierung
+      BarHomogeneous: 1
 
     initial_cutouts:
-      - cutout_mCNRM-CERFACS-CM5_rcp45_2010
-      - cutout_mCNRM-CERFACS-CM5_rcp26_2010
-    max_iter: 5
+      - cutout_mCNRM-CERFACS-CM5_rcp45_2028
+    max_iter: 1
+
+    max_master_size: 0
     solver_options:
-      threads: 8
-      method: 2
+      threads: 40         # 80 von 246 Kernen fuer Master
+      method: 2          # Barrier
       crossover: 0
-      BarConvTol: 1.0e-5
+      BarConvTol: 1.0e-3
       Seed: 123
       AggFill: 0
       PreDual: 0
-      NodefileStart: 0.5
-      NodefileDir: "/tmp"
-      MemLimit: 600
+      #SoftMemLimit: 450      # GB - lass 400GB fuer OS + Dispatch
       DualReductions: 0
-      NumericFocus: 1
-
+      NumericFocus: 2
+      ObjScale: -0.5
+      ScaleFlag: -1
+      BarHomogeneous: 1
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#foresight
 foresight: myopic
 

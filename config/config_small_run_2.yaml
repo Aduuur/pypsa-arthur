@@ -83,6 +83,7 @@ robust:
       DualReductions: 0
       NumericFocus: 2      # Höchste numerische Stabilität für Dispatch
       ScaleFlag: -1 # Aggressivere Skalierung
+      BarHomogeneous: 1
     initial_cutouts:
       #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_01_from_2031_12_06
       - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_02_from_2030_11_23

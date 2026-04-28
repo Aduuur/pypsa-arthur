@@ -24,7 +24,7 @@ from matplotlib.lines import Line2D
 from matplotlib.collections import LineCollection
 
 # FIX: war config_final
-from master_config import PlottingConfig
+from master_config import get_planning_year, PlottingConfig
 
 # =============================================================================
 # EINSTELLUNGEN
@@ -44,7 +44,7 @@ DEFAULT_P_MAX_PU_DC  = 1.0
 def _parse_year(n: pypsa.Network, path: str, fallback: int = 2050) -> int:
     """Jahr aus Netz-Snapshots lesen — funktioniert auch für Dispatch-Netze."""
     try:
-        return int(n.snapshots[0].year)
+        return get_planning_year(n, path)
     except Exception:
         pass
     m = re.search(r"___(\d{4})\.nc$", path) or re.search(r"_(\d{4})\.nc", path)

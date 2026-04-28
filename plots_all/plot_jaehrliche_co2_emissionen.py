@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 import pypsa
 
 # FIX: war config_final
-from master_config import PlottingConfig
+from master_config import get_planning_year, PlottingConfig
 
 FOSSIL_SOURCES = ["coal", "lignite", "oil", "gas", "oil primary"]
 SINK_CARRIER   = "co2 sequestered"
@@ -30,7 +30,7 @@ SINK_CARRIER   = "co2 sequestered"
 def _parse_year(n: pypsa.Network, path: str, fallback: int = 2050) -> int:
     """Jahr zuverlässig aus Netzwerk lesen — funktioniert auch für Dispatch-Netze."""
     try:
-        return int(n.snapshots[0].year)
+        return get_planning_year(n, path)
     except Exception:
         pass
     m = re.search(r"___(\d{4})\.nc$", path) or re.search(r"_(\d{4})\.nc", path)

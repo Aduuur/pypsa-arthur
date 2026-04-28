@@ -18,7 +18,7 @@ import re
 import pypsa
 import pandas as pd
 import matplotlib.pyplot as plt
-from config_final import PlottingConfig
+from config_final import PlottingConfig, fill_leap_day
 
 # =====================================================================
 # --- Linkfilter & Bus-Erkennung ---
@@ -96,6 +96,7 @@ def plot_consumption(df, year_label, country, config: PlottingConfig, network_pa
     YEAR_START   = f"{sim_year}-01-01"
     YEAR_END     = f"{sim_year}-12-31"
 
+    df = fill_leap_day(df)
     df_detail = df.loc[DETAIL_START:DETAIL_END]
     if df_detail.empty:
         print(f"⚠️ Skip {country} ({year_label}): kein Detailzeitraum.")
@@ -194,9 +195,7 @@ def main():
             continue
 
         m = re.search(r"_(\d{4})\.nc$", path)
-        if not m:
-            continue
-        year = int(m.group(1))
+        year = int(m.group(1)) if m else 2050  # ARO: kein Jahr im Namen
 
         print(f"\n📂 Lade Netzwerk {year}: {path}")
         n = pypsa.Network(path)

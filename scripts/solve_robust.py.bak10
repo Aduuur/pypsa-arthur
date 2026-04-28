@@ -2617,26 +2617,6 @@ def _dispatch_solve(
             annual_scale=annual_scale,
         )
         m.objective = op_cost
-        # [DISPATCH-FIX-TES] Enforce TES energy-to-power-ratio constraint in dispatch.
-        # Without this, e_nom_extendable stores are unconstrained and the optimizer
-        # builds unrealistically large thermal storage (~1 TWh per node), causing
-        # 2800+ charge/discharge cycles per year in the dispatch plot.
-        try:
-            add_TES_energy_to_power_ratio_constraints(network)
-            logger.info("[DISPATCH-FIX-TES] TES energy-to-power-ratio constraint added.")
-        except Exception as _tes_exc:
-            logger.warning("[DISPATCH-FIX-TES] Could not add TES constraint: %s", _tes_exc)
-        # [DISPATCH-FIX-2] Drop investment-type GCs in dispatch
-        # lv_limit and similar constraints are investment constraints
-        # and should not be active when no investment decisions are made
-        _inv_gc_types = {"transmission_volume_expansion_limit",
-                         "transmission_expansion_limit"}
-        _to_drop = [gc for gc, row in network.global_constraints.iterrows()
-                    if str(row.get("type","")) in _inv_gc_types]
-        if _to_drop:
-            network.global_constraints.drop(_to_drop, inplace=True)
-            logger.info("[DISPATCH-FIX-2] Dropped %d investment GCs: %s",
-                       len(_to_drop), _to_drop)
     w = n.snapshot_weightings["objective"]
     logger.info("DISPATCH WEIGHT CHECK: min=%.3f max=%.3f sum=%.1f n=%d annual_scale=%.4f",
     w.min(), w.max(), w.sum(), len(w), annual_scale)
@@ -3203,18 +3183,9 @@ def _fix_unbounded_infrastructure(n: pypsa.Network) -> Dict[str, int]:
             # water pit charger/discharger: Kosten liegen im Store (EUR/kWh)
             # = energy_to_power_ratio × store_capital_cost = 22.5h × 81.68 EUR/kWh = 1838 EUR/MW
             WP_CC = 1837.8  # EUR/MW
-            # [BUG-FIX-13] Only charger gets WP_CC, discharger stays at 1 EUR/MW
-            # (consistent with battery: only charger carries investment cost)
-            wp_charger_mask = lk.loc[to_fix, "carrier"].str.contains("water pits charger", case=False).values
-            wp_discharger_mask = lk.loc[to_fix, "carrier"].str.contains("water pits discharger", case=False).values
-            n.links.loc[to_fix[wp_charger_mask], "capital_cost"] = WP_CC
-            n.links.loc[to_fix[wp_discharger_mask], "capital_cost"] = 1.0
-            n.links.loc[to_fix[~wp_charger_mask & ~wp_discharger_mask], "capital_cost"] = 1.0
-            # [WP-CAP] Cap water pit charger/discharger p_nom_max to 1 GW per bus
-            # (realistic district heating potential; prevents solver from over-investing)
-            wp_all_mask = wp_charger_mask | wp_discharger_mask
-            n.links.loc[to_fix[wp_all_mask], "p_nom_max"] = 100.0
-            logger.info("[WP-CAP] Capped %d water pit charger/discharger to p_nom_max=0.1 GW", int(wp_all_mask.sum()))
+            wp_mask = lk.loc[to_fix, "carrier"].str.contains("water pit", case=False)
+            n.links.loc[to_fix[wp_mask], "capital_cost"] = WP_CC
+            n.links.loc[to_fix[~wp_mask], "capital_cost"] = 1.0
             fixed["links::zero_cc"] = len(to_fix)
             logger.info(
                 "[INFRA-FIX] Fixed capital_cost for %d links "
@@ -4201,44 +4172,15 @@ def solve_aro_master(
         n.stores.loc[_bat_inf, "e_nom_max"] = 1e7  # 10 TWh per node
         logger.info("[NUM-FIX-0b4] battery e_nom_max capped to 1e7 MWh (%d)", len(_bat_inf))
 
-    # [NUM-FIX-0b5] Cap water tanks/pits e_nom_max via energy-to-power-ratio.
-    # Without this, the optimizer builds ~1 TWh thermal storage per node which
-    # causes unrealistic dispatch (charge/discharge 2800+ times/year).
-    # Correct cap: e_nom_max = p_nom_max_charger * energy_to_power_ratio.
-    # Water pit charger is capped at 100 MW [WP-CAP], tanks use same logic.
-    _wt_mask = (
+    # [NUM-FIX-0b5] Cap water tanks e_nom_max=inf
+    _wt_inf = n.stores[
         n.stores.carrier.str.contains("water tank|water pit", case=False) &
-        n.stores.e_nom_extendable.fillna(False)
-    )
-    _wt_stores = n.stores[_wt_mask].index
-    if len(_wt_stores) > 0:
-        for store_name in _wt_stores:
-            store = n.stores.loc[store_name]
-            bus = store["bus"]
-            # find charger link for this store bus
-            charger_mask = (
-                n.links.bus1 == bus
-            ) & n.links.carrier.str.contains("charger", case=False)
-            if charger_mask.any():
-                charger = n.links[charger_mask].iloc[0]
-                etp = charger.get("energy to power ratio", None)
-                p_max = charger.get("p_nom_max", np.inf)
-                if etp is not None and not np.isnan(etp) and etp > 0:
-                    if np.isinf(p_max):
-                        # fallback: 500 MW per node is a generous upper bound
-                        p_max = 500.0
-                    e_max = float(etp) * float(p_max)
-                    n.stores.loc[store_name, "e_nom_max"] = e_max
-                    continue
-            # fallback if no charger found: cap at 1 TWh
-            n.stores.loc[store_name, "e_nom_max"] = 1e6
-        logger.info(
-            "[NUM-FIX-0b5] water tank/pit e_nom_max set via energy-to-power-ratio (%d stores). "
-            "Sample e_nom_max: %s",
-            len(_wt_stores),
-            {s: f"{n.stores.loc[s,'e_nom_max']:.0f} MWh"
-             for s in list(_wt_stores)[:4]},
-        )
+        n.stores.e_nom_extendable.fillna(False) &
+        (n.stores.e_nom_max >= 1e14)
+    ].index
+    if len(_wt_inf) > 0:
+        n.stores.loc[_wt_inf, "e_nom_max"] = 1e7  # 10 TWh
+        logger.info("[NUM-FIX-0b5] water tanks e_nom_max capped to 1e7 MWh (%d)", len(_wt_inf))
 
     # [NUM-FIX-0b6] Cap co2 stored e_nom_max=inf
     _co2s_inf = n.stores[

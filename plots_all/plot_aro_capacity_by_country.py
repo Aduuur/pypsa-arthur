@@ -76,6 +76,8 @@ LINK_ELECTRICITY_CARRIERS: Set[str] = {
     "H2 Fuel Cell", "H2 turbine", "H2 OCGT",
     "urban central solid biomass CHP",
     "urban central solid biomass CHP CC",
+    "battery discharger", "home battery discharger",  # FIX: Batterien fehlten
+    "coal", "lignite", "biomass", "OCGT methanol",  # FIX: fehlende AC-Erzeuger
 }
 
 # FIX E: Strings im Bus-Namen die auf NICHT-Strom-Busse hinweisen.
@@ -121,8 +123,8 @@ DEFAULT_COLORS: Dict[str, str] = {
     "H2 Fuel Cell":                        "#b5cf6b",
     "H2 turbine":                          "#991f83",
     "H2 OCGT":                             "#c251ae",
-    "battery discharger":                  "#bd9e39",
-    "home battery discharger":             "#8c6d31",
+    "battery discharger":                  "#7b2d8b",
+    "home battery discharger":             "#b05cc7",
     "PHS":                                 "#3182bd",
     "biomass":                             "#31a354",
     "biogas":                              "#74c476",

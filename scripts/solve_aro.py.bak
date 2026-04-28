@@ -103,7 +103,7 @@ Rolling-Window Bug Fixes (April 2026)
     MD5 ist zuverlässig.
 """
 
-import pathlib
+from __future__ import annotations
 
 import argparse
 import concurrent.futures
@@ -434,9 +434,7 @@ def evaluate_all_cutouts(
             results.append(_dispatch_worker_fn(kw))
     else:
         futures_map: Dict[concurrent.futures.Future, str] = {}
-        import multiprocessing as _mp
-        _fork_ctx = _mp.get_context("fork")
-        with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers, mp_context=_fork_ctx) as pool:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as pool:
             for kw in job_kwargs:
                 fut = pool.submit(_dispatch_worker_fn, kw)
                 futures_map[fut] = kw["cutout"]
@@ -686,23 +684,21 @@ def main() -> None:
         # Step 1: Robust-Solve über aktuelles master_set
         # ------------------------------------------------------------------
         logger.info("[Iter %d] Step 1: Robust-Solve over %s", iteration, master_set)
-        if Path(tmp_net).exists() and Path(tmp_sum).exists():
-            logger.info("[Iter %d] Skipping master solve — tmp_net exists: %s", iteration, tmp_net)
-        else:
-            cmd = [
-                _PYTHON, str(robust_script),
-                "--cutouts", *master_set,
-                "--scenario-network-template", scenario_template,
-                "--out-network", tmp_net,
-                "--out-summary-json", tmp_sum,
-                "--solver-name", solver_name,
-                "--solver-options-json", _solver_options_arg(solver_options),
-                "--co2-cost-mode", co2_cost_mode,
-                "--ls-penalty", str(ls_penalty),
-            ]
-            _run_subprocess(cmd)
-            if not Path(tmp_net).exists():
-                raise RuntimeError(f"Robust solver did not produce: {tmp_net}")
+        cmd = [
+            _PYTHON, str(robust_script),
+            "--cutouts", *master_set,
+            "--scenario-network-template", scenario_template,
+            "--out-network", tmp_net,
+            "--out-summary-json", tmp_sum,
+            "--solver-name", solver_name,
+            "--solver-options-json", _solver_options_arg(solver_options),
+            "--co2-cost-mode", co2_cost_mode,
+            "--ls-penalty", str(ls_penalty),
+        ]
+        _run_subprocess(cmd)
+
+        if not Path(tmp_net).exists():
+            raise RuntimeError(f"Robust solver did not produce: {tmp_net}")
 
         _debug_json_summary(tmp_sum, f"iter{iteration}_after_robust_solve")
 
@@ -871,10 +867,7 @@ def main() -> None:
 
         # [OPT-2] Temp-Dateien dieser Iteration aufräumen
         # tmp_net bleibt (noch im Cache)
-        if not _skip_used_cache:
-            _cleanup_iter_files(tmp_sum, dispatch_tmp_iter)
-        else:
-            logger.info("[CACHE] Keeping dispatch_tmp_iter for final copy: %s", dispatch_tmp_iter)
+        _cleanup_iter_files(tmp_sum, dispatch_tmp_iter)
 
     else:
         convergence_reason = (
@@ -888,49 +881,26 @@ def main() -> None:
     # Finaler Robust-Solve
     # =========================================================================
 
-    _skip_used_cache = False  # wird True wenn finaler Solve übersprungen wird
-    _all_in_master = set(cutouts) <= set(master_set)
-    if _all_in_master and last_iter_portfolio and pathlib.Path(last_iter_portfolio).exists():
-        logger.info(
-            "=== Final robust solve SKIPPED — alle %d Szenarien im master_set "
-            "(finaler Solve identisch mit Iteration %d). "
-            "Kopiere last_iter_portfolio: %s",
-            len(cutouts), iteration, last_iter_portfolio,
+    logger.info("=== Final robust solve (master_set: %s) ===", master_set)
+    final_cmd = [
+        _PYTHON, str(robust_script),
+        "--cutouts", *master_set,
+        "--scenario-network-template", scenario_template,
+        "--out-network", args.out_network,
+        "--out-summary-json", args.out_summary_json,
+        "--solver-name", solver_name,
+        "--solver-options-json", _solver_options_arg(solver_options),
+        "--co2-cost-mode", co2_cost_mode,
+        "--ls-penalty", str(ls_penalty),
+    ]
+    _run_subprocess(final_cmd)
+
+    if not Path(args.out_network).exists():
+        raise RuntimeError(
+            f"Final robust solver did not produce: {args.out_network}"
         )
-        import shutil as _shutil
-        _shutil.copy2(last_iter_portfolio, args.out_network)
-        _last_std = last_iter_portfolio.replace(".nc", "__std.nc")
-        if pathlib.Path(_last_std).exists() and args.out_std_network:
-            _shutil.copy2(_last_std, args.out_std_network)
-        # [FIX] Summary JSON sofort kopieren damit Snakemake outputs vollstaendig sind
-        _last_sum = last_iter_portfolio.replace(".nc", "").replace("_iter" + str(iteration), "") 
-        _last_sum = str(pathlib.Path(args.out_summary_json).with_suffix("")) + f"_iter{iteration}.json"
-        if pathlib.Path(_last_sum).exists():
-            _shutil.copy2(_last_sum, args.out_summary_json)
-            logger.info("[FIX] Copied iter summary JSON → %s", args.out_summary_json)
-        # [FIX-CACHE] Dispatch-Cache direkt aktivieren — last_iter wird nach cleanup gelöscht
-        # sodass MD5-Check fehlschlägt. Da Skip bedeutet Portfolio = last_iter, ist Cache gültig.
-        _skip_used_cache = True
-    else:
-        logger.info("=== Final robust solve (master_set: %s) ===", master_set)
-        final_cmd = [
-            _PYTHON, str(robust_script),
-            "--cutouts", *master_set,
-            "--scenario-network-template", scenario_template,
-            "--out-network", args.out_network,
-            "--out-summary-json", args.out_summary_json,
-            "--solver-name", solver_name,
-            "--solver-options-json", _solver_options_arg(solver_options),
-            "--co2-cost-mode", co2_cost_mode,
-            "--ls-penalty", str(ls_penalty),
-        ]
-        _run_subprocess(final_cmd)
 
-        if not Path(args.out_network).exists():
-            raise RuntimeError(
-                f"Final robust solver did not produce: {args.out_network}"
-            )
-
+    # [OPT-2] Letztes tmp_net aufräumen
     if last_iter_portfolio and last_iter_portfolio != args.out_network:
         _cleanup_iter_files(last_iter_portfolio)
 
@@ -942,11 +912,6 @@ def main() -> None:
 
     _use_cache          = False
     dispatch_tmp_final: Optional[str] = None
-
-    # [FIX-CACHE] Skip-Pfad hat _skip_used_cache gesetzt
-    if locals().get("_skip_used_cache") and last_iter_costs is not None:
-        _use_cache = True
-        logger.info("[OPT-1] Reusing cached dispatch (final solve was skipped — portfolio unchanged).")
 
     if (last_iter_costs is not None
             and last_iter_dispatch_paths is not None

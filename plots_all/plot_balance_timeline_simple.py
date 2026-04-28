@@ -19,7 +19,7 @@ import pypsa
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from config_final import PlottingConfig
+from config_final import PlottingConfig, fill_leap_day
 
 # =====================================================================
 # --- Zeiträume & Konfiguration ---
@@ -394,6 +394,8 @@ def plot_simple_balance(gen_mw: pd.Series, cons_mw: pd.Series, year: int, countr
 
     # Detailansicht
     fig, ax = plt.subplots(figsize=(13, 5))
+    gen_mw = fill_leap_day(gen_mw.to_frame()).iloc[:,0]
+    cons_mw = fill_leap_day(cons_mw.to_frame()).iloc[:,0]
     ax.fill_between(gen_mw.loc[DETAIL_START:DETAIL_END].index, gen_mw.loc[DETAIL_START:DETAIL_END],
                     color="#74a9cf", alpha=0.7, label="Erzeugung inkl. Import (MW)")
     ax.plot(cons_mw.loc[DETAIL_START:DETAIL_END].index, cons_mw.loc[DETAIL_START:DETAIL_END],
@@ -424,10 +426,7 @@ def main():
         if not os.path.isfile(path):
             continue
         m = re.search(r"_(\d{4})\.nc$", path)
-        if not m:
-            print(f"Warnung: Jahr nicht im Dateinamen erkannt: {path}")
-            continue
-        year = int(m.group(1))
+        year = int(m.group(1)) if m else 2050  # ARO-Dispatch: kein Jahr im Namen -> Planungsjahr
 
         print(f"\n📂 Lade Netzwerk {year}: {path}")
         n = pypsa.Network(path)

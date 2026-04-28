@@ -41,7 +41,8 @@ ELECTRICITY_CARRIERS = [
     "urban central solid biomass CHP",
     "urban central solid biomass CHP CC",
     "battery discharger", "home battery discharger",
-    "PHS"
+    "PHS",
+    "OCGT methanol", "biomass",  # FIX: fehlende AC-Erzeuger
 ]
 
 STORAGE_DISCHARGE_CARRIERS = [
@@ -109,7 +110,8 @@ def _extract_year_from_network(n: pypsa.Network, path: str) -> int | None:
     2. Fallback: Regex auf den Dateinamen
     """
     try:
-        return int(n.snapshots[0].year)
+        from master_config import get_planning_year
+    return get_planning_year(n, getattr(n, '_source_path', ''))
     except Exception:
         pass
     m = re.search(r"_(\d{4})[\._ ]", os.path.basename(path))

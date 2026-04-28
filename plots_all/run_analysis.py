@@ -84,8 +84,27 @@ STANDALONE_SCRIPTS: Dict[str, str] = {
     "co2_emissionen_analyse":  "plot_jaehrliche_co2_emissionen_analyse.py",
     "check_waermepumpen":      "plot_check_w\u00e4rmepumpen_df.py",
     # ARO-spezifische Plots
+    "aro_co2_analysis":        "plot_aro_co2_analysis.py",
+    "aro_energy_comparison":   "plot_aro_energy_comparison.py",
+    "aro_energy_comparison":   "plot_aro_energy_comparison.py",
     "aro_capacity_by_country": "plot_aro_capacity_by_country.py",
     "aro_annual_dispatch":     "plot_aro_annual_dispatch.py",
+}
+
+# Zeitabhängige Skripte — werden pro Szenario mit individuellem DF-Fenster ausgeführt
+PER_SCENARIO_SCRIPTS: set = {
+    "dispatch_timeline",
+    "balance_timeline",
+    "generation_timeline_gen",
+    "generation_timeline_res",
+    "storage_v2",
+    "storage_kombi_es_de",
+    "storage_kombi_fr_de",
+    "marginal_prices",
+    "dispatch_gas_h2",
+    "consumption_timeline",
+    "check_waermepumpen",
+    "map_leitung_export",
 }
 
 # Skripte die sinnvoll auf einem einzelnen Netz (ARO Worst-Case) laufen.
@@ -125,6 +144,9 @@ ARO_APPLICABLE_SCRIPTS: set = {
 # Dispatch-Zeitreihen hingegen brauchen das Dispatch-Netz.
 ARO_ROBUST_SCRIPTS: set = {
     # Diese Skripte sollen das robuste Portfolio-Netzwerk erhalten:
+    "aro_co2_analysis",
+    "aro_energy_comparison",
+    "aro_energy_comparison",
     "aro_capacity_by_country",   # wird direkt via analyzer gerufen, nicht relevant
     "aro_annual_dispatch",       # wird direkt via analyzer gerufen, nicht relevant
     # Kapazitätsvergleich läuft über analyzer.plot_scenario_capacity_comparison()
@@ -393,6 +415,7 @@ def _load_and_run_script(
     aro_selected_run: Optional[str] = None,
     aro_robust_path: Optional[str] = None,
     analyzer: Optional["AROAnalyzer"] = None,
+    output_path_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     result: Dict[str, Any] = {"script": script_key, "ok": False, "error": None}
 
@@ -520,8 +543,13 @@ def _load_and_run_script(
     #   3. Kein ARO-Pfad vorhanden → kein inject, plain run
     # ----------------------------------------------------------------
     from master_config import MASTER_CONFIG
+    import master_config as _mc_mod
     _orig_sel = None
     _network_backup: dict = {}
+    _orig_out = None
+    if output_path_override is not None:
+        _orig_out = _mc_mod._PLOT_OUTPUT_OVERRIDE
+        _mc_mod._PLOT_OUTPUT_OVERRIDE = output_path_override
 
     effective_override = override_scenario
     if script_key in ARO_BASIS_WC_COMPARISON_SCRIPTS and aro_basis_path is not None:
@@ -567,9 +595,9 @@ def _load_and_run_script(
                 _snap_year = int(_pypsa.Network(_df_path).snapshots[0].year)
                 _start = _pd.Timestamp(year=_snap_year, month=_month, day=_day)
                 _end   = _start + _pd.Timedelta(days=6)
-                master._cfg["dark_sky_period"]["reference_year"] = _snap_year
-                master._cfg["dark_sky_period"]["start_mmdd"] = _start.strftime("%m-%d")
-                master._cfg["dark_sky_period"]["end_mmdd"]   = _end.strftime("%m-%d")
+                master.raw["dark_sky_period"]["reference_year"] = _snap_year
+                master.raw["dark_sky_period"]["start_mmdd"] = _start.strftime("%m-%d")
+                master.raw["dark_sky_period"]["end_mmdd"]   = _end.strftime("%m-%d")
                 print(f"     [DF-Fenster] {_start.date()} - {_end.date()} (7 Tage)")
         except Exception as _e:
             print(f"     [DF-Fenster] Fallback auf Config-Default ({_e})")
@@ -592,6 +620,7 @@ def _load_and_run_script(
             MASTER_CONFIG["scenarios"]["selection"] = _orig_sel
         if _network_backup:
             _restore_network_config(_network_backup)
+        _mc_mod._PLOT_OUTPUT_OVERRIDE = _orig_out
 
     return result
 
@@ -605,6 +634,7 @@ def run_standalone_scripts(
     aro_selected_run: Optional[str] = None,
     aro_robust_path: Optional[str] = None,
     analyzer: Optional["AROAnalyzer"] = None,
+    output_path_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     report: Dict[str, Any] = {"ok": True, "scripts": {}}
 
@@ -622,6 +652,7 @@ def run_standalone_scripts(
             aro_basis_path=aro_basis_path,
             aro_selected_run=aro_selected_run,
             analyzer=analyzer,
+            output_path_override=output_path_override,
         )
         report["scripts"][key] = res
         if res["ok"]:
@@ -864,6 +895,51 @@ def run_aro(
             analyzer=analyzer,
         )
         report["standalone"] = standalone_report
+
+    # === PER-SCENARIO DISPATCH ANALYSIS ===
+    import re as _re2, pandas as _pd2
+    _dispatch_dir = Path(master.aro_results_base) / run_key / 'networks' / 'dispatch'
+    if run_standalone and _dispatch_dir.is_dir():
+        _all_nc = sorted(_dispatch_dir.glob('dispatch_*_std.nc'))
+        _SCEN_SCRIPTS = sorted(PER_SCENARIO_SCRIPTS)
+        print(f'\n=== Per-Szenario Auswertung ({len(_all_nc)} Netze) ===')
+        for _nc in _all_nc:
+            _nm = _nc.name
+            _is_wc = 'worst_case' in _nm
+            _ms = _re2.search(r'stress_[0-9]+_from_[0-9]{4}_[0-9]{2}_[0-9]{2}', _nm)
+            _short = (_ms.group(0) if _ms else _nm.replace('dispatch_','').replace('_std.nc',''))
+            if _is_wc: _short += '_WORST_CASE'
+            _sout = Path(out_dir) / 'scenarios' / _short
+            _sout.mkdir(parents=True, exist_ok=True)
+            master.PLOT_OUTPUT_PATH = str(_sout)
+            _md = _re2.search(r'_from_[0-9]{4}_([0-9]{2})_([0-9]{2})', _nm)
+            if _md:
+                try:
+                    import pypsa as _pypsa2
+                    _nt = _pypsa2.Network(str(_nc))
+                    _yr = int(_nt.snapshots[0].year)
+                    _st = _pd2.Timestamp(year=_yr, month=int(_md.group(1)), day=int(_md.group(2)))
+                    _en = _st + _pd2.Timedelta(days=6)
+                    master.raw['dark_sky_period']['reference_year'] = _yr
+                    master.raw['dark_sky_period']['start_mmdd'] = _st.strftime('%m-%d')
+                    master.raw['dark_sky_period']['end_mmdd']   = _en.strftime('%m-%d')
+                    print(f'  {_short}  DF: {_st.date()} - {_en.date()}')
+                except Exception as _ex:
+                    print(f'  {_short}  DF: ? ({_ex})')
+            _sr = run_standalone_scripts(
+                script_keys=_SCEN_SCRIPTS, aro_only=False,
+                override_scenario=run_key,
+                aro_dispatch_path=str(_nc),
+                aro_basis_path=basis_network_path,
+                aro_selected_run=run_key,
+                aro_robust_path=robust_network_path,
+                output_path_override=str(_sout),
+                analyzer=analyzer,
+            )
+            _ok = sum(1 for v in _sr.get('scripts',{}).values() if v.get('ok'))
+            print(f'    OK: {_ok}/{len(_sr.get("scripts",{}))}  -> {_sout}')
+        report['per_scenario'] = {'n': len(_all_nc)}
+        master.PLOT_OUTPUT_PATH = str(out_dir)  # zuruecksetzen
 
     return report
 

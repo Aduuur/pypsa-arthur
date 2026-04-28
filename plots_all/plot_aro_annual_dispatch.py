@@ -71,7 +71,7 @@ DEFAULT_GEN_COLORS: Dict[str, str] = {
     "coal":              "#636363",
     "lignite":           "#393b79",
     "H2 Fuel Cell":      "#b5cf6b",
-    "battery discharger":"#bd9e39",
+    "battery discharger":"#7b2d8b",
     "PHS":               "#3182bd",
 }
 

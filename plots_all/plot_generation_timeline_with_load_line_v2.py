@@ -14,7 +14,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import numpy as np
-from config_final import PlottingConfig
+from config_final import PlottingConfig, fill_leap_day
 
 plt.switch_backend("Agg")
 
@@ -242,6 +242,9 @@ def plot_dispatch(df_gen, s_load, s_export_net, year, country, config, net_name,
         if df_gen.empty: return
 
     # 2. Resample
+    df_gen = fill_leap_day(df_gen)
+    s_load = fill_leap_day(s_load.to_frame()).iloc[:,0]
+    s_export_net = fill_leap_day(s_export_net.to_frame()).iloc[:,0]
     if resample != "1h":
         df_res = df_gen.resample(resample).mean()
         load_res = s_load.resample(resample).mean()

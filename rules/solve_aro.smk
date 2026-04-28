@@ -205,23 +205,23 @@ rule solve_aro:
         mkdir -p "$(dirname {output.std_network})"
         mkdir -p "$(dirname {output.summary})"
 
-        {sys.executable} scripts/solve_aro.py \\
-          --cutouts {params.cutouts} \\
-          --scenario-network-template "{params.prepared_template}" \\
-          --initial-scenarios {params.initial} \\
-          --max-iter {params.max_iter} \\
-          --out-network {output.network} \\
-          --out-std-network {output.std_network} \\
-          --out-summary-json {output.summary} \\
-          --solver-name {params.solver} \\
-          --solver-options-json '{params.solver_opts}' \\
-          --co2-cost-mode {params.co2_cost_mode} \\
-          --ls-penalty {params.ls_penalty} \\
-          --convergence-tol {params.convergence_tol} \\
-          --dispatch-workers {params.dispatch_workers} \\
-          --dispatch-solver-options-json '{params.dispatch_solver_opts}' \\
-          --max-master-size {params.max_master_size} \\
-          --out-dispatch-dir {output.dispatch_dir} \\
+        {sys.executable} scripts/solve_aro.py \
+          --cutouts {params.cutouts} \
+          --scenario-network-template "{params.prepared_template}" \
+          --initial-scenarios {params.initial} \
+          --max-iter {params.max_iter} \
+          --out-network {output.network} \
+          --out-std-network {output.std_network} \
+          --out-summary-json {output.summary} \
+          --solver-name {params.solver} \
+          --solver-options-json '{params.solver_opts}' \
+          --co2-cost-mode {params.co2_cost_mode} \
+          --ls-penalty {params.ls_penalty} \
+          --convergence-tol {params.convergence_tol} \
+          --dispatch-workers {params.dispatch_workers} \
+          --dispatch-solver-options-json '{params.dispatch_solver_opts}' \
+          --max-master-size {params.max_master_size} \
+          --out-dispatch-dir {output.dispatch_dir} \
            2>&1 | tee {log}  
         """
 

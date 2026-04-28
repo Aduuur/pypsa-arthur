@@ -23,7 +23,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # FIX: war config_final, PlottingConfig ist in master_config definiert
-from master_config import PlottingConfig
+from master_config import get_planning_year, PlottingConfig
 
 
 # ------------------------------------------------------------
@@ -39,7 +39,7 @@ def _parse_year(n: pypsa.Network, path: str, fallback: int = 2050) -> int:
       3. fallback-Wert
     """
     try:
-        return int(n.snapshots[0].year)
+        return get_planning_year(n, path)
     except Exception:
         pass
     m = re.search(r"___(\d{4})\.nc$", path) or re.search(r"_(\d{4})\.nc", path)

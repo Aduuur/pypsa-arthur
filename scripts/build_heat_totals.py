@@ -255,6 +255,29 @@ if __name__ == "__main__":
         s_yearly = (s.groupby(s.index.year).sum() / 1e3)
         s_yearly.index = s_yearly.index.astype(int)
 
+        # [BUG-FIX] Normalize cutout proxy to ERA5-HDD scale per country.
+        # Cutout values are in MWh*population units (~1e8-1e11) while ERA5-HDD
+        # is in degree-day units (~1e4-1e6). Without normalization the regression
+        # extrapolates massively negative values for the planning year, which are
+        # clipped to 0, producing zero heat demand for CH, ES, FI, IT, NL, NO, SE.
+        _hdd_train = _ensure_year_index_int(hdd.copy(), name="year")
+        _hdd_train = _hdd_train.groupby(_hdd_train.index).sum()
+        _train_yrs = [y for y in range(2007, 2022) if y in _hdd_train.index]
+        if _train_yrs:
+            _era5_mean = _hdd_train.loc[_train_yrs].mean()
+            _cut_mean  = s_yearly.mean()
+            _common    = _era5_mean.index.intersection(_cut_mean.index)
+            _scale     = pd.Series(1.0, index=s_yearly.columns, dtype=float)
+            for _c in _common:
+                if _cut_mean[_c] > 0 and _era5_mean[_c] > 0:
+                    _scale[_c] = float(_era5_mean[_c]) / float(_cut_mean[_c])
+            s_yearly = s_yearly.multiply(_scale, axis=1)
+            logger.info(
+                "[HDD-FIX] Normalized cutout proxy to ERA5 scale. "
+                "Scale factors (sample): %s",
+                {c: f"{_scale[c]:.2e}" for c in list(_common)[:6]},
+            )
+
         # overwrite HDD with robust alignment
         hdd = _safe_overwrite_hdd_with_cutout_proxy(hdd, s_yearly)
 

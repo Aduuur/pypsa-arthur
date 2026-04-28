@@ -21,7 +21,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
-from config_final import PlottingConfig
+from config_final import PlottingConfig, fill_leap_day
 
 # ------------------------------------------------------------
 # Länder-Konfiguration (einzige "hardcoded" Werte — fachlich begründet)
@@ -299,6 +299,12 @@ def plot_storage_detail(n, year, save_dir, start_date, end_date,
     )
 
     # --- Resampling ---
+    de_charge_period = fill_leap_day(de_charge_period.to_frame()).iloc[:,0]
+    de_discharge_period = fill_leap_day(de_discharge_period.to_frame()).iloc[:,0]
+    de_soc_period = fill_leap_day(de_soc_period.to_frame()).iloc[:,0]
+    es_pump = fill_leap_day(es_pump.to_frame()).iloc[:,0]
+    es_gen = fill_leap_day(es_gen.to_frame()).iloc[:,0]
+    es_soc = fill_leap_day(es_soc.to_frame()).iloc[:,0]
     resample = "4h"
     de_charge_rs    = de_charge_period.resample(resample).mean()
     de_discharge_rs = de_discharge_period.resample(resample).mean()
@@ -395,10 +401,7 @@ def main():
 
         try:
             m = re.search(r"_(\d{4})\.nc$", path)
-            if not m:
-                print(f"⚠️  Kein Jahr im Dateinamen erkannt: {path}")
-                continue
-            year = int(m.group(1))
+            year = int(m.group(1)) if m else 2050  # ARO: kein Jahr im Namen -> Planungsjahr
 
             n = pypsa.Network(path)
             n.snapshots = pd.to_datetime(n.snapshots)

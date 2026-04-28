@@ -21,7 +21,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
-from config_final import PlottingConfig
+from config_final import PlottingConfig, fill_leap_day
 
 
 # =====================================================================
@@ -79,6 +79,7 @@ def plot_price_series(price_series: pd.Series, country: str, year: int,
     2. begrenzte Skala (0–100 €/MWh)
     """
 
+    price_series = fill_leap_day(price_series.to_frame()).iloc[:,0]
     if price_series.empty:
         print(f"⚠️ Keine Preisdaten für {country} {year}.")
         return
@@ -146,9 +147,7 @@ def main():
 
         # Jahr aus Dateiname extrahieren
         m = re.search(r"_(\d{4})\.nc$", path)
-        if not m:
-            continue
-        year = int(m.group(1))
+        year = int(m.group(1)) if m else 2050  # ARO: kein Jahr im Namen
 
         print(f"\n📂 Lade Netzwerk {year}: {path}")
         n = pypsa.Network(path)

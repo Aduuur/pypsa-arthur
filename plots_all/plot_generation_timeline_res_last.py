@@ -214,8 +214,7 @@ def main():
     for path in networks:
         if not os.path.isfile(path): continue
         m = re.search(r"_(\d{4})\.nc$", path)
-        if not m: continue
-        year = int(m.group(1))
+        year = int(m.group(1)) if m else 2050  # ARO: kein Jahr im Namen
 
         if year not in [2025, 2030, 2035, 2040, 2045, 2050]: continue
 

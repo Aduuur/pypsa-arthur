@@ -110,11 +110,25 @@ class AROAnalyzer:
 
     def load_aro_summary(self):
         """Lädt ARO Summary JSON."""
-        summary_path = _safe_path(self.run_config.get("summary_json"))
+        _raw_summary = self.run_config.get("summary_json")
+        # Template auflösen falls nötig
+        if _raw_summary and "{" in str(_raw_summary):
+            # Direkter String-Ersatz fuer Template-Variable
+            _raw_summary = str(_raw_summary).replace(
+                "{aro_results_base}",
+                "/home/endata/PycharmProjects/pypsa-ee/results"
+            )
+        summary_path = _safe_path(_raw_summary)
         if summary_path is None:
             raise ValueError("run_config['summary_json'] ist None/leer.")
         if not summary_path.exists():
-            raise FileNotFoundError(f"Summary JSON nicht gefunden: {summary_path}")
+            # Fallback: aro_summary_iter1.json
+            fallback = summary_path.parent / "aro_summary_iter1.json"
+            if fallback.exists():
+                print(f"  [summary] Nutze Fallback: {fallback.name}")
+                summary_path = fallback
+            else:
+                raise FileNotFoundError(f"Summary JSON nicht gefunden: {summary_path}")
 
         with open(summary_path, "r", encoding="utf-8") as f:
             self.aro_summary = json.load(f)
@@ -152,8 +166,15 @@ class AROAnalyzer:
         run_name = self.run_config.get("name", "")
         if not run_name:
             return None
-        d = base / run_name / "networks" / "_dispatch_tmp" / "final"
-        return d if d.is_dir() else None
+        tmp_base = base / run_name / "networks" / "_dispatch_tmp"
+        # Bevorzuge final/, falle auf iter1/ zurueck wenn final/ leer ist
+        for subdir in ("final", "iter1"):
+            d = tmp_base / subdir
+            if d.is_dir() and any(d.glob("*.nc")):
+                if subdir != "final":
+                    print(f"  [dispatch_tmp] Nutze Fallback: {subdir}/ (final/ ist leer)")
+                return d
+        return None
 
     def _safe_name(self, scenario_name: str) -> str:
         return scenario_name.replace("/", "_").replace(" ", "_")

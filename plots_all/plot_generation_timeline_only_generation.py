@@ -18,7 +18,7 @@ import re
 import pypsa
 import pandas as pd
 import matplotlib.pyplot as plt
-from config_final import PlottingConfig
+from config_final import PlottingConfig, fill_leap_day
 
 # =====================================================================
 # --- Linkfilter & Bus-Erkennung ---
@@ -130,6 +130,9 @@ def plot_generation(df, year_label, country, config: PlottingConfig, network_pat
         print(f"⚠️ Keine Daten im Detailzeitraum für {country} ({year_label}), skip.")
         return
 
+    # Negative Werte clippen (Curtailment/Modellierungsartefakte)
+    df_detail = df_detail.clip(lower=0)
+    df_detail = fill_leap_day(df_detail)
     fig, ax = plt.subplots(figsize=(13, 5))
     df_detail.plot.area(
         ax=ax,
@@ -163,6 +166,8 @@ def plot_generation(df, year_label, country, config: PlottingConfig, network_pat
 
     # === 2️⃣ Jahresverlauf: Tagesmittel ===
     df_year = df.loc[YEAR_START:YEAR_END].resample("1D").mean()
+    df_year = df_year.clip(lower=0)
+    df_year = fill_leap_day(df_year)
     fig, ax = plt.subplots(figsize=(13, 5))
     df_year.plot.area(
         ax=ax,
@@ -208,9 +213,7 @@ def main():
             continue
 
         m = re.search(r"_(\d{4})\.nc$", path)
-        if not m:
-            continue
-        year = int(m.group(1))
+        year = int(m.group(1)) if m else 2050  # ARO: kein Jahr im Namen
 
         print(f"\n📂 Lade Netzwerk {year}: {path}")
         n = pypsa.Network(path)
