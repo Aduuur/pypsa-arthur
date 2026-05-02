@@ -29,7 +29,7 @@ remote:
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#run
 run:
   prefix: ""
-  name: "real-run-1"
+  name: "3-Szenarien-Run"
   scenarios:
     enable: false
     file: config/scenarios.yaml
@@ -48,13 +48,13 @@ robust:
     - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_01_from_2031_12_06
     - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_02_from_2030_11_23
     - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_03_from_2035_11_22
-    - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_04_from_2040_12_12
-    - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_05_from_2033_11_21
-    - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_06_from_2047_01_07
-    - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_07_from_2041_11_21
-    - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_08_from_2047_11_23
-    - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_09_from_2039_12_13
-    - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_10_from_2041_01_30
+    #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_04_from_2040_12_12
+    #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_05_from_2033_11_21
+    #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_06_from_2047_01_07
+    #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_07_from_2041_11_21
+    #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_08_from_2047_11_23
+    #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_09_from_2039_12_13
+    #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_10_from_2041_01_30
 
 
   base_target: "networks/base.nc"
@@ -71,9 +71,9 @@ robust:
     co2_cost_mode: "off"      # "off" | "global_constraint_constant_cost"
     ls_penalty: 10000          # €/MWh — muss > max(marginal_cost) aller Generatoren
     convergence_tol: 0.001    # rel. Gap-Toleranz — 0.01%, auf 0.0 für klassisches ARO
-    dispatch_workers: 3
+    dispatch_workers: 1
     dispatch_solver_options:
-      threads: 20         # 10 cutouts x 10 threads = 100 -> passt auf 60 phys. Kerne mit Hyperthreading
+      threads: 12         # 10 cutouts x 10 threads = 100 -> passt auf 60 phys. Kerne mit Hyperthreading
       method: 2           # Barrier
       crossover: 0
       BarConvTol: 1.0e-3   # Dispatch: locker genug für numerisch schwieriges Problem
@@ -90,19 +90,19 @@ robust:
       - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_01_from_2031_12_06
       - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_02_from_2030_11_23
       - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_03_from_2035_11_22
-      - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_04_from_2040_12_12
-      - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_05_from_2033_11_21
-      - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_06_from_2047_01_07
-      - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_07_from_2041_11_21
-      - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_08_from_2047_11_23
-      - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_09_from_2039_12_13
-      - cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_10_from_2041_01_30
+      #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_04_from_2040_12_12
+      #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_05_from_2033_11_21
+      #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_06_from_2047_01_07
+      #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_07_from_2041_11_21
+      #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_08_from_2047_11_23
+      #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_09_from_2039_12_13
+      #- cutout_mCNRM-CERFACS-CM5_rcp45_2028_stress_10_from_2041_01_30
 
     max_iter: 1
 
     max_master_size: 0
     solver_options:
-      threads: 40         # 80 von 246 Kernen fuer Master
+      threads: 13         # 80 von 246 Kernen fuer Master
       method: 2          # Barrier
       crossover: 0
       BarConvTol: 0.01
@@ -111,7 +111,7 @@ robust:
       PreDual: 0
       #SoftMemLimit: 450      # GB - lass 400GB fuer OS + Dispatch
       DualReductions: 0
-      NumericFocus: 2
+      NumericFocus: 0
       ObjScale: -0.5
       ScaleFlag: -1
       BarHomogeneous: 1
@@ -1210,8 +1210,8 @@ clustering:
       ramp_limit_up: max
       ramp_limit_down: max
   temporal:
-    resolution_elec: false # später wieder anpassen
-    resolution_sector: false
+    resolution_elec: 2H # später wieder anpassen
+    resolution_sector: 2H
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#adjustments
 adjustments:
@@ -1424,14 +1424,14 @@ solving:
     name: gurobi
     options: gurobi-default
     solver_options:
-      Threads: 20
+      Threads: 12
       MIPGap: 1e-4
 
 
   solver_options:
     highs-default:
       # refer to https://ergo-code.github.io/HiGHS/dev/options/definitions/
-      threads: 20
+      threads: 12
       solver: "ipm"
       run_crossover: "off"
       small_matrix_value: 1e-6
@@ -1448,7 +1448,7 @@ solving:
       dual_feasibility_tolerance: 1e-5
       random_seed: 123
     gurobi-default:
-      threads: 20
+      threads: 12
       method: 2 # barrier
       crossover: 0
       BarConvTol: 1.e-4
@@ -1456,12 +1456,12 @@ solving:
       AggFill: 0
       PreDual: 0
       GURO_PAR_BARDENSETHRESH: 200
-      NumericFocus: 2
+      NumericFocus: 0
       ScaleFlag: -1
       #SoftMemLimit: 1900 #anpassen wenn mehr zur Verfügung
 
     gurobi-numeric-focus:
-      NumericFocus: 3       # Favour numeric stability over speed
+      NumericFocus: 0       # Favour numeric stability over speed
       method: 2             # barrier
       crossover: 0          # do not use crossover
       BarHomogeneous: 1     # Use homogeneous barrier if standard does not converge
@@ -1469,7 +1469,7 @@ solving:
       FeasibilityTol: 1.e-4
       OptimalityTol: 1.e-4
       ObjScale: -0.5
-      threads: 20
+      threads: 12
       Seed: 123
     gurobi-fallback:        # Use gurobi defaults
       crossover: 0
@@ -1479,7 +1479,7 @@ solving:
       FeasibilityTol: 1.e-5
       OptimalityTol: 1.e-5
       Seed: 123
-      threads: 20
+      threads: 12
 
     cplex-default:
       threads: 8

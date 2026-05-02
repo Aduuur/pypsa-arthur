@@ -339,7 +339,7 @@ def plot_dispatch(df_gen, s_load, s_export_net, year, country, config, net_name,
             labels_filtered.append("")
 
     # 7. Plotting
-    save_dir = os.path.join(config.BASE_SAVE_PATH, net_name, "plots_dispatch_final")
+    save_dir = os.path.join(config.PLOT_OUTPUT_PATH, "plots_dispatch_final")
     os.makedirs(save_dir, exist_ok=True)
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True, gridspec_kw={'height_ratios': [3, 1]})
@@ -447,6 +447,14 @@ def main():
             # 2. Januar
             plot_dispatch(df_gen, s_load, s_export, planning_year, country, config, net_name,
                           period_label="Januar", start=jan_start, end=jan_end, resample="6h")
+
+            # 3. Dunkelflaute (nur wenn _from_YYYY_MM_DD im Dateinamen)
+            _df_m = re.search(r"_from_\d{4}_(\d{2})_(\d{2})", os.path.basename(path))
+            if _df_m:
+                _df_start = f"{weather_year}-{_df_m.group(1)}-{_df_m.group(2)}"
+                _df_end = str((pd.Timestamp(_df_start) + pd.Timedelta(days=6)).date())
+                plot_dispatch(df_gen, s_load, s_export, planning_year, country, config, net_name,
+                              period_label="Dunkelflaute", start=_df_start, end=_df_end, resample="2h")
 
             if country == "ES":
                 plot_dispatch(df_gen, s_load, s_export, planning_year, country, config, net_name,

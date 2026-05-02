@@ -38,8 +38,8 @@ def _mkdir(p: Union[str, Path]) -> Path:
 #                  wird für Vergleichsplots (plot_installed_cap_new_vgl etc.) genutzt
 # RUN_NAME       : aktiv selektierter Run (für normale Plot-Skripte)
 # -----------------------------------------------------------------------------
-ARO_RUN_NAME: str = _env("ARO_RUN_NAME", "baserun-rcp85-test")       # type: ignore[assignment]
-REF_RUN_NAME: str = _env("REF_RUN_NAME", "baserun-rcp85-test") # type: ignore[assignment]
+ARO_RUN_NAME: str = _env("ARO_RUN_NAME", "3-Szenarien-Run")       # type: ignore[assignment]
+REF_RUN_NAME: str = _env("REF_RUN_NAME", "Referenzrun-rcp45") # type: ignore[assignment]
 RUN_NAME: str = _env("RUN_NAME", ARO_RUN_NAME)                   # type: ignore[assignment]
 
 
@@ -86,7 +86,7 @@ MASTER_CONFIG: Dict[str, Any] = {
     # =======================================================================
     "planning_year": int(_env("PLANNING_YEAR", "2050")),
     "dark_sky_period": {
-        "reference_year": int(_env("DARK_SKY_YEAR", "2028")),
+        "reference_year": int(_env("DARK_SKY_YEAR", "2030")),
         "start_mmdd":     _env("DARK_SKY_START", "01-07"),
         "end_mmdd":       _env("DARK_SKY_END",   "01-28"),
     },

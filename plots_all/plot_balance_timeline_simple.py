@@ -389,7 +389,7 @@ def get_total_consumption(n: pypsa.Network, country: str):
 def plot_simple_balance(gen_mw: pd.Series, cons_mw: pd.Series, year: int, country: str, config: PlottingConfig, network_path: str):
     title_country = "Gesamtnetz" if country == "ALL" else country
     network_name = os.path.basename(os.path.dirname(os.path.dirname(network_path)))
-    save_dir = os.path.join(config.BASE_SAVE_PATH, network_name, "balance_timeline_simple_imports")
+    save_dir = os.path.join(config.PLOT_OUTPUT_PATH, "balance_timeline_simple_imports")
     os.makedirs(save_dir, exist_ok=True)
 
     # Detailansicht

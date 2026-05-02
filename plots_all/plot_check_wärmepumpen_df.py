@@ -265,6 +265,8 @@ def plot_diagnosis(p_elec, q_heat, country, target_year, scenario_name,
     ax1.set_ylabel("Stromverbrauch [GW]")
     ax1.set_title(f"Stromverbrauch für Wärme ({country} {target_year}, {start_date}–{end_date})")
     ax1.grid(True, alpha=0.4, linestyle="--")
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%d.%m"))
+    ax1.xaxis.set_major_locator(mdates.DayLocator(interval=5))
 
     ax2 = axes[1]
     plot_cols = [c for c in q_heat.columns if q_heat[c].abs().sum() > 0.01]

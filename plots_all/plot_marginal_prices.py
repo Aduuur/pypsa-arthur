@@ -155,7 +155,7 @@ def main():
         # Speicherordner analog zur Gas/H₂-Logik
         network_root = os.path.dirname(os.path.dirname(path))
         network_name = os.path.basename(network_root)
-        save_folder = os.path.join(config.BASE_SAVE_PATH, network_name)
+        save_folder = config.PLOT_OUTPUT_PATH
 
         for country in config.get_countries():
             print(f"→ {country}: Preisverlauf wird berechnet …")

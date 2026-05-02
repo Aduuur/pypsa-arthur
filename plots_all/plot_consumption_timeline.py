@@ -112,7 +112,7 @@ def plot_consumption(df, year_label, country, config: PlottingConfig, network_pa
 
     title_country = "Gesamtnetz" if country == "ALL" else country
     network_name = os.path.basename(os.path.dirname(os.path.dirname(network_path)))
-    save_dir = os.path.join(config.BASE_SAVE_PATH, network_name, "consumption_timeline_only_consumption")
+    save_dir = os.path.join(config.PLOT_OUTPUT_PATH, "consumption_timeline_only_consumption")
     os.makedirs(save_dir, exist_ok=True)
 
     # === 1️⃣ Detailansicht: Januar–Februar (stundenweise) ===

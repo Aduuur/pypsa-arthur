@@ -2622,7 +2622,10 @@ def _dispatch_solve(
         # builds unrealistically large thermal storage (~1 TWh per node), causing
         # 2800+ charge/discharge cycles per year in the dispatch plot.
         try:
-            add_TES_energy_to_power_ratio_constraints(network)
+            import sys as _sys2, os as _os2
+            _sys2.path.insert(0, _os2.path.dirname(_os2.path.dirname(_os2.path.abspath(__file__))))
+            from scripts.solve_network import add_TES_energy_to_power_ratio_constraints as _add_TES_disp
+            _add_TES_disp(network)
             logger.info("[DISPATCH-FIX-TES] TES energy-to-power-ratio constraint added.")
         except Exception as _tes_exc:
             logger.warning("[DISPATCH-FIX-TES] Could not add TES constraint: %s", _tes_exc)

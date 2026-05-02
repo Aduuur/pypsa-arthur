@@ -109,11 +109,9 @@ PER_SCENARIO_SCRIPTS: set = {
 
 # Skripte die sinnvoll auf einem einzelnen Netz (ARO Worst-Case) laufen.
 ARO_APPLICABLE_SCRIPTS: set = {
-    "dispatch_timeline",
     "balance_timeline",
     "energy_gen_no_storage",
     "generation_timeline_res",
-    "generation_timeline_gen",
     "storage_v2",
     "storage_kombi_es_de",
     "storage_kombi_fr_de",

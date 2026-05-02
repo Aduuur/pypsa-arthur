@@ -267,9 +267,7 @@ def plot_annual_generation(df: pd.DataFrame, years, country, config: PlottingCon
 
     fig.tight_layout()
 
-    save_dir = os.path.join(config.BASE_SAVE_PATH,
-                            os.path.basename(os.path.dirname(os.path.dirname(ref_path))),
-                            "generated_energy")
+    save_dir = os.path.join(config.PLOT_OUTPUT_PATH, "generated_energy")
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, f"energy_generated_{country}.png")
 

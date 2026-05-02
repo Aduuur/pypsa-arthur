@@ -21,6 +21,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 # FIX: war config_final, PlottingConfig ist in master_config definiert
 from master_config import get_planning_year, PlottingConfig
@@ -203,7 +204,10 @@ def plot_country_storage(n, country, year, save_dir):
     ax2_sec.set_ylim(0, 1)
     ax2.legend(handles=[p4, p5, p6], loc="upper right", frameon=False, fontsize=14)
 
-    axes[-1].set_xlabel("Datum", fontsize=16)
+    for ax_i in axes:
+        ax_i.xaxis.set_major_formatter(mdates.DateFormatter('%b'))
+        ax_i.xaxis.set_major_locator(mdates.MonthLocator())
+    axes[-1].set_xlabel("Monat", fontsize=16)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
 
     os.makedirs(save_dir, exist_ok=True)
