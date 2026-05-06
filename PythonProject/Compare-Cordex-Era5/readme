@@ -1,0 +1,13 @@
+Start Befehle
+
+# CSV-basiert
+python plot_compare_energy_totals.py --out compare_out
+python plot_compare_demand_monthly_country.py --out compare_out --year 2010
+python plot_compare_avail_profile_monthly_country.py --out compare_out --year 2010
+
+# Network-basiert (braucht pypsa + solved network .nc)
+pip install pypsa
+python plot_compare_installed_capacity_from_network.py --out compare_out
+python plot_compare_generated_energy_monthly.py --out compare_out --year 2010
+python plot_compare_prices_monthly.py --out compare_out --year 2010
+python plot_compare_transmission_monthly.py --out compare_out --year 2010
