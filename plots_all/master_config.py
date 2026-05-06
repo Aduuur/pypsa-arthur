@@ -38,7 +38,7 @@ def _mkdir(p: Union[str, Path]) -> Path:
 #                  wird für Vergleichsplots (plot_installed_cap_new_vgl etc.) genutzt
 # RUN_NAME       : aktiv selektierter Run (für normale Plot-Skripte)
 # -----------------------------------------------------------------------------
-ARO_RUN_NAME: str = _env("ARO_RUN_NAME", "3-Szenarien-Run")       # type: ignore[assignment]
+ARO_RUN_NAME: str = _env("ARO_RUN_NAME", "Referenzrun-rcp45")       # type: ignore[assignment]
 REF_RUN_NAME: str = _env("REF_RUN_NAME", "Referenzrun-rcp45") # type: ignore[assignment]
 RUN_NAME: str = _env("RUN_NAME", ARO_RUN_NAME)                   # type: ignore[assignment]
 

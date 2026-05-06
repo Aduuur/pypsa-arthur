@@ -111,7 +111,7 @@ def _extract_year_from_network(n: pypsa.Network, path: str) -> int | None:
     """
     try:
         from master_config import get_planning_year
-    return get_planning_year(n, getattr(n, '_source_path', ''))
+        return get_planning_year(n, getattr(n, '_source_path', ''))
     except Exception:
         pass
     m = re.search(r"_(\d{4})[\._ ]", os.path.basename(path))

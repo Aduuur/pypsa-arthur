@@ -203,9 +203,8 @@ def plot_generation(df, year_label, country, config: PlottingConfig, network_pat
     _style_ax(ax)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%d. %b"))
     ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=1))
-    fig.autofmt_xdate(rotation=30, ha="right")
+    plt.setp(ax.get_xticklabels(), rotation=30, ha="right", fontsize=9)
     _make_legend(ax, df_detail.columns)
-    fig.tight_layout()
     plt.savefig(os.path.join(save_dir,
         f"generation_timeline_detail_{country}_{year_label}.png"), dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -231,9 +230,8 @@ def plot_generation(df, year_label, country, config: PlottingConfig, network_pat
                 _style_ax(ax)
                 ax.xaxis.set_major_formatter(mdates.DateFormatter("%d. %b"))
                 ax.xaxis.set_major_locator(mdates.DayLocator())
-                fig.autofmt_xdate(rotation=30, ha="right")
+                plt.setp(ax.get_xticklabels(), rotation=30, ha="right", fontsize=9)
                 _make_legend(ax, df_df.columns)
-                fig.tight_layout()
                 plt.savefig(os.path.join(save_dir,
                     f"generation_timeline_dunkelflaute_{country}_{year_label}.png"),
                     dpi=200, bbox_inches="tight")
@@ -258,8 +256,8 @@ def plot_generation(df, year_label, country, config: PlottingConfig, network_pat
     _style_ax(ax)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
     ax.xaxis.set_major_locator(mdates.MonthLocator())
+    plt.setp(ax.get_xticklabels(), rotation=0, ha="center", fontsize=9)
     _make_legend(ax, df_year.columns)
-    fig.tight_layout()
     plt.savefig(os.path.join(save_dir,
         f"generation_timeline_year_{country}_{year_label}.png"), dpi=200, bbox_inches="tight")
     plt.close(fig)

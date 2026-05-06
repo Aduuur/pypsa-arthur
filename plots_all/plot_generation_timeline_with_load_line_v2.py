@@ -392,15 +392,20 @@ def plot_dispatch(df_gen, s_load, s_export_net, year, country, config, net_name,
     ax2.legend(loc="upper right", fontsize=9)
     ax2.grid(True, alpha=0.3)
 
-    # X-Achse
+    # X-Achse (beide Panels)
     if period_label == "Year":
-        ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+        for _ax in [ax1, ax2]:
+            _ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+            _ax.xaxis.set_major_locator(mdates.MonthLocator())
     else:
-        ax2.xaxis.set_major_formatter(mdates.DateFormatter("%d.%m"))
+        for _ax in [ax1, ax2]:
+            _ax.xaxis.set_major_formatter(mdates.DateFormatter("%d.%m"))
+            _ax.xaxis.set_major_locator(mdates.DayLocator(interval=2))
+    plt.setp(ax2.get_xticklabels(), rotation=30, ha="right", fontsize=9)
+    ax1.tick_params(axis="x", labelbottom=False)
 
-    plt.tight_layout()
     filename = f"dispatch_{country}_{year}_{period_label}.png"
-    plt.savefig(os.path.join(save_dir, filename), dpi=150)
+    plt.savefig(os.path.join(save_dir, filename), dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"   -> Plot erstellt: {filename}")
 
@@ -416,8 +421,10 @@ def main():
     for path in networks:
         if not os.path.isfile(path): continue
         m = re.search(r"_(\d{4})\.nc$", path)
-        if not m: continue
-        planning_year = int(m.group(1))
+        if m:
+            planning_year = int(m.group(1))
+        else:
+            planning_year = 2050  # Dispatch-Netze haben kein Jahr im Namen
 
         print(f"\n📂 Netz {planning_year}: {os.path.basename(path)}")
         n = pypsa.Network(path)
